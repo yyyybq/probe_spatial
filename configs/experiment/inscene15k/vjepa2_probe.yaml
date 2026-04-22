@@ -1,0 +1,66 @@
+# @package _global_
+
+defaults:
+  - override /model: probe
+
+seed: 42
+
+tags: ["train", "inscene15k", "vjepa2"]
+
+task_name: inscene15k
+job_name: vjepa2_probe
+
+autoresume: true
+
+paths:
+  run_folder_name: ${task_name}_${job_name}
+
+feat_postfix: _layer23
+data:
+  data_module:
+    train_datasets:
+    - InsScene15KDataset(root='/nas/baiqiao/InsScene-15K/data', root_vfm='/nas/baiqiao/InsScene-15K/FEAT', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='train', vfm_name='vjepa2', feat_postfix='${feat_postfix}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512)
+    validation_datasets:
+    - InsScene15KDataset(root='/nas/baiqiao/InsScene-15K/data', root_vfm='/nas/baiqiao/InsScene-15K/FEAT', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='val', vfm_name='vjepa2', feat_postfix='${feat_postfix}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512)
+    batch_size_per_device: 8
+    batch_size_per_device_val: 8
+    num_workers: 8
+    num_workers_val: 4
+
+logger:
+  wandb:
+    name: ${task_name}_${job_name}
+    group: ${task_name}
+
+model:
+  probe_type: pixalign
+  probe:
+    _target_: vidfm3d.models.components.probe_pixalign.ProbeModelPA
+    embed_dim: 1024
+    video_channels: 1024
+    backbone_depth: 4
+    dpt_intermediate_layer_idx: [0, 1, 2, 3]
+    gradient_checkpointing: true
+    active_heads: ["depth", "point", "camera", "identity"]
+    identity_dim: 64
+  val_viz_freq: 5
+
+  loss_weights:
+    pmap: 1.0
+    dmap: 1.0
+    pmap_grad: 0.0
+    dmap_grad: 0.0
+    camera: 1.0
+    identity: 1.0
+
+  normalize_pred: true
+  normalize_gt: true
+  soft_bg_weight: 0.0
+  cmap_power: 1.0
+
+trainer:
+  devices: [0]
+  strategy: auto
+  max_epochs: 50
+  precision: bf16-mixed
+  plugins: []
