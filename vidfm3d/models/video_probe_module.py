@@ -322,7 +322,7 @@ class VideoProbeLitModule(LightningModule):
         self.train_total_samples_per_step.reset()
         self.log(
             "trainer/total_samples",
-            self.train_total_samples,
+            self.train_total_samples.float(),
             on_step=True,
             on_epoch=False,
             prog_bar=False,
@@ -417,14 +417,15 @@ class VideoProbeLitModule(LightningModule):
                             save_path=save_path + "_pmaps_overlay.ply",
                             name=f"train-viz/{i:02d}:pmaps-overlay",
                         )
-            aligned_mse_avg = np.mean(aligned_mses)
-            self.log(
-                "train/pmap_mse_aligned",
-                aligned_mse_avg,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=True,
-            )
+            if len(aligned_mses) > 0:
+                aligned_mse_avg = np.mean(aligned_mses)
+                self.log(
+                    "train/pmap_mse_aligned",
+                    aligned_mse_avg,
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=True,
+                )
 
         return loss
 

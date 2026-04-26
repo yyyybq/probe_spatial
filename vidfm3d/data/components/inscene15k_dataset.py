@@ -82,6 +82,7 @@ class InsScene15KDataset(EasyDataset):
         train_ratio: float = 0.9,
         max_identity_classes: int = 256,
         window_size: int = 0,
+        include_pmaps: bool = True,
         **kwargs,
     ):
         """
@@ -116,6 +117,7 @@ class InsScene15KDataset(EasyDataset):
         self.target_w = target_w
         self.max_identity_classes = max_identity_classes
         self.window_size = window_size
+        self.include_pmaps = include_pmaps
         self.kwargs = kwargs
 
         # Collect all scenes
@@ -554,21 +556,25 @@ class InsScene15KDataset(EasyDataset):
         # Build confidence maps from depth validity (1 where depth > 0)
         confmaps = (depthmaps > 0).float()  # (S, H, W)
 
-        # Compute world-coordinate point maps from depth + camera
-        S, _, H, W = images.shape
-        pointmaps = []
-        for i in range(S):
-            pts = depth_to_pointmap(depthmaps[i], intrinsics[i], extrinsics[i])
-            pointmaps.append(pts)
-        pointmaps = torch.stack(pointmaps)  # (S, H, W, 3)
+        # Compute world-coordinate point maps only when needed (v3 can disable this).
+        if self.include_pmaps:
+            S, _, H, W = images.shape
+            pointmaps = []
+            for i in range(S):
+                pts = depth_to_pointmap(depthmaps[i], intrinsics[i], extrinsics[i])
+                pointmaps.append(pts)
+            pointmaps = torch.stack(pointmaps)  # (S, H, W, 3)
+        else:
+            pointmaps = None
 
-        # Normalize scene: extrinsics relative to first frame, scale by avg point dist
-        extrinsics, pointmaps, depthmaps_hw1 = invert_pose_ref_and_scale(
+        # Normalize scene: extrinsics relative to first frame.
+        # If point maps are disabled, scale by depth instead of points.
+        extrinsics, pointmaps_scaled, depthmaps_hw1 = invert_pose_ref_and_scale(
             extrinsics,                        # (S, 3, 4)
-            pointmaps,                         # (S, H, W, 3)
+            pointmaps,
             depthmaps=depthmaps.unsqueeze(-1),  # (S, H, W, 1)
             ref_idx=0,
-            scale_by_points=True,
+            scale_by_points=self.include_pmaps,
         )
         depthmaps = depthmaps_hw1.squeeze(-1)  # (S, H, W)
 
@@ -583,7 +589,8 @@ class InsScene15KDataset(EasyDataset):
         output["extrinsics"] = extrinsics  # (S, 3, 4)
         output["cmaps"] = confmaps.unsqueeze(1)  # (S, 1, H, W)
         output["dmaps"] = depthmaps.unsqueeze(1)  # (S, 1, H, W)
-        output["pmaps"] = pointmaps.permute(0, 3, 1, 2)  # (S, 3, H, W)
+        if self.include_pmaps and pointmaps_scaled is not None:
+            output["pmaps"] = pointmaps_scaled.permute(0, 3, 1, 2)  # (S, 3, H, W)
 
         # VFM features
         if self.root_vfm is not None:
