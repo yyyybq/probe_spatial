@@ -1,0 +1,35 @@
+_target_: vidfm3d.models.probe_ext_module.ProbeExtensionLitModule
+
+probe_type: ???   # one of: view_consistency, abnormal, ego_belief, action_dynamics
+output_path: ${paths.output_dir}
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 3e-4
+  betas:
+    - 0.9
+    - 0.95
+  weight_decay: 0.05
+
+scheduler:
+  _target_: pl_bolts.optimizers.lr_scheduler.LinearWarmupCosineAnnealingLR
+  _partial_: true
+  warmup_epochs: 5
+  max_epochs: ${trainer.max_epochs}
+  eta_min: 1e-6
+
+probe: ???   # filled by experiment config
+
+# A2 thresholds
+view_overlap_pos_threshold: 0.4
+view_overlap_neg_threshold: 0.05
+
+# B1 polar loss weights (azimuth, elevation, log_distance)
+polar_loss_weights: [1.0, 1.0, 0.5]
+
+# C1
+mse_loss_weight: 1.0
+cosine_loss_weight: 1.0
+
+compile: false

@@ -1,206 +1,402 @@
 # probe_spatial: Probing Spatial Understanding in Video Foundation Models
 
-This repository extends [VidFM3D](https://github.com/zxhuang1698/VidFM3D) with:
+This repository extends [VidFM3D](https://github.com/zxhuang1698/VidFM3D) with a **Spatial Diagnostic Suite** — four orthogonal probes that together characterize what kind of 3D / temporal / ego-centric understanding a Video Foundation Model (VFM) has internalized, all trained on frozen VFM features without touching VFM weights.
 
-- **InsScene-15K support** — a new dataset combining Infinigen and ScanNet++ scenes for probe training and evaluation
-- **V-JEPA2 feature extraction** — feature extractor for the V-JEPA2 model (`features/vjepa2/`)
-- **Pixel-aligned probe (ProbeModelPA)** — a DPT-based probe head that predicts depth, camera pose, and scene identity from pixel-aligned VFM features
-- **Window sampling** — temporal windowed sampling (`window_size=200`) for efficient training on long video sequences
-- **v3 experiment configs** — cleaner probe setup: no point-map head, window sampling, 100-epoch schedule, checkpointed every 5 epochs
-- **Robustness fixes** — `torch.load` patch for PyTorch 2.6 compatibility; `ModelCheckpoint` patch to ensure `last.ckpt` is always saved regardless of top-k improvement
+| Family | Probe | Question |
+|--------|-------|---------|
+| **A. Global Spatial Perception** | A1 depth/camera/identity (VidFM3D baseline) | Does the VFM perceive a coherent 3D scene? |
+| **A. Global Spatial Perception** | **A2 view consistency** | Can it tell whether two clips share a viewing region? |
+| **A. Global Spatial Perception** | **A3 abnormal detection** | Can it detect temporally shuffled frames? |
+| **B. Ego-Centric Belief** | **B1 hidden-object localization** | Does it remember where objects went off-screen? |
+| **C. Action-Conditioned Prediction** | **C1 latent dynamics** | Can it predict the next-frame feature given a camera motion? |
 
 Based on: [VidFM3D: How Much 3D Do Video Foundation Models Encode?](https://arxiv.org/pdf/2512.19949v1)
 
 ![Teaser](teaser.png)
 
+---
+
+## Quick-start: reproduce results on a new server
+
+```bash
+# 1. Clone repo
+git clone https://github.com/yyyybq/probe_spatial.git
+cd probe_spatial
+
+# 2. Create env (see Installation section below)
+conda create -n vidfm3d python=3.11 cmake=3.14.0 -y
+conda activate vidfm3d
+conda install pytorch torchvision torchaudio pytorch-cuda=12.4 \
+    nvidia/label/cuda-12.4.0::cuda-toolkit -c pytorch -c nvidia
+pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
+pip install -r requirements.txt
+pip install -e .
+
+# 3. Download InsScene-15K data
+python data/download_inscene15k.py --step all --base-dir /data/InsScene-15K
+
+# 4. Extract VFM features (one VFM shown; repeat for cogvideox / vjepa2)
+INSCENE_DATA=/data/InsScene-15K
+python -m features.run_inscene15k --vfm wan \
+    --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT \
+    --t 749 --output-layers 20
+python -m features.run_inscene15k --vfm wan --mode shuffled \
+    --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_SHUFFLED \
+    --t 749 --output-layers 20
+python -m features.run_inscene15k --vfm wan --mode target_isolated \
+    --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_TARGET \
+    --t 749 --output-layers 20 --num-targets 8
+
+# 5. Train all 4 new probes for Wan on GPU 0
+bash scripts/run_diag_sweep.sh wan 0
+
+# 6. Test & evaluate
+bash scripts/run_diag_eval_sweep.sh   # writes comparison_val.csv
+```
+
+> **Note**: feature paths are hardcoded in `configs/experiment/inscene15k_ext/*.yaml`.
+> Update the `root_vfm`, `target_feat_root`, and `shuffled_feat_root` fields to match
+> your actual data location before training, or pass overrides via Hydra:
+> ```bash
+> python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
+>     model.probe.target_feat_root=/data/InsScene-15K/FEAT_TARGET
+> ```
+
+---
+
 ## Installation
 
 ```bash
-# create conda environment
 conda create -n vidfm3d python=3.11 cmake=3.14.0 -y
 conda activate vidfm3d
 
-# install PyTorch (adjust versions according to your system)
-conda install pytorch torchvision torchaudio pytorch-cuda=12.4 nvidia/label/cuda-12.4.0::cuda-toolkit -c pytorch -c nvidia
+# PyTorch (CUDA 12.4)
+conda install pytorch torchvision torchaudio pytorch-cuda=12.4 \
+    nvidia/label/cuda-12.4.0::cuda-toolkit -c pytorch -c nvidia
 
-# install PyTorch3D from source (the compilation will take a while)
-# export MAX_JOBS=6 # un-comment this if your machine is low on RAM (e.g., 16GB) when compiling PyTorch3D
+# PyTorch3D (takes a while to compile; set MAX_JOBS=4 on low-RAM machines)
 pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
-# unset MAX_JOBS
 
-# install requirements
 pip install -r requirements.txt
-
-# install as a package
 pip install -e .
 ```
 
 <details>
-<summary>Installation Troubleshooting</summary>
+<summary>Troubleshooting</summary>
 
-**CUDA Runtime Error**
-If you encounter the error `fatal error: cuda_runtime.h: No such file or directory` when installing PyTorch3D, try setting `CUDA_HOME` before installing PyTorch3D:
-
+**CUDA Runtime Error** — `fatal error: cuda_runtime.h: No such file or directory`
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.4
 pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
 ```
 
-**PyTorch Import Error (iJIT_NotifyEvent)**
-If you encounter `ImportError: ... libtorch_cpu.so: undefined symbol: iJIT_NotifyEvent` when running `import torch`, it is likely due to an incompatibility with newer versions of Intel MKL. Downgrade `mkl` and `intel-openmp` by running:
-
+**PyTorch iJIT_NotifyEvent** — Intel MKL incompatibility:
 ```bash
 conda install "mkl<2024.1" "intel-openmp<2024.1" -c conda-forge -y
 ```
 
-**Unsupported GNU Version (GCC Compiler Error)**
-If PyTorch3D compilation fails with #error -- unsupported GNU version!, your C++ compiler is too new for your specific CUDA version. Install a compatible GCC into your Conda environment or set `CC`/`CXX` before building.
+**GCC too new for CUDA** — Set `CC`/`CXX` to an older GCC or install one into the conda env before building PyTorch3D.
 
 </details>
 
+---
+
 ## Dataset Preparation
 
-### InsScene-15K (primary dataset for this work)
+### InsScene-15K (primary dataset)
 
-InsScene-15K combines **Infinigen** synthetic scenes and **ScanNet++** real-world scenes for probe training.
+InsScene-15K ([HuggingFace: lifuguan/InsScene-15K](https://huggingface.co/datasets/lifuguan/InsScene-15K)) combines **Infinigen** synthetic scenes and **ScanNet++** real-world scenes.
 
-1. Download [InsScene-15K](https://huggingface.co/datasets/TODO/inscene15k) and place under `data/InsScene-15K/`.
-2. Extract VFM features (see [Feature Extraction](#feature-extraction) below).
+```bash
+# Download + extract in one step (~60 GB)
+python data/download_inscene15k.py --step all --base-dir /data/InsScene-15K
 
-Dataset structure expected:
+# Or separately
+python data/download_inscene15k.py --step download --base-dir /data/InsScene-15K
+python data/download_inscene15k.py --step extract  --base-dir /data/InsScene-15K
 ```
-data/InsScene-15K/
+
+Expected structure after extraction:
+```
+/data/InsScene-15K/
   data/
-    processed_infinigen/
-    processed_scannetpp_v2/
-  FEAT/
-    wan/
-    cogvideox/
-    vjepa2/
+    processed_infinigen/      # Infinigen synthetic scenes
+    processed_scannetpp_v2/   # ScanNet++ real-world scenes
+  FEAT/                       # filled by feature extraction (step 4)
+  FEAT_SHUFFLED/              # filled by feature extraction --mode shuffled (A3)
+  FEAT_TARGET/                # filled by feature extraction --mode target_isolated (C1)
 ```
 
-### CO3Dv2
+### CO3Dv2 / DL3DV (original VidFM3D datasets)
 
-1. Download the raw CO3Dv2 dataset following [the official instructions](https://github.com/facebookresearch/co3d). Place under `vidfm3d/data/CO3D/CO3D-data/`.
+Follow the [original VidFM3D instructions](https://github.com/zxhuang1698/VidFM3D#dataset-preparation) for CO3Dv2 and DL3DV.
 
-2. Extract frames:
+---
+
+## Feature Extraction
+
+Features are pre-extracted once and cached as `.sft` files. The extractor is resume-safe (skips already-done scenes).
+
+### InsScene-15K — three extraction modes
+
+| Mode | Output dir | Used by |
+|------|-----------|---------|
+| `normal` (default) | `FEAT/` | A1, A2, B1, C1 input |
+| `shuffled` | `FEAT_SHUFFLED/` | A3 (temporally shuffled clips) |
+| `target_isolated` | `FEAT_TARGET/` | C1 target features (no temporal context) |
+
+```bash
+INSCENE_DATA=/data/InsScene-15K
+VFM=wan
+MODEL_ID=Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+
+# Normal features (required for all probes)
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT \
+    --t 749 --output-layers 20
+
+# Shuffled features (A3 only)
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --mode shuffled \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_SHUFFLED \
+    --t 749 --output-layers 20
+
+# Target-isolated features (C1 only)
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --mode target_isolated \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_TARGET \
+    --t 749 --output-layers 20 --num-targets 8
+```
+
+Switch `--vfm cogvideox --model-id THUDM/CogVideoX-5b` or
+`--vfm vjepa2` (uses `features/vjepa2/vjepa2_feature.py`) for other VFMs.
+
+| VFM | `--vfm` | `--model-id` | `feat_postfix` | `in_channels` |
+|-----|---------|-------------|---------------|--------------|
+| Wan2.1-T2V-1.3B | `wan` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | `_t749_layer20` | 1536 |
+| CogVideoX-5B | `cogvideox` | `THUDM/CogVideoX-5b` | `_t749_layer20` | 3072 |
+| V-JEPA2-ViT-L | `vjepa2` | see `features/vjepa2/` | `_layer23` | 1024 |
+
+---
+
+## Training
+
+### New Diagnostic Probes (A2 / A3 / B1 / C1) — this work
+
+**Train all four probes for one VFM on a single GPU:**
+```bash
+bash scripts/run_diag_sweep.sh wan     0   # GPU 0
+bash scripts/run_diag_sweep.sh vjepa2  1   # GPU 1
+bash scripts/run_diag_sweep.sh cogvideox 2 # GPU 2
+```
+
+**Train a single probe:**
+```bash
+# A2 view consistency
+CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
+    experiment=inscene15k_ext/view_consistency_wan_v1
+
+# A3 abnormal detection
+CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
+    experiment=inscene15k_ext/abnormal_wan_v1
+
+# B1 hidden-object localization
+CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
+    experiment=inscene15k_ext/ego_belief_wan_v1
+
+# C1 latent dynamics
+CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
+    experiment=inscene15k_ext/action_dynamics_wan_v1
+```
+
+Training runs for 50 epochs (≈2–4 hours per probe on 1× L40S), auto-resumes from `last.ckpt`.
+
+**Control experiments** (scrambled features as baseline):
+```bash
+CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
+    experiment=inscene15k_ext/action_dynamics_wan_ctrl
+```
+
+### A1 Baseline Probe (depth / camera / identity) — original VidFM3D
+
+```bash
+# Wan2.1
+CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py experiment=inscene15k/wan_probe_v3
+
+# V-JEPA2
+CUDA_VISIBLE_DEVICES=1 python vidfm3d/train.py experiment=inscene15k/vjepa2_probe_v3
+```
+
+Trains for 100 epochs, checkpointed every 5 epochs.
+
+### Override data paths
+
+If your data is not at the default path, override via Hydra:
+```bash
+python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
+    "data.data_module.train_datasets=['InsScene15KDataset(root=\"/your/data\", root_vfm=\"/your/FEAT\", ..., diag_action=True, target_feat_root=\"/your/FEAT_TARGET\")']"
+```
+
+---
+
+## Evaluation
+
+### New Diagnostic Probes (A2 / A3 / B1 / C1)
+
+```bash
+# Evaluate all trained runs and aggregate into a CSV
+bash scripts/run_diag_eval_sweep.sh     # writes comparison_val.csv
+
+# Evaluate a single run
+python vidfm3d/eval_diag.py \
+    experiment=inscene15k_ext/view_consistency_wan_v1 \
+    ckpt_path=logs/<run>/checkpoints/last.ckpt \
+    eval_split=val train=false test=false
+```
+
+**Test mode** (final numbers, runs the test dataloader):
+```bash
+# Using a symlink to avoid Hydra=sign parsing issue
+ln -s logs/<run>/checkpoints/epoch=49-step=104850.ckpt /tmp/eval_ck.ckpt
+python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
+    train=False test=True ckpt_path=/tmp/eval_ck.ckpt \
+    data.data_module.batch_size_per_device=16 \
+    data.data_module.batch_size_per_device_val=16
+```
+
+> **Tip**: Use `batch_size=16` for test to avoid nan in C1 R@1 (the last batch
+> must have ≥ 4 samples; 953 val samples % 16 = 9 ✓).
+
+### A1 Baseline Probe
+
+```bash
+# Evaluate depth, camera (Auc_30, Rac_15, Tac_15), and identity
+python eval_pertask_v3.py --models wan,vjepa2 --gpu 0
+```
+
+Results summary (InsScene-15K val, 953 samples):
+
+| Model | depth↓ | identity↓ | Auc_30↑ | Rac_15↑ | Tac_15↑ |
+|-------|--------|-----------|---------|---------|---------|
+| Wan2.1 | 0.334 | 5.550 | 1.76% | 7.49% | 7.22% |
+| V-JEPA2 | 0.322 | 4.628 | 2.15% | 7.97% | 7.43% |
+
+### New Probe Results Summary
+
+| Probe | Wan v1 | Wan ctrl | V-JEPA2 v1 | Note |
+|-------|--------|----------|-----------|------|
+| A2 overlap_acc↑ | 85.6% | 78.7% | 85.2% | trivial baseline=84.3% |
+| A3 abnormal_acc↑ | 92.1% | 100%* | 97.5% | *anomalous |
+| B1 az_err↓ | 18.1° | 23.4° | 17.6° | |
+| B1 el_err↓ | 11.4° | 15.1° | 11.7° | |
+| C1 R@1↑ | 26.7% | 5.8% | 22.8% | random=6.25% |
+
+---
+
+## Repository Structure
+
+```
+probe_spatial/
+├── data/
+│   └── download_inscene15k.py       # Download + extract InsScene-15K
+├── configs/
+│   ├── train.yaml                   # Hydra top-level config
+│   ├── model/
+│   │   ├── probe.yaml               # A1 probe (depth/camera/identity)
+│   │   └── probe_ext.yaml           # NEW: A2/A3/B1/C1 probes
+│   └── experiment/
+│       ├── inscene15k/              # A1 experiments
+│       └── inscene15k_ext/          # NEW: 4 probes × 3 VFMs + ctrl variants
+├── features/
+│   ├── run_inscene15k.py            # Feature extractor (normal/shuffled/target modes)
+│   ├── wan/                         # Wan feature extraction
+│   ├── cogvideox/                   # CogVideoX feature extraction
+│   └── vjepa2/                      # V-JEPA2 feature extraction
+├── vidfm3d/
+│   ├── train.py                     # Hydra entry point
+│   ├── eval_diag.py                 # Per-sample dump for diagnostic probes
+│   ├── eval_diag_compare.py         # Aggregate runs into CSV
+│   ├── data/components/
+│   │   └── inscene15k_dataset.py    # Dataset (extended with diag flags)
+│   ├── models/
+│   │   ├── probe_ext_module.py      # NEW: LitModule for A2/A3/B1/C1
+│   │   └── components/
+│   │       ├── probe_view_consistency.py   # A2 head
+│   │       ├── probe_abnormal.py           # A3 head
+│   │       ├── probe_ego_belief.py         # B1 head
+│   │       └── probe_action_dynamics.py    # C1 head
+│   └── utils/
+│       └── spatial_diag.py          # Geometry helpers (overlap, polar, pose)
+├── scripts/
+│   ├── run_diag_sweep.sh            # Train all 4 probes for one VFM
+│   └── run_diag_eval_sweep.sh       # Eval all runs, write CSV
+└── eval_pertask_v3.py               # A1 evaluation script
+```
+
+---
+
+## Known Issues & Fixes
+
+**PyTorch 2.6 `weights_only` error on checkpoint resume**
+`torch.load` defaults to `weights_only=True` in PyTorch 2.6+, which breaks Lightning checkpoint loading with OmegaConf objects. Fixed in `vidfm3d/train.py` via monkeypatch.
+
+**`last.ckpt` not updating when val/loss plateaus**
+Fixed in `vidfm3d/train.py` via monkeypatch that unconditionally saves `last.ckpt` every epoch.
+
+**Hydra parse error with `=` in checkpoint path**
+`epoch=49-step=104850.ckpt` contains `=` which confuses Hydra's CLI parser. Workaround: symlink to `/tmp/eval_ck.ckpt` first.
+
+**C1 R@1 = nan in test mode**
+Happens when the last batch has < 4 samples. Fix: use `batch_size_per_device=16` (953 % 16 = 9 ≥ 4).
+
+---
+
+## CO3Dv2 and DL3DV (original VidFM3D datasets)
+
+<details>
+<summary>Expand</summary>
+
+### Dataset Preparation
+
+**CO3Dv2:**
 ```bash
 python -m vidfm3d.data.processing.co3d.extract_frames \
     --raw_root vidfm3d/data/CO3D/CO3D-data \
     --out_root vidfm3d/data/CO3D/CO3D-raw \
-    --stride 1 --num_frames 81 \
-    --trunc_thresh 0.25 --resize_to 960 540
-```
-
-3. Extract ground-truth point maps using VGGT:
-```bash
+    --stride 1 --num_frames 81 --trunc_thresh 0.25 --resize_to 960 540
 python -m vidfm3d.data.processing.process_co3d --root vidfm3d/data/CO3D
 ```
 
-### DL3DV
-
-1. Download `DL3DV-10K` from [HuggingFace](https://huggingface.co/datasets/DL3DV/DL3DV-10K), place under `vidfm3d/data/DL3DV/DL3DV-10K/`.
-
-2. Extract ground-truth point maps using VGGT:
+**DL3DV:**
 ```bash
 python -m vidfm3d.data.processing.process_dl3dv --root vidfm3d/data/DL3DV
 ```
 
-## Feature Extraction
-
-### InsScene-15K
-
-```bash
-# WAN2.1-1.3B
-python features/run_inscene15k.py --vfm wan --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers --output-layers 20 --t 749
-
-# CogVideoX-5B
-python features/run_inscene15k.py --vfm cogvideox --model-id THUDM/CogVideoX-5b --output-layers 20 --t 749
-
-# V-JEPA2
-python features/vjepa2/vjepa2_feature.py
-```
-
-### CO3Dv2 / DL3DV
-
+### Feature Extraction
 ```bash
 python -m features.run_co3d  --vfm wan --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers --output-layers 20 --t 749
 python -m features.run_dl3dv --vfm wan --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers --output-layers 20 --t 749
 ```
 
-See `features/run_co3d.py` or `features/run_dl3dv.py` for per-model examples (CogVideoX, Open-Sora, Aether, V-JEPA, DINOv2, Fast3R).
-
-## Training
-
-### InsScene-15K (v3 — recommended)
-
-The v3 configs use pixel-aligned probing with window sampling (`window_size=200`), no point-map head, and train for 100 epochs, saving a checkpoint every 5 epochs.
-
-```bash
-# WAN2.1 on GPU 0
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py experiment=inscene15k/wan_probe_v3
-
-# CogVideoX on GPU 1
-CUDA_VISIBLE_DEVICES=1 python vidfm3d/train.py experiment=inscene15k/cogvideox_probe_v3
-
-# V-JEPA2 on GPU 2
-CUDA_VISIBLE_DEVICES=2 python vidfm3d/train.py experiment=inscene15k/vjepa2_probe_v3
-```
-
-Training auto-resumes from `last.ckpt` if present (`autoresume: true`).
-
-### CO3Dv2 / DL3DV (original VidFM3D)
-
+### Training
 ```bash
 python vidfm3d/train.py experiment=co3d/wan job_name=wan
 python vidfm3d/train.py experiment=dl3dv/wan job_name=wan
 ```
 
-You can override any parameter from the command line using [Hydra override syntax](https://hydra.cc/docs/advanced/override_grammar/basic/).
-
-## Evaluation
-
-### InsScene-15K (v3)
-
-```bash
-python eval_pertask_v3.py
-```
-
-Evaluates depth, camera, and identity heads; reports per-task losses and camera AUC (Auc_30, Rac_30, Tac_30).
-
-### CO3Dv2 / DL3DV
-
-Export metrics from local W&B logs to CSV:
+### Evaluation
 ```bash
 python scripts/parse_results.py \
-  --groups dl3dv,co3d \
-  --runs wan \
-  --metrics "val/Auc_30,val/pmap_mse_aligned,val/loss_depth"
+    --groups dl3dv,co3d --runs wan \
+    --metrics "val/Auc_30,val/pmap_mse_aligned,val/loss_depth"
 ```
 
-### Qualitative Visualization
+</details>
 
-```bash
-python vidfm3d/train.py experiment=co3d/wan task_name=co3d-eval job_name=wan \
-  train=false test=true ckpt_path=/path/to/last.ckpt
-```
-
-Results are saved to `logs/{task_name}/runs/{task_name}_{job_name}/`:
-- `viser_viz/` — interactive 3D point cloud and camera visualization
-- `viz/val/epoch_0/` — depth maps, confidence maps, images
-
-View a 3D scene:
-```bash
-python scripts/viser_view.py --scene logs/co3d-eval/runs/co3d-eval_wan/viser_viz/batch_0_sample_0_pred
-```
-
-## Known Issues & Fixes
-
-**PyTorch 2.6 `weights_only` error on checkpoint resume**  
-`torch.load` defaults to `weights_only=True` in PyTorch 2.6+, which breaks Lightning checkpoint loading with OmegaConf objects. Fixed in `vidfm3d/train.py` via a monkeypatch that forces `weights_only=False`.
-
-**`last.ckpt` not updating when val/loss plateaus**  
-Lightning's `ModelCheckpoint` gates `save_last` on the top-k save triggering. If val/loss stops improving, `last.ckpt` is silently skipped. Fixed in `vidfm3d/train.py` via a monkeypatch that unconditionally saves `last.ckpt` after every epoch.
+---
 
 ## Citation
 
@@ -213,179 +409,11 @@ Lightning's `ModelCheckpoint` gates `save_last` on the top-k save triggering. If
 }
 ```
 
-## Acknowledgments & Licenses
+## Acknowledgments
 
-This project builds on code from the following repositories:
-- **[VidFM3D](https://github.com/zxhuang1698/VidFM3D)**: original probing framework (MIT)
-- **[Fast3R](https://github.com/facebookresearch/fast3r)**: training & data infrastructure
-- **[VGGT](https://github.com/facebookresearch/vggt)**: architecture and data processing
+This project builds on:
+- **[VidFM3D](https://github.com/zxhuang1698/VidFM3D)** — original probing framework (MIT)
+- **[Fast3R](https://github.com/facebookresearch/fast3r)** — training & data infrastructure
+- **[VGGT](https://github.com/facebookresearch/vggt)** — architecture and data processing
 
-Foundation models evaluated in this work, each under its own license:
-- **[WAN 2.1](https://github.com/Wan-Video/Wan2.1)**
-- **[CogVideoX](https://github.com/THUDM/CogVideo)**
-- **[V-JEPA2](https://github.com/facebookresearch/jepa)**
-- **[Open-Sora](https://github.com/hpcaitech/Open-Sora)**
-- **[Aether](https://github.com/OpenRobotLab/Aether)**
-- **[V-JEPA](https://github.com/facebookresearch/jepa)**
-- **[DINOv2](https://github.com/facebookresearch/dinov2)**
-- **[Fast3R](https://github.com/facebookresearch/fast3r)**
-
-<details>
-<summary>Installation Troubleshooting</summary>
-
-**CUDA Runtime Error**
-If you encounter the error `fatal error: cuda_runtime.h: No such file or directory` when installing PyTorch3D, try setting `CUDA_HOME` before installing PyTorch3D:
-
-```bash
-export CUDA_HOME=/usr/local/cuda-12.4
-pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
-```
-
-**PyTorch Import Error (iJIT_NotifyEvent)**
-If you encounter `ImportError: ... libtorch_cpu.so: undefined symbol: iJIT_NotifyEvent` when running `import torch`, it is likely due to an incompatibility with newer versions of Intel MKL. Downgrade `mkl` and `intel-openmp` by running:
-
-```bash
-conda install "mkl<2024.1" "intel-openmp<2024.1" -c conda-forge -y
-```
-
-**Unsupported GNU Version (GCC Compiler Error)**
-If PyTorch3D compilation fails with #error -- unsupported GNU version! gcc versions later than X are not supported!, your C++ compiler is too new for your specific CUDA version (e.g., CUDA 12.4 strictly requires GCC 13 or older). If your system already has a compatible GCC version (check with gcc --version), but Conda is overriding it with a newer one, force the build to use your system's compiler. Otherwise, you can install one directly into your Conda environment. 
-
-</details>
-
-## Dataset Preparation
-
-### CO3Dv2
-
-1. **Download** the raw CO3Dv2 dataset following [the official instructions](https://github.com/facebookresearch/co3d). Place (or symlink) the downloaded categories under `vidfm3d/data/CO3D/CO3D-data/`.
-
-2. **Extract frames**: crops each sequence to a fixed aspect ratio (16:9 by default), subsamples to 81 frames, and rejects poorly-cropped sequences:
-```bash
-python -m vidfm3d.data.processing.co3d.extract_frames \
-    --raw_root vidfm3d/data/CO3D/CO3D-data \
-    --out_root vidfm3d/data/CO3D/CO3D-raw \
-    --stride 1 --num_frames 81 \
-    --trunc_thresh 0.25 --resize_to 960 540
-```
-
-3. **Extract ground-truth point maps** using VGGT:
-```bash
-python -m vidfm3d.data.processing.process_co3d --root vidfm3d/data/CO3D
-```
-
-### DL3DV
-
-1. **Download** `DL3DV-10K` from [HuggingFace](https://huggingface.co/datasets/DL3DV/DL3DV-10K) and place (or symlink) it under `vidfm3d/data/DL3DV/DL3DV-10K/`. The dataset already comes with extracted frames, no additional frame extraction step is needed.
-
-2. **Extract ground-truth point maps** using VGGT:
-```bash
-python -m vidfm3d.data.processing.process_dl3dv --root vidfm3d/data/DL3DV
-```
-
-## Feature Extraction
-
-Use the following command to extract features (using WAN2.1-1.3B as example):
-
-```bash
-python -m features.run_co3d \
-  --vfm wan \
-  --subset all \
-  --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-  --prompt "" \
-  --output-layers 20 \
-  --t 749
-
-python -m features.run_dl3dv \
-  --vfm wan \
-  --subset all \
-  --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-  --prompt "" \
-  --output-layers 20 \
-  --t 749
-```
-Different VFMs may require different arguments; see the top of `features/run_co3d.py` or `features/run_dl3dv.py` for per-model examples.
-
-<details>
-<summary>Adding a new feature extractor</summary>
-
-Create a folder under `features/` with an `extract_features.py` (see `cogvideox/`, `wan/`, `aether/`, `opensora/` as references). For diffusion models, verify the extraction is correct before training — common failure modes include wrong scaling and incorrect conditioning. It helps to include a full denoising loop for debugging; compare `cogvideox_feature.py` vs `cogvideox_feature_denoise.py` or `wan_feature.py` vs `wan_feature_denoise.py` as examples.
-
-</details>
-
-## Training
-
-Train model with chosen experiment configuration from [configs/experiment/](configs/experiment/). For example, to train probe for WAN2.1-1.3B on both datasets:
-
-```bash
-python vidfm3d/train.py experiment=co3d/wan job_name=wan
-python vidfm3d/train.py experiment=dl3dv/wan job_name=wan
-```
-
-You can override any parameter from command line following [Hydra override syntax](https://hydra.cc/docs/advanced/override_grammar/basic/). All the logging can be found on wandb.
-
-## Evaluation & Visualization
-
-### Quantitative Metrics
-
-Export final metrics from local W&B logs to CSV:
-```bash
-python scripts/parse_results.py \
-  --groups dl3dv,co3d \
-  --runs wan \
-  --metrics "val/Auc_30,val/pmap_mse_aligned,val/loss_depth"
-```
-`--metrics` supports wildcard patterns (e.g. `val/*`). Per-run CSVs are written to `logs/metrics/<group>/<run>.csv` and a joint CSV to `logs/metrics/<group>/joint.csv`.
-
-### Qualitative Visualization
-
-The training val loop skips saving viser artifacts. To generate them, run the test loop explicitly:
-```bash
-python vidfm3d/train.py experiment=co3d/wan task_name=co3d-eval job_name=wan train=false test=true ckpt_path=/path/to/checkpoints/last.ckpt
-```
-Results are saved to `logs/{task_name}/runs/{task_name}_{job_name}/` (e.g. `logs/co3d-eval/runs/co3d-eval_wan/`), with two subdirectories:
-- `viser_viz/` — interactive point cloud and camera visualization
-- `viz/val/epoch_0/` — depth maps, confidence maps, and images
-
-To view a 3D scene, port-forward and run:
-```bash
-python scripts/viser_view.py --scene logs/co3d-eval/runs/co3d-eval_wan/viser_viz/batch_0_sample_0_pred
-python scripts/viser_view.py --scene logs/co3d-eval/runs/co3d-eval_wan/viser_viz/batch_0_sample_0_gt
-```
-For apples-to-apples comparison across methods, copy the pose string from one viser session and paste it into others to lock the viewpoint.
-
-### Figure Plotting
-
-The radar plot compares multiple methods at once: run `parse_results.py` with all desired methods in `--runs` first so the joint CSV contains one row per method. Then:
-```bash
-python scripts/plot_radar.py \
-  --csv logs/metrics/co3d/joint.csv \
-  --out results/radar_co3d.png
-```
-
-## Citation
-
-```bibtex
-@article{huang2025vidfm3d,
-  title   = {How Much 3D Do Video Foundation Models Encode?},
-  author  = {Huang, Zixuan and Li, Xiang and Lv, Zhaoyang and Rehg, James M.},
-  booktitle = {arXiv preprint arXiv:2512.19949},
-  year    = {2025}
-}
-```
-
-## Acknowledgments & Licenses
-
-This project builds on code from the following awesome repositories, which retain their original licenses:
-- **[Fast3R](https://github.com/facebookresearch/fast3r)**: training & data infrastructure.
- - **[VGGT](https://github.com/facebookresearch/vggt)**: architecture and data processing.
-
-Foundation models evaluated in this work, each under its own license:
-- **[WAN 2.1](https://github.com/Wan-Video/Wan2.1)**
-- **[CogVideoX](https://github.com/THUDM/CogVideo)**
-- **[Open-Sora](https://github.com/hpcaitech/Open-Sora)**
-- **[Aether](https://github.com/OpenRobotLab/Aether)**
-- **[V-JEPA](https://github.com/facebookresearch/jepa)**
-- **[DINOv2](https://github.com/facebookresearch/dinov2)**
-- **[Fast3R](https://github.com/facebookresearch/fast3r)**
-
-Please refer to each repository for its full license and terms of use.
+Foundation models evaluated: **Wan 2.1**, **CogVideoX**, **V-JEPA2** (each under its own license).

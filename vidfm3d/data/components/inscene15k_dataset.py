@@ -83,6 +83,16 @@ class InsScene15KDataset(EasyDataset):
         max_identity_classes: int = 256,
         window_size: int = 0,
         include_pmaps: bool = True,
+        # ---------- Spatial Diagnostic Suite toggles ----------
+        diag_overlap: bool = False,        # A2: compute (S,S) overlap matrix
+        diag_hidden_obj: bool = False,     # B1: pick hidden object + polar target
+        diag_action: bool = False,         # C1: load target_feat + emit action
+        diag_abnormal: bool = False,       # A3: load shuffled vfm features
+        target_feat_root: str = None,      # root for C1 target features
+        shuffled_feat_root: str = None,    # root for A3 shuffled features
+        scramble_feat: bool = False,       # Control: replace VFM feat with randn (same shape)
+        no_obj_mask: bool = False,         # Ablation: replace obj mask with all-ones (global pool)
+        pose_only: bool = False,           # Ablation: zero out vfm_feat (only last_pose_enc survives)
         **kwargs,
     ):
         """
@@ -118,6 +128,20 @@ class InsScene15KDataset(EasyDataset):
         self.max_identity_classes = max_identity_classes
         self.window_size = window_size
         self.include_pmaps = include_pmaps
+        # Diagnostic suite flags
+        self.diag_overlap = diag_overlap
+        self.diag_hidden_obj = diag_hidden_obj
+        self.diag_action = diag_action
+        self.diag_abnormal = diag_abnormal
+        self.target_feat_root = target_feat_root
+        self.shuffled_feat_root = shuffled_feat_root
+        self.scramble_feat = scramble_feat
+        self.no_obj_mask = no_obj_mask
+        self.pose_only = pose_only
+        # A2/B1/C1 all need extrinsics normalized via pointmap-based scale
+        # (invert_pose_ref_and_scale requires pointmaps).
+        if (diag_overlap or diag_hidden_obj or diag_action) and not include_pmaps:
+            self.include_pmaps = True
         self.kwargs = kwargs
 
         # Collect all scenes
@@ -504,6 +528,108 @@ class InsScene15KDataset(EasyDataset):
             new_masks[masks == old_id] = new_id
         return new_masks
 
+    # --------------- Spatial Diagnostic helpers ---------------
+    def _feat_scene_name(self, scene_info):
+        """Match the directory naming convention used by features/run_inscene15k.py."""
+        scene_dir = scene_info["scene_dir"]
+        if scene_info["source"] == "infinigen":
+            parent = os.path.basename(os.path.dirname(scene_dir))
+            base = os.path.basename(scene_dir)
+            return f"{parent}__{base}" if parent.startswith("scene_") else base
+        return os.path.basename(scene_dir)
+
+    def _feat_filename(self) -> str:
+        """Filename used inside a per-scene feature directory.
+
+        The convention matches features/run_inscene15k.py:
+          - wan / cogvideox: feature{feat_postfix}.sft  (postfix carries _t<t>_layer<n>)
+          - vjepa2:          feature_layer<n>.sft       (postfix carries _layer<n> too;
+                                                         user is expected to set
+                                                         feat_postfix accordingly)
+          - vjepa:           feature.sft
+        Whichever the case, ``feature{feat_postfix}.sft`` is the right pattern as long
+        as feat_postfix matches the extractor's choice. We keep that single source of
+        truth here.
+        """
+        if self.vfm_name == "vjepa":
+            return "feature.sft"
+        return f"feature{self.feat_postfix}.sft"
+
+    def _load_target_feat(self, scene_info, target_global_idx, num_frames):
+        """Load a clip-isolated target feature for C1.
+
+        Expected file layout:
+            {target_feat_root}/{vfm}/{source}/{scene}/feature{feat_postfix}.sft
+        which contains:
+            feat:           (M, H_f, W_f, C)   — features for M target frames
+            target_indices: (M,) long          — original frame indices
+
+        Returns the feature for the closest target index to target_global_idx,
+        or None if missing.
+        """
+        if self.target_feat_root is None:
+            return None
+        path = os.path.join(
+            self.target_feat_root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+            self._feat_filename(),
+        )
+        if not os.path.exists(path):
+            return None
+        try:
+            data = load_file(path)
+        except Exception as e:
+            logger.warning(f"Failed to read target feat {path}: {e}")
+            return None
+        feat = data["feat"].float()                            # (M, H_f, W_f, C)
+        # Find the metadata for target_indices
+        meta_path = os.path.join(os.path.dirname(path), "target_indices.npy")
+        if os.path.exists(meta_path):
+            tgt_idx = torch.from_numpy(np.load(meta_path)).long()
+            # Closest match in the precomputed grid
+            j = (tgt_idx - target_global_idx).abs().argmin().item()
+        else:
+            # Fall back: assume evenly spaced
+            j = min(feat.shape[0] - 1, int(round(target_global_idx / max(num_frames - 1, 1) * (feat.shape[0] - 1))))
+        return feat[j]
+
+    def _load_shuffled_feat(self, scene_info, num_frames, sel_global):
+        """Load shuffled-context vfm features for A3.
+
+        Expected layout mirrors the standard feature layout:
+            {shuffled_feat_root}/{vfm}/{source}/{scene}/feature{feat_postfix}.sft
+        with feat shape (T, H_f, W_f, C) indexed the same way as the original
+        (i.e. shuffled[i] = feature of frame i extracted under scrambled context).
+        """
+        if self.shuffled_feat_root is None:
+            return None
+        path = os.path.join(
+            self.shuffled_feat_root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+            self._feat_filename(),
+        )
+        if not os.path.exists(path):
+            return None
+        try:
+            shuf = load_file(path)["feat"].float()
+        except Exception as e:
+            logger.warning(f"Failed to read shuffled feat {path}: {e}")
+            return None
+        if self.vfm_name == "cogvideox":
+            shuf = shuf.reshape(-1, *shuf.shape[2:])
+        T = shuf.shape[0]
+        vfm_idx = (
+            torch.round(sel_global.float() / max(num_frames - 1, 1) * (T - 1))
+            .long().clamp(0, T - 1)
+        )
+        if self.feat_pixalign:
+            shuf = shuf[vfm_idx]
+        return shuf
+
     def __getitem__(self, idx):
         if self.seed:
             self._rng = np.random.default_rng(seed=self.seed + idx)
@@ -595,25 +721,13 @@ class InsScene15KDataset(EasyDataset):
         # VFM features
         if self.root_vfm is not None:
             source_name = scene_info["source"]
-            # Build scene_name matching extraction output convention:
-            #   infinigen: scene_XXX__<hash>  (parent__basename)
-            #   scannetpp: <scene_id>         (basename only)
-            scene_dir = scene_info["scene_dir"]
-            if source_name == "infinigen":
-                parent = os.path.basename(os.path.dirname(scene_dir))
-                base = os.path.basename(scene_dir)
-                if parent.startswith("scene_"):
-                    feat_scene_name = f"{parent}__{base}"
-                else:
-                    feat_scene_name = base
-            else:
-                feat_scene_name = os.path.basename(scene_dir)
+            feat_scene_name = self._feat_scene_name(scene_info)
             vfm_feat_path = os.path.join(
                 self.root_vfm,
                 self.vfm_name,
                 source_name,
                 feat_scene_name,
-                f"feature{self.feat_postfix}.sft",
+                self._feat_filename(),
             )
             if os.path.exists(vfm_feat_path):
                 vfm_feat = load_file(vfm_feat_path)["feat"]
@@ -639,6 +753,15 @@ class InsScene15KDataset(EasyDataset):
                         vfm_idx = torch.arange(
                             vfm_feat.shape[0], device=vfm_feat.device
                         )
+                if self.scramble_feat:
+                    # Control experiment: replace with unit-normal noise (same shape).
+                    # Use a deterministic seed so the same sample always gets the same noise.
+                    g = torch.Generator()
+                    g.manual_seed(hash((int(idx), 0)) & 0xFFFFFFFF)
+                    vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
+                if self.pose_only:
+                    # Ablation: zero out VFM feat so only last_pose_enc survives in B1.
+                    vfm_feat = torch.zeros_like(vfm_feat)
                 output["vfm_feat"] = vfm_feat
                 output["vfm_idx"] = vfm_idx
             else:
@@ -659,5 +782,107 @@ class InsScene15KDataset(EasyDataset):
         output["rng"] = int.from_bytes(self._rng.bytes(4), "big")
         output["scene_path"] = scene_info["scene_dir"]
         output["vfm_name"] = self.vfm_name
+
+        # ------------------------------------------------------------ Spatial Diagnostic Suite
+        # NOTE: All diagnostic outputs use post-normalization extrinsics + pmaps_scaled.
+        # The geometry stays metrically consistent (rigid transform + uniform scale).
+        if self.diag_overlap or self.diag_hidden_obj or self.diag_action:
+            from vidfm3d.utils.spatial_diag import (
+                compute_overlap_ratio,
+                compute_hidden_object_target,
+                encode_relative_pose,
+            )
+
+        if self.diag_overlap:
+            assert pointmaps_scaled is not None, "diag_overlap requires include_pmaps=True"
+            valid_mask = (depthmaps > 0)                                 # (S, H, W)
+            output["overlap_gt"] = compute_overlap_ratio(
+                pointmaps_scaled, intrinsics, extrinsics, valid_mask
+            )                                                            # (S, S)
+
+        if self.diag_hidden_obj:
+            assert pointmaps_scaled is not None, "diag_hidden_obj requires include_pmaps=True"
+            target = compute_hidden_object_target(
+                identity_ids=masks,
+                pmaps_world=pointmaps_scaled,
+                confmaps=confmaps,
+                extrinsics=extrinsics,
+                last_frame_idx=-1,
+            )
+            S, H, W = masks.shape
+            # ------------------------------------------------------------------ B2 query token
+            # For B2 we emit a 1D appearance signature of the chosen object,
+            # masked-pooled from the past frame with the most visible pixels.
+            # No spatial / pose / mask info is exposed to the probe.
+            vfm_feat_cur = output["vfm_feat"]   # (S, H_f, W_f, C) -- post scramble/pose_only
+            C = vfm_feat_cur.shape[-1]
+
+            if target is None:
+                output["hidden_obj_valid"] = torch.zeros((), dtype=torch.bool)
+                output["hidden_obj_polar"] = torch.zeros(3, dtype=torch.float32)
+                output["hidden_obj_mask"] = torch.zeros(S, H, W, dtype=torch.bool)
+                output["hidden_obj_id"] = torch.tensor(-1, dtype=torch.long)
+                output["belief_query_feat"] = torch.zeros(C, dtype=vfm_feat_cur.dtype)
+                output["belief_query_frame"] = torch.tensor(-1, dtype=torch.long)
+            else:
+                output["hidden_obj_valid"] = target["valid"].cpu()
+                output["hidden_obj_polar"] = target["polar"].cpu()
+                per_frame_mask = target["per_frame_mask"].cpu()
+                output["hidden_obj_id"] = target["obj_id"].cpu()
+
+                # B2: build the appearance-only query token BEFORE any mask ablation,
+                # using the past frame with the most masked pixels.
+                pix_per_frame = per_frame_mask.flatten(1).sum(dim=1)      # (S,)
+                best_frame = int(pix_per_frame.argmax().item())
+                H_f, W_f = vfm_feat_cur.shape[1], vfm_feat_cur.shape[2]
+                m_best = per_frame_mask[best_frame].unsqueeze(0).unsqueeze(0).float()
+                m_feat = torch.nn.functional.interpolate(
+                    m_best, size=(H_f, W_f), mode="nearest"
+                ).squeeze(0).squeeze(0) > 0.5                              # (H_f, W_f)
+                denom = m_feat.float().sum().clamp(min=1.0)
+                query_feat = (vfm_feat_cur[best_frame] * m_feat.unsqueeze(-1)).sum(
+                    dim=(0, 1)
+                ) / denom                                                  # (C,)
+                output["belief_query_feat"] = query_feat
+                output["belief_query_frame"] = torch.tensor(best_frame, dtype=torch.long)
+
+                if self.no_obj_mask:
+                    per_frame_mask = torch.ones_like(per_frame_mask)  # B1 ablation only
+                output["hidden_obj_mask"] = per_frame_mask
+            # Encode last frame's pose as a 9-dim vector for conditioning
+            last_extr = extrinsics[-1]
+            output["last_pose_enc"] = encode_relative_pose(
+                torch.eye(3, 4, dtype=last_extr.dtype), last_extr
+            ).cpu()
+
+        if self.diag_action:
+            # Input frames = first S-1 of vfm_feat already loaded; target frame = last view.
+            # For action_dynamics we need an UNCONTAMINATED target_feat (separate forward).
+            target_feat = self._load_target_feat(
+                scene_info, sel_global[-1].item(), num_frames
+            )
+            if target_feat is not None:
+                output["target_feat"] = target_feat                       # (H_f, W_f, C)
+                output["input_feat"] = output["vfm_feat"][:-1].clone()     # (S-1, H_f, W_f, C)
+                output["action"] = encode_relative_pose(
+                    extrinsics[-2], extrinsics[-1]
+                ).cpu()
+                output["dyn_valid"] = torch.ones((), dtype=torch.bool)
+            else:
+                # Fall back: emit zero-valued tensors so collation works, mark invalid
+                vf = output["vfm_feat"]
+                output["target_feat"] = torch.zeros_like(vf[0])
+                output["input_feat"] = torch.zeros_like(vf[:-1])
+                output["action"] = torch.zeros(9, dtype=torch.float32)
+                output["dyn_valid"] = torch.zeros((), dtype=torch.bool)
+
+        if self.diag_abnormal:
+            shuf = self._load_shuffled_feat(scene_info, num_frames, sel_global)
+            output["vfm_feat_shuffled"] = (
+                shuf if shuf is not None else torch.zeros_like(output["vfm_feat"])
+            )
+            output["abnormal_feat_valid"] = torch.tensor(
+                shuf is not None, dtype=torch.bool
+            )
 
         return output

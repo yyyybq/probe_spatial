@@ -1,42 +1,42 @@
-# --------- lightning --------- #
-lightning>=2.5.0
+# Core deep learning
+torch>=2.6.0
+torchvision>=0.21.0
+torchaudio>=2.6.0
+
+# Lightning training framework
+lightning>=2.6.0
 lightning-bolts
 lightning-utilities
 torchmetrics
 torchinfo
 
-# --------- hydra --------- #
-hydra-core
+# Hydra config
+hydra-core>=1.3.2
 hydra-colorlog
 hydra-optuna-sweeper
 
-# --------- loggers --------- #
+# Loggers
 wandb
 
-# --------- others --------- #
+# Project dependencies
 rootutils       # standardizing the project root setup
 rich            # beautiful text formatting in terminal
-
-# --------- project core --------- #
 trimesh
 roma
 open3d
-einops
-deepspeed
-gradio
-matplotlib
-tqdm
-transformers
+einops>=0.8.0
+transformers>=4.40.0
 diffusers
-jaxtyping
 opencv-python
-viser
-pillow_heif
-plotly
+pillow
+scipy
 scikit-image
 scikit-learn
-scipy
+numpy
+matplotlib
+tqdm
 seaborn
 safetensors
-pyglet<2
-huggingface-hub[torch]>=0.22
+huggingface-hub>=0.22
+jaxtyping
+deepspeed

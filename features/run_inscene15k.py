@@ -175,6 +175,23 @@ def main():
     parser.add_argument("--partition", default="spaced",
                         choices=["spaced", "chunked"],
                         help="V-JEPA partition mode")
+    # ---------------- Spatial Diagnostic Suite extraction modes ----------------
+    parser.add_argument(
+        "--mode", default="normal",
+        choices=["normal", "shuffled", "target_isolated"],
+        help=(
+            "normal: standard clip forward (default).\n"
+            "shuffled: shuffle frame order before VFM forward (for A3 abnormal probe). "
+            "Output features are re-ordered to match the original frame order so that "
+            "shuffled[i] = feature of frame i extracted under scrambled temporal context.\n"
+            "target_isolated: extract clip-isolated features for M target frames "
+            "(replicate each target frame to fill the clip; for C1 action-dynamics probe)."
+        ),
+    )
+    parser.add_argument("--shuffle-seed", type=int, default=42,
+                        help="Seed used to permute frame order in --mode shuffled.")
+    parser.add_argument("--num-targets", type=int, default=8,
+                        help="Number of target frames per scene in --mode target_isolated.")
     args = parser.parse_args()
 
     # Per-VFM defaults
@@ -234,7 +251,11 @@ def main():
         def out_fname(layer):
             return f"feature_layer{layer}.sft"
 
-    vfm_dir_name = args.vfm  # subdirectory under out_root
+    # The mode (normal / shuffled / target_isolated) is differentiated by
+    # `--out-root` (e.g. FEAT vs FEAT_SHUFFLED vs FEAT_TARGET) — the per-VFM
+    # subdirectory keeps a clean, mode-agnostic name so InsScene15KDataset can
+    # locate it via `vfm_name` regardless of mode.
+    vfm_dir_name = args.vfm
 
     # Check how many are already done
     done = 0
@@ -330,32 +351,126 @@ def main():
             )
             os.makedirs(out_dir, exist_ok=True)
 
-            if args.vfm == "wan":
+            # ---------------- Mode dispatch ----------------
+            if args.mode == "shuffled":
+                # Shuffle in *latent-time chunks* so the output's compressed
+                # temporal axis can be cleanly inverse-permuted.
+                #   Wan / CogVideoX (VAE stride 4, first frame standalone):
+                #       chunks = [[0], [1..4], [5..8], ...]
+                #   V-JEPA2 (tubelet size 2): chunks = [[0,1], [2,3], ...]
+                #   else: per-frame.
+                if args.vfm in ("wan", "cogvideox"):
+                    chunks = [[0]]
+                    j = 1
+                    while j < len(frames):
+                        chunks.append(list(range(j, min(j + 4, len(frames)))))
+                        j += 4
+                elif args.vfm == "vjepa2":
+                    chunks = [
+                        list(range(k, min(k + 2, len(frames))))
+                        for k in range(0, len(frames), 2)
+                    ]
+                else:
+                    chunks = [[k] for k in range(len(frames))]
+
+                rng = np.random.default_rng(seed=args.shuffle_seed + i)
+                chunk_perm = rng.permutation(len(chunks))
+                inv_chunk_perm = np.argsort(chunk_perm).tolist()
+                flat_order = [fi for ci in chunk_perm for fi in chunks[ci]]
+                frames_input = [frames[fi] for fi in flat_order]
+            elif args.mode == "target_isolated":
+                # M target frame indices spread across the original sequence
+                M = max(2, min(args.num_targets, len(s["img_files"])))
+                target_local_idx = np.linspace(
+                    0, len(s["img_files"]) - 1, M
+                ).round().astype(int).tolist()
+                target_global = target_local_idx  # already global within the scene
+                frames_input = None  # filled per-target inside the per-VFM block
+            else:
+                frames_input = frames
+
+            if args.mode == "target_isolated":
+                # Run M forwards per layer, collect into (M, H_f, W_f, C) per layer.
+                M = len(target_global)
+                target_imgs = [
+                    Image.open(os.path.join(s["img_dir"], s["img_files"][gi]))
+                    .convert("RGB").resize(
+                        (args.resize[1], args.resize[0]), Image.LANCZOS
+                    )
+                    for gi in target_global
+                ]
+                per_layer_collect = {l: [] for l in (missing_layers if args.vfm != "vjepa" else [0])}
+
+                for tgt_img in target_imgs:
+                    rep_frames = [tgt_img] * args.num_frames
+                    if args.vfm == "wan":
+                        with torch.no_grad():
+                            feats = model.forward(
+                                video=rep_frames, prompt=args.prompt, t=args.t,
+                                output_layer_indices=missing_layers,
+                                ensemble_size=args.ensemble,
+                            )
+                        for layer_id, raw_feat in feats.items():
+                            reshaped = reshape_to_t_h_w_c(raw_feat)  # (T, H_f, W_f, C)
+                            per_layer_collect[layer_id].append(reshaped[reshaped.shape[0] // 2])
+                    elif args.vfm == "cogvideox":
+                        feats = forward_cogvideox(model, rep_frames, t=args.t, layer_ids=missing_layers)
+                        for layer_id, feat in feats.items():
+                            # feat shape (2, T_clip, H_f, W_f, C) -> (2*T_clip, ...) -> middle
+                            f = feat.reshape(-1, *feat.shape[2:])
+                            per_layer_collect[layer_id].append(f[f.shape[0] // 2])
+                    elif args.vfm == "vjepa2":
+                        feats = model(rep_frames, output_layers=missing_layers)
+                        for layer_id, feat in feats.items():
+                            per_layer_collect[layer_id].append(feat[feat.shape[0] // 2])
+                    else:
+                        raise NotImplementedError(
+                            f"target_isolated mode not implemented for vfm={args.vfm}"
+                        )
+
+                for layer_id, lst in per_layer_collect.items():
+                    stacked = torch.stack(lst, dim=0).half().contiguous()
+                    out_path = os.path.join(out_dir, out_fname(layer_id))
+                    save_file({"feat": stacked}, out_path)
+                # Save target index metadata (one per scene, layer-agnostic)
+                np.save(
+                    os.path.join(out_dir, "target_indices.npy"),
+                    np.array(target_global, dtype=np.int64),
+                )
+
+            elif args.vfm == "wan":
                 with torch.no_grad():
                     feats = model.forward(
-                        video=frames, prompt=args.prompt, t=args.t,
+                        video=frames_input, prompt=args.prompt, t=args.t,
                         output_layer_indices=missing_layers,
                         ensemble_size=args.ensemble,
                     )
                 for layer_id, raw_feat in feats.items():
                     reshaped = reshape_to_t_h_w_c(raw_feat)
+                    if args.mode == "shuffled":
+                        reshaped = reshaped[inv_chunk_perm]
                     out_path = os.path.join(out_dir, out_fname(layer_id))
                     save_file({"feat": reshaped.half()}, out_path)
 
             elif args.vfm == "cogvideox":
-                feats = forward_cogvideox(model, frames, t=args.t, layer_ids=missing_layers)
+                feats = forward_cogvideox(model, frames_input, t=args.t, layer_ids=missing_layers)
                 for layer_id, feat in feats.items():
+                    if args.mode == "shuffled":
+                        # feat shape (2, T_latent, H, W, C); leading 2 is CFG, not temporal.
+                        feat = feat[:, inv_chunk_perm]
                     out_path = os.path.join(out_dir, out_fname(layer_id))
                     save_file({"feat": feat.half()}, out_path)
 
             elif args.vfm == "vjepa":
-                feats = model(frames)  # (N_clips, 8, H, W, C)
+                feats = model(frames_input)  # (N_clips, 8, H, W, C)
                 out_path = os.path.join(out_dir, out_fname(0))
                 save_file({"feat": feats.half().contiguous()}, out_path)
 
             elif args.vfm == "vjepa2":
-                feats = model(frames, output_layers=missing_layers)
+                feats = model(frames_input, output_layers=missing_layers)
                 for layer_id, feat in feats.items():
+                    if args.mode == "shuffled":
+                        feat = feat[inv_chunk_perm]
                     out_path = os.path.join(out_dir, out_fname(layer_id))
                     save_file({"feat": feat.half().contiguous()}, out_path)
 

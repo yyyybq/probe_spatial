@@ -1,0 +1,59 @@
+# @package _global_
+# B2: Ego-Centric Belief Probe v2 — query-token formulation.
+# Removes GT obj mask + past-pose conditioning; the probe must do its own
+# re-identification + viewpoint reasoning from a 1D appearance signature.
+
+defaults:
+  - override /model: probe_ext
+  - override /callbacks: v3_checkpoint
+
+seed: 42
+
+tags: ["train", "inscene15k_ext", "wan", "ego_belief_v2"]
+
+task_name: inscene15k_ext
+job_name: ego_belief_v2_wan_ctrl
+
+autoresume: true
+
+paths:
+  run_folder_name: ${task_name}_${job_name}
+
+feat_postfix: _t749_layer20
+data:
+  data_module:
+    train_datasets:
+    - InsScene15KDataset(root='/nas/baiqiao/InsScene-15K/data', root_vfm='/nas/baiqiao/InsScene-15K/FEAT', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='train', vfm_name='wan', feat_postfix='${feat_postfix}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512, window_size=200, include_pmaps=True, diag_hidden_obj=True, scramble_feat=True)
+    validation_datasets:
+    - InsScene15KDataset(root='/nas/baiqiao/InsScene-15K/data', root_vfm='/nas/baiqiao/InsScene-15K/FEAT', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='val', vfm_name='wan', feat_postfix='${feat_postfix}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512, window_size=200, include_pmaps=True, diag_hidden_obj=True, scramble_feat=True)
+    batch_size_per_device: 4
+    batch_size_per_device_val: 4
+    num_workers: 8
+    num_workers_val: 4
+
+logger:
+  wandb:
+    name: ${task_name}_${job_name}
+    group: ${task_name}
+
+model:
+  probe_type: ego_belief_v2
+  probe:
+    _target_: vidfm3d.models.components.probe_ego_belief_v2.EgoBeliefProbeV2
+    in_channels: 1536
+    hidden_dim: 512
+    num_layers: 4
+    num_heads: 8
+    max_seq_len: 8
+    max_h: 36
+    max_w: 64
+    n_az_bins: 16
+    n_el_bins: 8
+    patch_pool: 2
+
+trainer:
+  devices: [0]
+  strategy: auto
+  max_epochs: 50
+  precision: bf16-mixed
+  plugins: []

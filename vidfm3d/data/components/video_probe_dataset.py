@@ -66,7 +66,8 @@ def invert_pose_ref_and_scale(
       new_points:  (S,H,W,3)
     """
     assert extrinsics_3x4.ndim == 3 and extrinsics_3x4.shape[1:] == (3, 4)
-    assert pointmaps_world.ndim == 4 and pointmaps_world.shape[-1] == (3)
+    if pointmaps_world is not None:
+        assert pointmaps_world.ndim == 4 and pointmaps_world.shape[-1] == (3)
     S = extrinsics_3x4.shape[0]
 
     # 1) Convert (3,4)->(4,4)
@@ -84,22 +85,26 @@ def invert_pose_ref_and_scale(
     new_ex_4x4 = E_4x4_all @ E_ref_inv_4x4  # (S,4,4)
     new_ex_3x4 = new_ex_4x4[:, :3, :4]  # back to shape (S,3,4)
 
-    # 4) Transform pointmaps from old-world coords into ref camera coords:
-    #    X'_i = E_ref_4x4 * X, i.e. multiply by E_ref, since E_ref mapped oldWorld->camRef.
-    new_points = []
-    for i in range(S):
-        pm = pointmaps_world[i]  # (H,W,3)
-        pm_flat = pm.reshape(-1, 3)
-        ones = torch.ones(pm_flat.shape[0], 1, dtype=pm.dtype, device=pm.device)
-        pm_h = torch.cat([pm_flat, ones], dim=1)  # (N,4)
-        # apply E_ref_4x4
-        pm_trans_h = (E_ref_4x4 @ pm_h.T).T  # (N,4)
-        pm_trans = pm_trans_h[:, :3].reshape(pm.shape)
-        new_points.append(pm_trans)
-    new_points = torch.stack(new_points, dim=0)  # (S,H,W,3)
+    # 4) Transform pointmaps from old-world coords into ref camera coords.
+    # When pointmaps_world is None (scale_by_points must also be False), skip.
+    if pointmaps_world is not None:
+        new_points = []
+        for i in range(S):
+            pm = pointmaps_world[i]  # (H,W,3)
+            pm_flat = pm.reshape(-1, 3)
+            ones = torch.ones(pm_flat.shape[0], 1, dtype=pm.dtype, device=pm.device)
+            pm_h = torch.cat([pm_flat, ones], dim=1)  # (N,4)
+            # apply E_ref_4x4
+            pm_trans_h = (E_ref_4x4 @ pm_h.T).T  # (N,4)
+            pm_trans = pm_trans_h[:, :3].reshape(pm.shape)
+            new_points.append(pm_trans)
+        new_points = torch.stack(new_points, dim=0)  # (S,H,W,3)
+    else:
+        new_points = None
 
     if not scale_by_points:
-        return new_ex_3x4, new_points
+        # Extrinsics re-based but not scaled; always return 3 values.
+        return new_ex_3x4, new_points, depthmaps
 
     # 5) Optionally, scale the entire scene so that the average distance in ref frame is ~1
     #    We do this by computing mean distance and we scaling the extrinsics and the new_points accordingly.
@@ -108,7 +113,7 @@ def invert_pose_ref_and_scale(
 
     # clamp to avoid blow-ups if the scene is basically empty
     if dist_mean < 1e-3 or dist_mean > 1e4:
-        return new_ex_3x4, new_points
+        return new_ex_3x4, new_points, depthmaps
 
     scale = 1.0 / dist_mean
 
