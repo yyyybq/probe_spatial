@@ -143,10 +143,11 @@ class ProbeExtensionLitModule(LightningModule):
             valid = torch.ones(batch["vfm_feat"].shape[0], dtype=torch.bool,
                                device=batch["vfm_feat"].device)
         n_valid = int(valid.sum().item())
+        device = batch["vfm_feat"].device
         if n_valid == 0:
             zero = self._zero_loss()
             return zero, {"loss_abnormal": zero.detach(),
-                          "abnormal_n_valid": torch.tensor(0.0)}
+                          "abnormal_n_valid": torch.tensor(0.0, device=device)}
 
         feat_normal = batch["vfm_feat"][valid]                 # (B', S, H_f, W_f, C)
         feat_shuf = batch["vfm_feat_shuffled"][valid]
@@ -168,7 +169,7 @@ class ProbeExtensionLitModule(LightningModule):
         metrics = {
             "loss_abnormal": loss.detach(),
             "abnormal_acc": acc,
-            "abnormal_n_valid": torch.tensor(float(n_valid)),
+            "abnormal_n_valid": torch.tensor(float(n_valid), device=device),
         }
         return loss, metrics
 
@@ -177,9 +178,10 @@ class ProbeExtensionLitModule(LightningModule):
         self, batch: Dict[str, torch.Tensor], train: bool
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         valid = batch["hidden_obj_valid"]              # (B,) bool
+        device = batch["vfm_feat"].device
         if valid.sum() == 0:
             zero = self._zero_loss()
-            return zero, {"loss_ego": zero.detach(), "ego_n_valid": torch.tensor(0.0)}
+            return zero, {"loss_ego": zero.detach(), "ego_n_valid": torch.tensor(0.0, device=device)}
 
         vfm_feat = batch["vfm_feat"][valid]            # (B', S, H_f, W_f, C)
         per_pix = batch["hidden_obj_mask"][valid]      # (B', S, H, W)
@@ -206,7 +208,7 @@ class ProbeExtensionLitModule(LightningModule):
             "ego_az_err_deg": ang_err[:, 0].mean(),
             "ego_el_err_deg": ang_err[:, 1].mean(),
             "ego_logd_err": log_dist_err.mean(),
-            "ego_n_valid": torch.tensor(float(valid.sum().item())),
+            "ego_n_valid": torch.tensor(float(valid.sum().item()), device=device),
         }
         return loss, metrics
 
@@ -215,9 +217,10 @@ class ProbeExtensionLitModule(LightningModule):
         self, batch: Dict[str, torch.Tensor], train: bool
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         valid = batch["hidden_obj_valid"]
+        device = batch["vfm_feat"].device
         if valid.sum() == 0:
             zero = self._zero_loss()
-            return zero, {"loss_belief": zero.detach(), "belief_n_valid": torch.tensor(0.0)}
+            return zero, {"loss_belief": zero.detach(), "belief_n_valid": torch.tensor(0.0, device=device)}
 
         vfm_feat = batch["vfm_feat"][valid]                 # (B', S, H_f, W_f, C)
         query_feat = batch["belief_query_feat"][valid]      # (B', C)
@@ -266,7 +269,7 @@ class ProbeExtensionLitModule(LightningModule):
             "belief_top3": top3,
             "belief_ang_err_deg": ang_err_deg.mean(),
             "belief_logd_err": logd_err.mean(),
-            "belief_n_valid": torch.tensor(float(valid.sum().item())),
+            "belief_n_valid": torch.tensor(float(valid.sum().item()), device=device),
         }
         return loss, metrics
 
@@ -279,10 +282,11 @@ class ProbeExtensionLitModule(LightningModule):
             valid = torch.ones(batch["input_feat"].shape[0], dtype=torch.bool,
                                device=batch["input_feat"].device)
         n_valid = int(valid.sum().item())
+        device = batch["input_feat"].device
         if n_valid == 0:
             zero = self._zero_loss()
             return zero, {"loss_dyn": zero.detach(),
-                          "dyn_n_valid": torch.tensor(0.0)}
+                          "dyn_n_valid": torch.tensor(0.0, device=device)}
 
         input_feat = batch["input_feat"][valid]        # (B', T, H_f, W_f, C)
         action = batch["action"][valid]                # (B', 9)
@@ -319,7 +323,7 @@ class ProbeExtensionLitModule(LightningModule):
             "dyn_cos": cos_sim_corr,
             "dyn_R@1": r1,
             "dyn_mean_rank": mean_rank,
-            "dyn_n_valid": torch.tensor(float(n_valid)),
+            "dyn_n_valid": torch.tensor(float(n_valid), device=device),
         }
         return loss, metrics
 

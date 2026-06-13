@@ -1,34 +1,53 @@
 #!/usr/bin/env bash
-# Run eval_diag.py on every (probe, vfm) run that has a last.ckpt under logs/
+# Run eval_diag.py for every inscene15k_ext run that has a last.ckpt and a matching config.
 #   bash scripts/run_diag_eval_sweep.sh
 set -euo pipefail
 
 LOGS_ROOT=${LOGS_ROOT:-logs}
 SPLIT=${SPLIT:-val}
 
-for vfm in wan cogvideox vjepa2; do
-    for probe in view_consistency ego_belief action_dynamics abnormal; do
-        run="inscene15k_ext_${probe}_${vfm}_v1"
-        # find the latest ckpt under any matching run dir
-        ckpt=$(ls -1t ${LOGS_ROOT}/**/${run}/checkpoints/last.ckpt 2>/dev/null | head -n1 || true)
-        if [[ -z "${ckpt}" ]]; then
-            ckpt=$(ls -1t ${LOGS_ROOT}/${run}/checkpoints/last.ckpt 2>/dev/null | head -n1 || true)
-        fi
-        if [[ -z "${ckpt}" ]]; then
-            echo "[skip] no ckpt for ${run}"
-            continue
-        fi
-        echo "==== eval ${run} ===="
-        python vidfm3d/eval_diag.py \
-            experiment=inscene15k_ext/${probe}_${vfm}_v1 \
-            ckpt_path=${ckpt} \
-            eval_split=${SPLIT} \
-            train=false test=false
-    done
+mapfile -t ckpts < <(
+    find "${LOGS_ROOT}" -path '*/inscene15k_ext_*/checkpoints/last.ckpt' -type f -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn \
+        | cut -d' ' -f2-
+)
+
+if (( ${#ckpts[@]} == 0 )); then
+    echo "[skip] no inscene15k_ext last.ckpt files found under ${LOGS_ROOT}"
+    exit 0
+fi
+
+declare -A seen_runs=()
+for ckpt in "${ckpts[@]}"; do
+    run_dir=$(dirname "$(dirname "${ckpt}")")
+    run=$(basename "${run_dir}")
+    if [[ -n "${seen_runs[${run}]:-}" ]]; then
+        continue
+    fi
+    seen_runs[${run}]=1
+
+    job=${run#inscene15k_ext_}
+    cfg_file="configs/experiment/inscene15k_ext/${job}.yaml"
+    if [[ ! -f "${cfg_file}" ]]; then
+        echo "[skip] no config for ${run}: ${cfg_file}"
+        continue
+    fi
+
+    echo "==== eval ${run} ===="
+    python vidfm3d/eval_diag.py \
+        experiment="inscene15k_ext/${job}" \
+        ckpt_path="${ckpt}" \
+        eval_split="${SPLIT}" \
+        train=false test=false
 done
 
-# Aggregate
+mapfile -t run_dirs < <(find "${LOGS_ROOT}" -type d -name 'inscene15k_ext_*' 2>/dev/null | sort)
+if (( ${#run_dirs[@]} == 0 )); then
+    echo "[skip] no evaluated run directories found under ${LOGS_ROOT}"
+    exit 0
+fi
+
 python vidfm3d/eval_diag_compare.py \
-    --runs $(ls -d ${LOGS_ROOT}/*inscene15k_ext_*_v1 2>/dev/null) \
-    --split ${SPLIT} \
-    --output comparison_${SPLIT}.csv
+    --runs "${run_dirs[@]}" \
+    --split "${SPLIT}" \
+    --output "comparison_${SPLIT}.csv"

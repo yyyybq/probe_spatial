@@ -8,6 +8,7 @@ Supports two data sources that have identity masks + depth + camera:
 Point maps are computed from depth + intrinsics + extrinsics via back-projection.
 """
 
+import hashlib
 import logging
 import math
 import os
@@ -91,6 +92,7 @@ class InsScene15KDataset(EasyDataset):
         target_feat_root: str = None,      # root for C1 target features
         shuffled_feat_root: str = None,    # root for A3 shuffled features
         scramble_feat: bool = False,       # Control: replace VFM feat with randn (same shape)
+        allow_missing_vfm: bool = False,   # Debug only: use dummy zeros if a normal VFM feature is missing
         no_obj_mask: bool = False,         # Ablation: replace obj mask with all-ones (global pool)
         pose_only: bool = False,           # Ablation: zero out vfm_feat (only last_pose_enc survives)
         **kwargs,
@@ -136,6 +138,7 @@ class InsScene15KDataset(EasyDataset):
         self.target_feat_root = target_feat_root
         self.shuffled_feat_root = shuffled_feat_root
         self.scramble_feat = scramble_feat
+        self.allow_missing_vfm = allow_missing_vfm
         self.no_obj_mask = no_obj_mask
         self.pose_only = pose_only
         # A2/B1/C1 all need extrinsics normalized via pointmap-based scale
@@ -730,7 +733,12 @@ class InsScene15KDataset(EasyDataset):
                 self._feat_filename(),
             )
             if os.path.exists(vfm_feat_path):
-                vfm_feat = load_file(vfm_feat_path)["feat"]
+                # NOTE: cast to fp32 to match `_load_shuffled_feat` which does
+                # `.float()`. A dtype mismatch (fp16 vs fp32) between the two
+                # branches lets a probe trivially detect the dtype quantization
+                # signature instead of using content — see A3 ctrl dtype-leak
+                # finding in PROGRESS_REPORT.md.
+                vfm_feat = load_file(vfm_feat_path)["feat"].float()
                 if self.vfm_name in ["wan", "opensora", "vjepa2"]:
                     T = vfm_feat.shape[0]
                     vfm_idx = torch.round(
@@ -755,9 +763,12 @@ class InsScene15KDataset(EasyDataset):
                         )
                 if self.scramble_feat:
                     # Control experiment: replace with unit-normal noise (same shape).
-                    # Use a deterministic seed so the same sample always gets the same noise.
+                    # Seed on scene_dir (not idx) so train/val index overlap does not let
+                    # the probe memorise noise patterns across splits. See A3 ctrl seed-leak
+                    # finding in PROGRESS_REPORT.md.
                     g = torch.Generator()
-                    g.manual_seed(hash((int(idx), 0)) & 0xFFFFFFFF)
+                    _seed_n = int(hashlib.md5((scene_info["scene_dir"] + ":n").encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+                    g.manual_seed(_seed_n)
                     vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
                 if self.pose_only:
                     # Ablation: zero out VFM feat so only last_pose_enc survives in B1.
@@ -765,11 +776,20 @@ class InsScene15KDataset(EasyDataset):
                 output["vfm_feat"] = vfm_feat
                 output["vfm_idx"] = vfm_idx
             else:
-                logger.warning(
-                    f"VFM feature not found at {vfm_feat_path}, using dummy."
-                )
+                msg = f"VFM feature not found at {vfm_feat_path}"
+                if not self.allow_missing_vfm:
+                    raise FileNotFoundError(
+                        msg + "; run feature extraction first or set allow_missing_vfm=True for debugging"
+                    )
+                logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
+                dummy_channels = {
+                    "wan": 1536,
+                    "cogvideox": 3072,
+                    "vjepa2": 1024,
+                    "vjepa": 1024,
+                }.get(self.vfm_name, 1536)
                 output["vfm_feat"] = torch.zeros(
-                    self.num_views, 18, 32, 1536, dtype=torch.float32
+                    self.num_views, 18, 32, dummy_channels, dtype=torch.float32
                 )
                 output["vfm_idx"] = torch.arange(self.num_views)
         else:
@@ -881,6 +901,19 @@ class InsScene15KDataset(EasyDataset):
             output["vfm_feat_shuffled"] = (
                 shuf if shuf is not None else torch.zeros_like(output["vfm_feat"])
             )
+            # Control consistency: if scramble_feat is on, the "normal" branch
+            # (vfm_feat) was replaced by N(0,1) noise above. The shuffled branch
+            # must be scrambled too, otherwise the probe trivially distinguishes
+            # noise-vs-real-features and gets ~100% acc without using time order.
+            if self.scramble_feat and shuf is not None:
+                g = torch.Generator()
+                _seed_s = int(hashlib.md5((scene_info["scene_dir"] + ":s").encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+                g.manual_seed(_seed_s)
+                output["vfm_feat_shuffled"] = torch.randn(
+                    output["vfm_feat_shuffled"].shape,
+                    generator=g,
+                    dtype=output["vfm_feat_shuffled"].dtype,
+                )
             output["abnormal_feat_valid"] = torch.tensor(
                 shuf is not None, dtype=torch.bool
             )

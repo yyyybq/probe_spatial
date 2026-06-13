@@ -171,13 +171,13 @@ python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
     --t 749 --output-layers 20 --num-targets 8
 ```
 
-Switch `--vfm cogvideox --model-id THUDM/CogVideoX-5b` or
+Switch `--vfm cogvideox --model-id THUDM/CogVideoX-5b-I2V` or
 `--vfm vjepa2` (uses `features/vjepa2/vjepa2_feature.py`) for other VFMs.
 
 | VFM | `--vfm` | `--model-id` | `feat_postfix` | `in_channels` |
 |-----|---------|-------------|---------------|--------------|
 | Wan2.1-T2V-1.3B | `wan` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | `_t749_layer20` | 1536 |
-| CogVideoX-5B | `cogvideox` | `THUDM/CogVideoX-5b` | `_t749_layer20` | 3072 |
+| CogVideoX-5B | `cogvideox` | `THUDM/CogVideoX-5b-I2V` | `_t749_layer20` | 3072 |
 | V-JEPA2-ViT-L | `vjepa2` | see `features/vjepa2/` | `_layer23` | 1024 |
 
 ---
@@ -289,7 +289,7 @@ Results summary (InsScene-15K val, 953 samples):
 | Probe | Wan v1 | Wan ctrl | V-JEPA2 v1 | Note |
 |-------|--------|----------|-----------|------|
 | A2 overlap_acc↑ | 85.6% | 78.7% | 85.2% | trivial baseline=84.3% |
-| A3 abnormal_acc↑ | 92.1% | 100%* | 97.5% | *anomalous |
+| A3 pair_acc↑ | 86.3% | 16.5% | pending re-eval | Wan numbers after dtype/seed fixes |
 | B1 az_err↓ | 18.1° | 23.4° | 17.6° | |
 | B1 el_err↓ | 11.4° | 15.1° | 11.7° | |
 | C1 R@1↑ | 26.7% | 5.8% | 22.8% | random=6.25% |
