@@ -50,6 +50,10 @@ python -m features.run_inscene15k --vfm wan --mode target_isolated \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_TARGET \
     --t 749 --output-layers 20 --num-targets 8
 
+# Layer sweeps: pass multiple layers, then train with feature_layer=<L>.
+# Current defaults are Wan/CogVideoX layer20 at t=749, V-JEPA2 layer23,
+# and MLLM/VLM layer -1 caches.
+
 # 5. Train all 4 new probes for Wan on GPU 0
 bash scripts/run_diag_sweep.sh wan 0
 
@@ -63,6 +67,17 @@ bash scripts/run_diag_eval_sweep.sh   # writes comparison_val.csv
 > ```bash
 > python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
 >     model.probe.target_feat_root=/data/InsScene-15K/FEAT_TARGET
+> ```
+
+On a shared cluster, the dataset also honors `INSCENE_DATA_ROOT`,
+`INSCENE_FEAT_ROOT`, `INSCENE_TARGET_FEAT_ROOT`, and
+`INSCENE_SHUFFLED_FEAT_ROOT`; these take precedence over legacy YAML paths.
+> See `PROBE_SPATIAL_GUIDE.md` §8.1.1 for layer-wise extraction, probing, and
+> `scripts/summarize_layer_sweep.py` best-layer/last-layer reports.
+> End-to-end layer sweeps use:
+> ```bash
+> VFM=wan PROBE=view_consistency LAYERS="0 5 10 15 20 25 29" \
+>   bash scripts/run_feature_layer_probe_sweep.sh
 > ```
 
 ---
@@ -180,6 +195,61 @@ Switch `--vfm cogvideox --model-id THUDM/CogVideoX-5b-I2V` or
 | CogVideoX-5B | `cogvideox` | `THUDM/CogVideoX-5b-I2V` | `_t749_layer20` | 3072 |
 | V-JEPA2-ViT-L | `vjepa2` | see `features/vjepa2/` | `_layer23` | 1024 |
 
+### Feature layer convention
+
+The current diagnostic defaults are now centralized in
+`vidfm3d/utils/feature_layers.py` and remain backward compatible:
+
+| Model family | Current default layer | Meaning |
+|-----|-----:|-----|
+| Wan2.1 | 20 | diffusion transformer block 20 at timestep `t=749` |
+| CogVideoX | 20 | diffusion transformer block 20 at timestep `t=749` |
+| V-JEPA2 ViT-L | 23 | last encoder block, 0-based |
+| Qwen2.5-VL / BAGEL caches | -1 | current default visual-token / last-layer cache |
+
+To probe other layers, extract them by passing explicit layer ids, or use the
+aliases `default`, `last`, and `all`:
+
+```bash
+# Multiple Wan layers in one pass; writes feature_t749_layer{L}.sft files.
+python -m features.run_inscene15k --vfm wan \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT \
+    --t 749 --output-layers 0 5 10 15 20 25 29
+
+# V-JEPA2 all registered layers; writes feature_layer{L}.sft files.
+python -m features.run_inscene15k --vfm vjepa2 \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT \
+    --all-layers
+
+# Qwen2.5-VL: -1 is the default visual-merger cache; non-negative ids are
+# vision-tower blocks captured by hooks.
+python -m features.run_inscene15k_mllm --backend qwen2_5_vl \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_MLLM \
+    --output-layers -1 0 8 16 24 31
+```
+
+Layer-wise probe training uses the same experiment YAML and only overrides the
+feature filename / run name:
+
+```bash
+DRY_RUN=1 VFM=wan PROBE=ego_belief LAYERS="0 5 10 15 20 25 29" \
+    bash scripts/run_feature_layer_probe_sweep.sh
+
+VFM=vjepa2 PROBE=action_dynamics LAYERS="0 5 11 17 23" DEV=1 \
+    bash scripts/run_feature_layer_probe_sweep.sh
+```
+
+The script extracts required feature modes, trains one probe per layer,
+evaluates checkpoints, and summarizes the layer-wise curve. To summarize
+existing evaluated runs manually:
+
+```bash
+python scripts/summarize_layer_sweep.py \
+    --vfm wan --probe ego_belief \
+    --pattern "inscene15k_ext_ego_belief_wan_layer*" \
+    --output layer_sweep_ego_belief_wan.csv
+```
+
 ---
 
 ## Training
@@ -257,18 +327,15 @@ python vidfm3d/eval_diag.py \
     eval_split=val train=false test=false
 ```
 
-**Test mode** (final numbers, runs the test dataloader):
+**Test mode** (final numbers; requires a frozen three-way split manifest):
 ```bash
-# Using a symlink to avoid Hydra=sign parsing issue
-ln -s logs/<run>/checkpoints/epoch=49-step=104850.ckpt /tmp/eval_ck.ckpt
-python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
-    train=False test=True ckpt_path=/tmp/eval_ck.ckpt \
-    data.data_module.batch_size_per_device=16 \
-    data.data_module.batch_size_per_device_val=16
+export INSCENE_SPLIT_MANIFEST=$PWD/configs/splits/inscene15k_v1.json
+python vidfm3d/eval_diag.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
+    ckpt_path=/path/to/last.ckpt +eval_split=test train=false test=false
 ```
 
-> **Tip**: Use `batch_size=16` for test to avoid nan in C1 R@1 (the last batch
-> must have ≥ 4 samples; 953 val samples % 16 = 9 ✓).
+`eval_diag.py` computes C1 retrieval globally, so final R@K no longer depends
+on evaluation batch size. It also reports no-action and last-observation baselines.
 
 ### A1 Baseline Probe
 
@@ -290,9 +357,9 @@ Results summary (InsScene-15K val, 953 samples):
 |-------|--------|----------|-----------|------|
 | A2 overlap_acc↑ | 85.6% | 78.7% | 85.2% | trivial baseline=84.3% |
 | A3 pair_acc↑ | 86.3% | 16.5% | pending re-eval | Wan numbers after dtype/seed fixes |
-| B1 az_err↓ | 18.1° | 23.4° | 17.6° | |
-| B1 el_err↓ | 11.4° | 15.1° | 11.7° | |
-| C1 R@1↑ | 26.7% | 5.8% | 22.8% | random=6.25% |
+| B1 az_err↓ | legacy | legacy | legacy | pre no-pose task definition; rerun required |
+| B1 el_err↓ | legacy | legacy | legacy | pre no-pose task definition; rerun required |
+| C1 R@1↑ | legacy | legacy | legacy | pre exact-target/global-retrieval fix; rerun required |
 
 ---
 
@@ -349,8 +416,9 @@ Fixed in `vidfm3d/train.py` via monkeypatch that unconditionally saves `last.ckp
 **Hydra parse error with `=` in checkpoint path**
 `epoch=49-step=104850.ckpt` contains `=` which confuses Hydra's CLI parser. Workaround: symlink to `/tmp/eval_ck.ckpt` first.
 
-**C1 R@1 = nan in test mode**
-Happens when the last batch has < 4 samples. Fix: use `batch_size_per_device=16` (953 % 16 = 9 ≥ 4).
+**C1 target caches**
+The dataset now accepts only exact target-frame matches. Sparse target caches
+are sampled directly; use `--num-targets 0` when every frame must be available.
 
 ---
 

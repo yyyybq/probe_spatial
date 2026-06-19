@@ -1,6 +1,6 @@
 _target_: vidfm3d.models.probe_ext_module.ProbeExtensionLitModule
 
-probe_type: ???   # one of: view_consistency, abnormal, ego_belief, action_dynamics
+probe_type: ???   # one of: view_consistency, abnormal, ego_belief, ego_belief_v2, action_dynamics, path_integration, counterfactual
 output_path: ${paths.output_dir}
 
 optimizer:

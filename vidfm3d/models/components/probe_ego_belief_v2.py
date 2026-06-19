@@ -1,8 +1,8 @@
 """B2 - Ego-Centric Belief probe v2 (query-token formulation).
 
-This probe tests the same scientific question as B1 but removes the privileged
-inputs (GT obj mask + ground-truth past camera poses).  The model must do its
-own re-identification and viewpoint reasoning, using ONLY:
+This probe tests the same scientific question as B1 with a compact object
+condition and no camera pose. A GT mask is used outside the head to specify
+which past object is queried, but no spatial mask is passed into the head:
 
     vfm_feat:    (B, S, H_f, W_f, C)   -- S frames of patch features (the last
                                            frame is the "current" view that
@@ -17,17 +17,15 @@ Output: a discrete belief distribution over (azimuth, elevation) bins in the
 last frame's camera coordinate system, plus a regressed log-distance scalar.
 
 The probe internally:
-    1. Embeds all patches with shared frame-role embeddings (past vs current)
-       and 2-D spatial position embeddings.
+    1. Embeds all patches with frame-order and 2-D spatial embeddings.
     2. Adds a single learnable "belief" CLS token initialized by the query
        embedding.
     3. Runs Transformer self-attention over (belief + patches).
     4. Reads off the belief token and decodes joint (az, el) logits plus a
        log-distance scalar.
 
-The model is never told which frame is "current"; we adopt the convention that
-the LAST frame in the sequence is current and tag it with a learned role
-embedding.  This is the only piece of side information the probe receives.
+The model is not given a current-frame flag or camera pose. Sequence order and
+the target definition establish that predictions use the last-frame reference.
 """
 
 from __future__ import annotations
@@ -76,10 +74,6 @@ class EgoBeliefProbeV2(nn.Module):
         self.col_embed = nn.Parameter(torch.zeros(1, max_w_p, hidden_dim))
         nn.init.normal_(self.row_embed, std=0.02)
         nn.init.normal_(self.col_embed, std=0.02)
-
-        # Frame role embeddings: 0 = past, 1 = current
-        self.role_embed = nn.Parameter(torch.zeros(2, hidden_dim))
-        nn.init.normal_(self.role_embed, std=0.02)
 
         # Frame index embedding (treat all past frames as exchangeable but
         # still give them a small distinct id so attention can differentiate).
@@ -132,10 +126,7 @@ class EgoBeliefProbeV2(nn.Module):
         spatial = row + col                                    # (1, Hp, Wp, D)
         z = z + spatial.unsqueeze(1)                           # broadcast over S
 
-        # Frame role + index embeddings
-        role = self.role_embed[0].expand(S, -1).clone()        # all past
-        role[-1] = self.role_embed[1]                          # last = current
-        z = z + role.view(1, S, 1, 1, -1)
+        # Frame order is available, but no frame receives a privileged role.
         z = z + self.frame_embed[:, :S].view(1, S, 1, 1, -1)
 
         # Flatten to (B, S*Hp*Wp, D)

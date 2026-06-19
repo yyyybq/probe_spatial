@@ -6,6 +6,31 @@
 
 ---
 
+> **2026-06-19 protocol change:** B1/B2 no longer receive camera pose or an
+> explicit current-frame role condition. C1 now requires exact target/action
+> alignment and global retrieval evaluation. Older B1/B2/C1 numbers below are
+> historical diagnostics and require rerunning before publication.
+
+## 2026-06-14 方法更新：支持 layer-wise probing
+
+当前默认 probe 层已确认并保持不变：
+
+| Backend | Default feature file | 含义 |
+|---|---|---|
+| Wan2.1 | `feature_t749_layer20.sft` | diffusion transformer block 20 at timestep 749 |
+| CogVideoX | `feature_t749_layer20.sft` | diffusion transformer block 20 at timestep 749 |
+| V-JEPA2 ViT-L | `feature_layer23.sft` | last encoder block, 0-based layer 23 |
+| Qwen2.5-VL / BAGEL | `feature_layer-1.sft` | 当前 MLLM default visual-token / last-layer cache |
+
+新增能力：
+- `vidfm3d/utils/feature_layers.py` 集中维护默认层、last layer、文件名和通道数规则。
+- `features/run_inscene15k.py` 支持 `--output-layers default|last|all|...` 和 `--all-layers`，可一次缓存多层 Wan / CogVideoX / V-JEPA2 feature。
+- `features/run_inscene15k_mllm.py` 支持同样的层参数；Qwen2.5-VL 的 `-1` 保持当前 visual-merger 默认，非负层号通过 hooks 抓 vision tower block 输出。
+- `scripts/run_layer_sweep.sh` 可复用现有 experiment YAML 扫不同 layer；`scripts/summarize_layer_sweep.py` 汇总 best layer score、default layer score、last layer score 和 layer-wise CSV。
+- `vidfm3d/eval_diag.py` 的 summary 写入 `feature_layer / feat_postfix / job_name`，便于跨层比较。
+
+---
+
 ## 一、研究目标
 
 我们想知道：**视频基础模型是否理解三维场景结构？**
@@ -157,14 +182,16 @@ Wan v1（85.6%）和 V-JEPA2（85.2%）只比最简单基线高 1 个百分点�
 ### 问题 3：B1 的 GT 掩码"信息泄露"
 **现象**：B1 完整版（v1）表现很好，但消融发现，一旦去掉 GT 掩码（nomask），效果立即跌回 baseline。  
 **含义**：B1 其实是"带作弊"版，GT 掩码告诉模型精确的物体位置，使问题变得容易。  
-**解决方案**：设计 B2 探针——不提供 GT 掩码和相机位姿，只用物体的"外观特征"（视频中物体可见时的 VFM 特征）来预测物体消失后的位置。B2 才是真正测试 VFM 空间记忆能力的任务。
+**最新定义**：B2 不向 head 提供空间掩码或相机位姿，但用过去帧的
+GT mask 构造 1D object query，以明确指定要预测哪个 object。GT mask
+因此是 object-condition 构造工具，不应再描述为完全不使用 GT mask。
 
 ---
 
 ## 五、B2 探针：纯外观特征 → 空间位置（无信息泄露）
 
 **B2 探针设计**：  
-- 输入：整段视频的 VFM 特征（4帧） + 物体在视野中时的外观特征（自动从可见帧中提取，无需 GT 掩码、无需相机位姿）  
+- 输入：整段视频的 VFM 特征（4帧） + 由过去 GT object mask 构造的 1D 外观 query；head 不接收空间 mask 或相机位姿。
 - 输出：预测物体相对于最后一帧相机的方向（方位角 × 仰角的分类问题，16×8 = 128 个方向格子）+ 对数距离回归  
 - 这才是真正的"仅凭外观特征推断空间位置"的探针，无任何泄露  
 
@@ -237,6 +264,26 @@ Wan v1（85.6%）和 V-JEPA2（85.2%）只比最简单基线高 1 个百分点�
 | Wan v1 | 85.6% | 0.143 |
 | Wan ctrl | 78.7% | 0.180 |
 | V-JEPA2 v1 | 85.2% | 0.142 |
+
+### C2/C3 新增探针 5 epoch 结果（1000 train steps）
+
+> 这是 C2/C3 第一版完整 5 epoch 实验：四个实验均从 `epoch=0-step=200` 自动续训到 `epoch=4-step=1000`，并在 val split（n=953）上重新评估。它仍不是 50 epoch 长训；主要瓶颈是大 VFM/target feature 的 I/O 和 CPU 张量处理。
+
+#### C2 Path Integration（越低越好，检索指标越高越好）
+| 模型 | final_pose_error | drift_rate | mean_step_pose_error | global_R@1 | global_R@5 |
+|------|------------------|------------|----------------------|------------|------------|
+| Wan v1 | **2.508** | **0.563** | 1.615 | 0.14% | 0.63% |
+| V-JEPA2 v1 | 2.514 | 0.568 | **1.591** | **0.17%** | **0.73%** |
+
+**初步解读**：5 epoch 后两个模型的 pose-error 已明显低于 epoch0，说明 Path Integration probe 确实开始学习轨迹积分；Wan 与 V-JEPA2 的 final_pose_error 基本打平，V-JEPA2 的 mean_step_pose_error 略好。检索 R@1/R@5 仍很低，说明 target feature 检索结构尚未稳定形成，后续需要更长训练或改进特征压缩/采样策略。
+
+#### C3 Counterfactual（越高越好）
+| 模型 | n_valid_interventions | counterfactual_consistency | intervention_validity | intervention_margin | global_R@1 |
+|------|-----------------------|----------------------------|-----------------------|---------------------|------------|
+| Wan v1 | 1527 | **0.9890** | 41.7% | **-0.00016** | 0.20% |
+| V-JEPA2 v1 | 1509 | 0.8659 | **41.9%** | -0.00108 | **0.53%** |
+
+**初步解读**：Counterfactual 的 cosine consistency 已从 epoch0 的近 0 提升到很高，说明 probe 学会了生成与目标特征空间相容的 counterfactual 表征；Wan 的 consistency 更高，V-JEPA2 的 retrieval R@1 更高。intervention_validity 仍约 42%，intervention_margin 仍接近 0，说明模型还没有稳定学到“干预后目标应比原目标更匹配”的判别性结构，当前更像学到了特征空间平滑/平均化，而非强 counterfactual 推理。
 
 ### A1 基线探针（来自 VidFM3D，100 epochs）
 

@@ -9,6 +9,7 @@ Point maps are computed from depth + intrinsics + extrinsics via back-projection
 """
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -23,6 +24,10 @@ from safetensors.torch import load_file
 
 from vidfm3d.data.components.video_probe_dataset import invert_pose_ref_and_scale
 from vidfm3d.dust3r.datasets.base.easy_dataset import EasyDataset
+from vidfm3d.utils.feature_layers import (
+    default_feature_channels,
+    feature_filename,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +77,9 @@ class InsScene15KDataset(EasyDataset):
         split: str = "train",
         vfm_name: str = "wan",
         feat_postfix: str = "_t749_layer20",
+        feature_layer: int = None,
+        feature_timestep: int = None,
+        feature_prefix: str = "feature",
         feat_pixalign: bool = True,
         seed: int = None,
         num_views: int = 4,
@@ -81,20 +89,32 @@ class InsScene15KDataset(EasyDataset):
         target_h: int = 288,
         target_w: int = 512,
         train_ratio: float = 0.9,
+        split_manifest: str = None,
         max_identity_classes: int = 256,
         window_size: int = 0,
         include_pmaps: bool = True,
+        streaming_prefix: bool = False,
+        prefix_stride: int = 1,
+        prefix_min_len: int = 1,
+        prefix_max_len: int = None,
+        streaming_feat_root: str = None,
+        streaming_prefix_dir_fmt: str = "prefix_{tail:06d}",
         # ---------- Spatial Diagnostic Suite toggles ----------
         diag_overlap: bool = False,        # A2: compute (S,S) overlap matrix
         diag_hidden_obj: bool = False,     # B1: pick hidden object + polar target
         diag_action: bool = False,         # C1: load target_feat + emit action
         diag_abnormal: bool = False,       # A3: load shuffled vfm features
+        diag_path_integration: bool = False,  # C2: recurrent multi-action feature prediction
+        diag_counterfactual: bool = False,    # C3: multi-horizon action intervention prediction
         target_feat_root: str = None,      # root for C1 target features
         shuffled_feat_root: str = None,    # root for A3 shuffled features
+        action_horizons: list = None,      # frame offsets from anchor, e.g. [1, 10, 30]
+        counterfactual_min_overlap: float = 0.05,
         scramble_feat: bool = False,       # Control: replace VFM feat with randn (same shape)
         allow_missing_vfm: bool = False,   # Debug only: use dummy zeros if a normal VFM feature is missing
         no_obj_mask: bool = False,         # Ablation: replace obj mask with all-ones (global pool)
-        pose_only: bool = False,           # Ablation: zero out vfm_feat (only last_pose_enc survives)
+        pose_only: bool = False,           # Deprecated alias for unconditional_baseline
+        unconditional_baseline: bool = False,  # zero visual/object conditions
         **kwargs,
     ):
         """
@@ -110,6 +130,13 @@ class InsScene15KDataset(EasyDataset):
             window_size: If > 0, split long videos into overlapping windows of this size.
                          Stride = window_size // 2.  0 or negative disables windowing.
         """
+        # Site-specific storage is supplied by the scheduler/environment. This
+        # keeps historical YAMLs runnable without baking one cluster's mount
+        # points into the scientific configuration.
+        root = os.environ.get("INSCENE_DATA_ROOT", root)
+        root_vfm = os.environ.get("INSCENE_FEAT_ROOT", root_vfm)
+        target_feat_root = os.environ.get("INSCENE_TARGET_FEAT_ROOT", target_feat_root)
+        shuffled_feat_root = os.environ.get("INSCENE_SHUFFLED_FEAT_ROOT", shuffled_feat_root)
         if sources is None:
             sources = ["processed_infinigen", "processed_scannetpp_v2"]
 
@@ -119,6 +146,9 @@ class InsScene15KDataset(EasyDataset):
         self.split = split
         self.vfm_name = vfm_name
         self.feat_postfix = feat_postfix
+        self.feature_layer = feature_layer
+        self.feature_timestep = feature_timestep
+        self.feature_prefix = feature_prefix
         self.feat_pixalign = feat_pixalign
         self.seed = seed
         self.num_views = num_views
@@ -128,22 +158,35 @@ class InsScene15KDataset(EasyDataset):
         self.target_h = target_h
         self.target_w = target_w
         self.max_identity_classes = max_identity_classes
+        self.split_manifest = split_manifest or os.environ.get("INSCENE_SPLIT_MANIFEST")
         self.window_size = window_size
         self.include_pmaps = include_pmaps
+        self.streaming_prefix = streaming_prefix
+        self.prefix_stride = max(int(prefix_stride), 1)
+        self.prefix_min_len = max(int(prefix_min_len), 1)
+        self.prefix_max_len = int(prefix_max_len) if prefix_max_len is not None else None
+        self.streaming_feat_root = streaming_feat_root
+        self.streaming_prefix_dir_fmt = streaming_prefix_dir_fmt
+        self._streaming_prefix_meta_cache = {}
+        self._target_index_cache = {}
         # Diagnostic suite flags
         self.diag_overlap = diag_overlap
         self.diag_hidden_obj = diag_hidden_obj
         self.diag_action = diag_action
         self.diag_abnormal = diag_abnormal
+        self.diag_path_integration = diag_path_integration
+        self.diag_counterfactual = diag_counterfactual
         self.target_feat_root = target_feat_root
         self.shuffled_feat_root = shuffled_feat_root
+        self.action_horizons = sorted({int(h) for h in (action_horizons or []) if int(h) > 0})
+        self.counterfactual_min_overlap = counterfactual_min_overlap
         self.scramble_feat = scramble_feat
         self.allow_missing_vfm = allow_missing_vfm
         self.no_obj_mask = no_obj_mask
-        self.pose_only = pose_only
+        self.pose_only = pose_only or unconditional_baseline
         # A2/B1/C1 all need extrinsics normalized via pointmap-based scale
         # (invert_pose_ref_and_scale requires pointmaps).
-        if (diag_overlap or diag_hidden_obj or diag_action) and not include_pmaps:
+        if (diag_overlap or diag_hidden_obj or diag_action or diag_path_integration or diag_counterfactual) and not include_pmaps:
             self.include_pmaps = True
         self.kwargs = kwargs
 
@@ -160,23 +203,67 @@ class InsScene15KDataset(EasyDataset):
             elif source == "processed_scannetpp_v2":
                 self._collect_scannetpp_scenes(source_path)
 
-        # Split scenes
-        rng = np.random.default_rng(seed=42)
-        indices = rng.permutation(len(self.scenes))
-        split_idx = int(len(self.scenes) * train_ratio)
-        if split == "train":
-            self.scenes = [self.scenes[i] for i in indices[:split_idx]]
+        # Split at scene level before window expansion. A frozen manifest is
+        # required for a genuine test set and strongly recommended otherwise.
+        if self.split_manifest:
+            with open(self.split_manifest) as f:
+                manifest = json.load(f)
+            splits = manifest.get("splits", manifest)
+            if split not in splits:
+                raise ValueError(f"Split {split!r} missing from {self.split_manifest}")
+            allowed = set(splits[split])
+            self.scenes = [s for s in self.scenes if self._scene_key(s) in allowed]
+            missing = allowed - {self._scene_key(s) for s in self.scenes}
+            if missing:
+                raise ValueError(
+                    f"Split manifest references {len(missing)} unavailable scenes; "
+                    f"first={sorted(missing)[0]}"
+                )
+        elif split == "all":
+            pass
+        elif split == "test":
+            raise ValueError("A distinct test split requires split_manifest=...")
         else:
-            self.scenes = [self.scenes[i] for i in indices[split_idx:]]
+            logger.warning("No split manifest supplied; using legacy deterministic train/val split")
+            rng = np.random.default_rng(seed=42)
+            indices = rng.permutation(len(self.scenes))
+            split_idx = int(len(self.scenes) * train_ratio)
+            selected = indices[:split_idx] if split == "train" else indices[split_idx:]
+            self.scenes = [self.scenes[i] for i in selected]
 
-        # Expand scenes with windowing for long videos
-        if self.window_size > 0:
+        # Expand scenes with windowing for long videos. Streaming prefix is its
+        # own indexing scheme: each sample is exactly [0, ..., tail].
+        if self.streaming_prefix:
+            self._expand_scenes_with_streaming_prefix()
+        elif self.window_size > 0:
             self._expand_scenes_with_windows()
 
         logger.info(
             f"InsScene15KDataset: {len(self.scenes)} samples for {split} split "
-            f"from sources {sources} (window_size={self.window_size})"
+            f"from sources {sources} (window_size={self.window_size}, "
+            f"streaming_prefix={self.streaming_prefix})"
         )
+
+    def _expand_scenes_with_streaming_prefix(self):
+        """Expand each scene into online prefix samples H_t = [I_0, ..., I_t]."""
+        expanded = []
+        for scene in self.scenes:
+            nf = int(scene["num_frames"])
+            max_len = nf if self.prefix_max_len is None else min(nf, self.prefix_max_len)
+            if max_len < self.prefix_min_len:
+                continue
+            for length in range(self.prefix_min_len, max_len + 1, self.prefix_stride):
+                tail = length - 1
+                prefix_scene = dict(scene)
+                prefix_scene["streaming_tail"] = tail
+                prefix_scene["streaming_indices"] = list(range(length))
+                expanded.append(prefix_scene)
+        logger.info(
+            f"Streaming prefix expansion: {len(self.scenes)} scenes -> {len(expanded)} samples "
+            f"(min_len={self.prefix_min_len}, max_len={self.prefix_max_len}, "
+            f"stride={self.prefix_stride})"
+        )
+        self.scenes = expanded
 
     def _expand_scenes_with_windows(self):
         """Expand scenes into overlapping windows for long videos.
@@ -299,6 +386,9 @@ class InsScene15KDataset(EasyDataset):
 
     def __len__(self):
         return len(self.scenes)
+
+    def _scene_key(self, scene_info):
+        return f"{scene_info['source']}/{self._feat_scene_name(scene_info)}"
 
     def get_stats(self):
         return f"{len(self)} scenes"
@@ -469,6 +559,95 @@ class InsScene15KDataset(EasyDataset):
             torch.stack(extrinsics),  # (S, 3, 4)
         )
 
+    def _load_camera_depth_scene(self, scene_info, sel_indices):
+        """Load only depth, intrinsics, and extrinsics for feature-only probes."""
+        depthmaps = []
+        intrinsics = []
+        extrinsics = []
+
+        if scene_info["source"] == "infinigen":
+            frames_dir = os.path.join(scene_info["scene_dir"], "frames")
+            img_dir = os.path.join(frames_dir, "Image", "camera_0")
+            cam_dir = os.path.join(frames_dir, "camview", "camera_0")
+            depth_dir = os.path.join(frames_dir, "Depth", "camera_0")
+            img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".png")])
+
+            for idx in sel_indices:
+                idx = min(int(idx.item()), len(img_files) - 1)
+                frame_id = img_files[idx].replace("Image_", "").replace(".png", "")
+
+                depth_path = os.path.join(depth_dir, f"Depth_{frame_id}.npy")
+                if os.path.exists(depth_path):
+                    depth = np.load(depth_path).astype(np.float32)
+                    depth[depth > 1e6] = 0.0
+                else:
+                    # Rare fallback; use the RGB size without keeping the image.
+                    img_path = os.path.join(img_dir, img_files[idx])
+                    with Image.open(img_path) as img:
+                        w, h = img.size
+                    depth = np.zeros((h, w), dtype=np.float32)
+                depthmaps.append(torch.from_numpy(depth))
+
+                cam_path = os.path.join(cam_dir, f"camview_{frame_id}.npz")
+                cam = np.load(cam_path)
+                intrinsics.append(torch.from_numpy(cam["K"].astype(np.float32)))
+                T = torch.from_numpy(cam["T"].astype(np.float32))
+                extrinsics.append(T[:3, :4])
+
+        elif scene_info["source"] == "scannetpp":
+            scene_dir = scene_info["scene_dir"]
+            depth_dir = os.path.join(scene_dir, "depth")
+            meta_path = os.path.join(scene_dir, "scene_iphone_metadata.npz")
+            valid_frames = scene_info["valid_frames"]
+            meta = np.load(meta_path)
+            all_images_list = list(meta["images"])
+
+            for idx in sel_indices:
+                idx = min(int(idx.item()), len(valid_frames) - 1)
+                frame_name = valid_frames[idx]
+                depth_stem = os.path.splitext(frame_name)[0]
+                depth_path = os.path.join(depth_dir, f"{depth_stem}.png")
+                if os.path.exists(depth_path):
+                    depth = np.array(Image.open(depth_path)).astype(np.float32) / 1000.0
+                else:
+                    depth = np.zeros((self.target_h, self.target_w), dtype=np.float32)
+                depthmaps.append(torch.from_numpy(depth))
+
+                try:
+                    meta_idx = all_images_list.index(frame_name)
+                except ValueError:
+                    stem = os.path.splitext(frame_name)[0]
+                    meta_idx = all_images_list.index(stem) if stem in all_images_list else 0
+                intrinsics.append(torch.from_numpy(meta["intrinsics"][meta_idx].astype(np.float32)))
+                T = torch.from_numpy(meta["trajectories"][meta_idx].astype(np.float32))
+                extrinsics.append(T[:3, :4])
+        else:
+            raise ValueError(f"Unknown source: {scene_info['source']}")
+
+        return (
+            torch.stack(depthmaps),
+            torch.stack(intrinsics),
+            torch.stack(extrinsics),
+        )
+
+    def _resize_depth_to_target(self, depthmaps, intrinsics):
+        """Resize depth maps and rescale intrinsics without loading RGB/masks."""
+        _, orig_h, orig_w = depthmaps.shape
+        scale_h = self.target_h / orig_h
+        scale_w = self.target_w / orig_w
+        depthmaps = F.interpolate(
+            depthmaps.unsqueeze(1),
+            size=(self.target_h, self.target_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+        intrinsics = intrinsics.clone()
+        intrinsics[:, 0, 0] *= scale_w
+        intrinsics[:, 0, 2] *= scale_w
+        intrinsics[:, 1, 1] *= scale_h
+        intrinsics[:, 1, 2] *= scale_h
+        return depthmaps, intrinsics
+
     def _resize_to_target(self, images, masks, depthmaps, intrinsics):
         """Resize images, masks, depth to target resolution and rescale intrinsics."""
         _, _, orig_h, orig_w = images.shape
@@ -550,13 +729,76 @@ class InsScene15KDataset(EasyDataset):
                                                          user is expected to set
                                                          feat_postfix accordingly)
           - vjepa:           feature.sft
-        Whichever the case, ``feature{feat_postfix}.sft`` is the right pattern as long
-        as feat_postfix matches the extractor's choice. We keep that single source of
-        truth here.
+        ``feat_postfix`` remains supported for old configs.  New layer-sweep
+        configs can pass ``feature_layer`` instead, which keeps the current
+        default filenames but makes layer changes an ordinary Hydra override.
         """
-        if self.vfm_name == "vjepa":
-            return "feature.sft"
-        return f"feature{self.feat_postfix}.sft"
+        return feature_filename(
+            self.vfm_name,
+            feat_postfix=self.feat_postfix,
+            feature_layer=self.feature_layer,
+            feature_timestep=self.feature_timestep,
+            feature_prefix=self.feature_prefix,
+        )
+
+    def _streaming_prefix_dir_name(self, scene_info) -> str:
+        return self.streaming_prefix_dir_fmt.format(
+            tail=int(scene_info["streaming_tail"]),
+            length=len(scene_info["streaming_indices"]),
+        )
+
+    def _streaming_prefix_scene_dir(self, scene_info) -> str | None:
+        root = self.streaming_feat_root or self.root_vfm
+        if root is None:
+            return None
+        return os.path.join(
+            root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+        )
+
+    def _streaming_prefix_record(self, scene_info) -> dict | None:
+        scene_dir = self._streaming_prefix_scene_dir(scene_info)
+        if scene_dir is None:
+            return None
+
+        meta_path = os.path.join(scene_dir, "prefix_index.npy")
+        if meta_path not in self._streaming_prefix_meta_cache:
+            records_by_tail = {}
+            if os.path.exists(meta_path):
+                try:
+                    records = np.load(meta_path, allow_pickle=True).tolist()
+                    if isinstance(records, dict):
+                        records = records.values()
+                    for record in records:
+                        if isinstance(record, dict) and "tail" in record:
+                            records_by_tail[int(record["tail"])] = record
+                except Exception as e:
+                    logger.warning(f"Failed to read streaming prefix metadata {meta_path}: {e}")
+            self._streaming_prefix_meta_cache[meta_path] = records_by_tail
+
+        return self._streaming_prefix_meta_cache[meta_path].get(
+            int(scene_info["streaming_tail"])
+        )
+
+    def _target_indices(self, scene_info):
+        """Return the exact frame ids represented by a target cache."""
+        if self.target_feat_root is None:
+            return None
+        cache_key = (scene_info["scene_dir"], self.vfm_name)
+        if cache_key in self._target_index_cache:
+            return self._target_index_cache[cache_key]
+        path = os.path.join(
+            self.target_feat_root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+            "target_indices.npy",
+        )
+        indices = torch.from_numpy(np.load(path)).long() if os.path.exists(path) else None
+        self._target_index_cache[cache_key] = indices
+        return indices
 
     def _load_target_feat(self, scene_info, target_global_idx, num_frames):
         """Load a clip-isolated target feature for C1.
@@ -567,8 +809,9 @@ class InsScene15KDataset(EasyDataset):
             feat:           (M, H_f, W_f, C)   — features for M target frames
             target_indices: (M,) long          — original frame indices
 
-        Returns the feature for the closest target index to target_global_idx,
-        or None if missing.
+        Returns the feature for the exact target index, or None if missing.
+        Nearest-neighbour targets are scientifically invalid because the action
+        and camera reference would then describe a different frame.
         """
         if self.target_feat_root is None:
             return None
@@ -587,16 +830,278 @@ class InsScene15KDataset(EasyDataset):
             logger.warning(f"Failed to read target feat {path}: {e}")
             return None
         feat = data["feat"].float()                            # (M, H_f, W_f, C)
-        # Find the metadata for target_indices
-        meta_path = os.path.join(os.path.dirname(path), "target_indices.npy")
-        if os.path.exists(meta_path):
-            tgt_idx = torch.from_numpy(np.load(meta_path)).long()
-            # Closest match in the precomputed grid
-            j = (tgt_idx - target_global_idx).abs().argmin().item()
+        tgt_idx = self._target_indices(scene_info)
+        if tgt_idx is None:
+            return None
+        matches = torch.nonzero(tgt_idx == int(target_global_idx), as_tuple=False).flatten()
+        return feat[int(matches[0].item())] if matches.numel() else None
+
+    def _load_target_feats(self, scene_info, target_global_indices, num_frames):
+        """Load multiple clip-isolated target features with one safetensors read."""
+        if self.target_feat_root is None:
+            return [None for _ in target_global_indices]
+        path = os.path.join(
+            self.target_feat_root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+            self._feat_filename(),
+        )
+        if not os.path.exists(path):
+            return [None for _ in target_global_indices]
+        try:
+            data = load_file(path)
+        except Exception as e:
+            logger.warning(f"Failed to read target feat {path}: {e}")
+            return [None for _ in target_global_indices]
+
+        feat = data["feat"].float()
+        tgt_idx = self._target_indices(scene_info)
+        if tgt_idx is None:
+            return [None for _ in target_global_indices]
+        index_to_row = {int(frame): row for row, frame in enumerate(tgt_idx.tolist())}
+        return [
+            feat[index_to_row[int(target_idx)]]
+            if int(target_idx) in index_to_row else None
+            for target_idx in target_global_indices
+        ]
+
+    def _load_vfm_feat_for_selection(self, scene_info, num_frames, sel_global):
+        """Load normal VFM features and select the requested global frame indices."""
+        if self.root_vfm is None:
+            return (
+                torch.zeros(self.num_views, 18, 32, 1536, dtype=torch.float32),
+                torch.arange(self.num_views),
+            )
+
+        vfm_feat_path = os.path.join(
+            self.root_vfm,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+            self._feat_filename(),
+        )
+        if not os.path.exists(vfm_feat_path):
+            msg = f"VFM feature not found at {vfm_feat_path}"
+            if not self.allow_missing_vfm:
+                raise FileNotFoundError(
+                    msg + "; run feature extraction first or set allow_missing_vfm=True for debugging"
+                )
+            logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
+            dummy_channels = default_feature_channels(self.vfm_name)
+            return (
+                torch.zeros(self.num_views, 18, 32, dummy_channels, dtype=torch.float32),
+                torch.arange(self.num_views),
+            )
+
+        vfm_feat = load_file(vfm_feat_path)["feat"].float()
+        if self.vfm_name == "cogvideox":
+            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+
+        T = vfm_feat.shape[0]
+        vfm_idx = (
+            torch.round(sel_global.float() / max(num_frames - 1, 1) * (T - 1))
+            .long()
+            .clamp(0, T - 1)
+        )
+        if self.feat_pixalign:
+            vfm_feat = vfm_feat[vfm_idx]
+            vfm_idx = torch.arange(vfm_feat.shape[0], device=vfm_feat.device)
+
+        if self.scramble_feat:
+            g = torch.Generator()
+            _seed_n = int(hashlib.md5((scene_info["scene_dir"] + ":n").encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+            g.manual_seed(_seed_n)
+            vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
+        if self.pose_only:
+            vfm_feat = torch.zeros_like(vfm_feat)
+
+        return vfm_feat, vfm_idx
+
+    def _load_streaming_prefix_feat(self, scene_info, sel_global):
+        """Load the precomputed VFM feature for one online prefix sample."""
+        scene_dir = self._streaming_prefix_scene_dir(scene_info)
+        if scene_dir is None:
+            return (
+                torch.zeros(len(sel_global), 18, 32, 1536, dtype=torch.float32),
+                torch.arange(len(sel_global)),
+            )
+
+        vfm_feat_path = os.path.join(
+            scene_dir,
+            self._streaming_prefix_dir_name(scene_info),
+            self._feat_filename(),
+        )
+        if not os.path.exists(vfm_feat_path):
+            msg = f"Streaming prefix VFM feature not found at {vfm_feat_path}"
+            if not self.allow_missing_vfm:
+                raise FileNotFoundError(
+                    msg + "; run feature extraction with --mode streaming_prefix first "
+                    "or set allow_missing_vfm=True for debugging"
+                )
+            logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
+            dummy_channels = default_feature_channels(self.vfm_name)
+            return (
+                torch.zeros(len(sel_global), 18, 32, dummy_channels, dtype=torch.float32),
+                torch.arange(len(sel_global)),
+            )
+
+        vfm_feat = load_file(vfm_feat_path)["feat"].float()
+        if self.vfm_name == "cogvideox":
+            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+        if vfm_feat.ndim != 4:
+            raise ValueError(
+                f"Expected streaming prefix VFM feature feat to be 4D (T,H,W,C), "
+                f"got {tuple(vfm_feat.shape)} from {vfm_feat_path}."
+            )
+
+        T = vfm_feat.shape[0]
+        prefix_len = len(sel_global)
+        meta_record = self._streaming_prefix_record(scene_info)
+        input_length = None
+        valid_length = prefix_len
+        pad_mode = None
+        if meta_record is not None:
+            input_length = int(meta_record.get("input_length", 0) or 0)
+            valid_length = int(meta_record.get("valid_length", prefix_len))
+            pad_mode = meta_record.get("pad_mode")
+
+        if input_length is not None and input_length > 1 and T > 1:
+            # Prefix extraction pads short inputs by repeating the current tail
+            # frame. Historical frames use their real positions in the padded
+            # input; the tail can use its final repeated occurrence.
+            positions = torch.arange(prefix_len, dtype=torch.float32)
+            if (
+                pad_mode == "repeat_tail"
+                and prefix_len > 0
+                and input_length > valid_length
+            ):
+                positions[-1] = float(input_length - 1)
+            vfm_idx = (
+                positions / float(input_length - 1) * float(T - 1)
+            ).round().long().clamp(0, T - 1)
+        elif prefix_len <= 1:
+            vfm_idx = torch.zeros(prefix_len, dtype=torch.long)
         else:
-            # Fall back: assume evenly spaced
-            j = min(feat.shape[0] - 1, int(round(target_global_idx / max(num_frames - 1, 1) * (feat.shape[0] - 1))))
-        return feat[j]
+            # Backward-compatible fallback for old caches without prefix_index.npy.
+            vfm_idx = (
+                torch.linspace(0, T - 1, prefix_len, dtype=torch.float32)
+                .round()
+                .long()
+                .clamp(0, T - 1)
+            )
+        if self.feat_pixalign:
+            vfm_feat = vfm_feat[vfm_idx]
+            vfm_idx = torch.arange(vfm_feat.shape[0], device=vfm_feat.device)
+
+        if self.scramble_feat:
+            g = torch.Generator()
+            seed_key = f"{scene_info['scene_dir']}:prefix:{scene_info['streaming_tail']}:n"
+            _seed_n = int(hashlib.md5(seed_key.encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+            g.manual_seed(_seed_n)
+            vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
+        if self.pose_only:
+            vfm_feat = torch.zeros_like(vfm_feat)
+
+        return vfm_feat, vfm_idx
+
+    def _getitem_feature_action_diag(self, scene_info, num_frames, sel_global):
+        """Fast path for C2/C3 probes that do not consume RGB, masks, or identity IDs."""
+        from vidfm3d.utils.spatial_diag import (
+            compute_overlap_ratio,
+            encode_relative_pose,
+        )
+
+        depthmaps, intrinsics, extrinsics = self._load_camera_depth_scene(
+            scene_info, sel_global
+        )
+        depthmaps, intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
+        confmaps = (depthmaps > 0).float()
+
+        pointmaps = torch.stack([
+            depth_to_pointmap(depthmaps[i], intrinsics[i], extrinsics[i])
+            for i in range(depthmaps.shape[0])
+        ])
+        extrinsics, pointmaps_scaled, depthmaps_hw1 = invert_pose_ref_and_scale(
+            extrinsics,
+            pointmaps,
+            depthmaps=depthmaps.unsqueeze(-1),
+            ref_idx=0,
+            scale_by_points=True,
+        )
+        depthmaps = depthmaps_hw1.squeeze(-1)
+
+        vf, vfm_idx = self._load_vfm_feat_for_selection(
+            scene_info, num_frames, sel_global
+        )
+        K = max(vf.shape[0] - 1, 0)
+
+        loaded_target_feats = self._load_target_feats(
+            scene_info,
+            [int(target_idx.item()) for target_idx in sel_global[1:]],
+            num_frames,
+        )
+        target_feats = []
+        target_valid = []
+        for target_feat in loaded_target_feats:
+            if target_feat is None:
+                target_feats.append(torch.zeros_like(vf[0]))
+                target_valid.append(False)
+            else:
+                target_feats.append(target_feat)
+                target_valid.append(True)
+
+        if K > 0:
+            target_feat_seq = torch.stack(target_feats)
+            horizon_valid = torch.as_tensor(target_valid, dtype=torch.bool)
+            path_actions = torch.stack([
+                encode_relative_pose(extrinsics[i], extrinsics[i + 1]).cpu()
+                for i in range(K)
+            ])
+            counterfactual_actions = torch.stack([
+                encode_relative_pose(extrinsics[0], extrinsics[i + 1]).cpu()
+                for i in range(K)
+            ])
+            horizons = (sel_global[1:] - sel_global[0]).to(torch.long).cpu()
+        else:
+            target_feat_seq = torch.zeros(0, *vf.shape[1:], dtype=vf.dtype)
+            horizon_valid = torch.zeros(0, dtype=torch.bool)
+            path_actions = torch.zeros(0, 9, dtype=torch.float32)
+            counterfactual_actions = torch.zeros(0, 9, dtype=torch.float32)
+            horizons = torch.zeros(0, dtype=torch.long)
+
+        overlap_anchor = torch.ones(K, dtype=torch.float32)
+        if self.diag_counterfactual and K > 0:
+            overlap_full = compute_overlap_ratio(
+                pointmaps_scaled,
+                intrinsics,
+                extrinsics,
+                depthmaps > 0,
+            )
+            overlap_anchor = overlap_full[0, 1:].cpu()
+
+        counterfactual_valid = horizon_valid & (
+            overlap_anchor >= float(self.counterfactual_min_overlap)
+        )
+
+        return {
+            "vfm_feat": vf,
+            "vfm_idx": vfm_idx,
+            "input_feat_seq": vf[:1].clone(),
+            "target_feat_seq": target_feat_seq,
+            "path_actions": path_actions,
+            "counterfactual_actions": counterfactual_actions,
+            "target_extrinsics": extrinsics[1:].cpu(),
+            "start_extrinsic": extrinsics[0].cpu(),
+            "action_horizons": horizons,
+            "counterfactual_overlap": overlap_anchor,
+            "path_horizon_valid": horizon_valid,
+            "path_valid": torch.tensor(bool(horizon_valid.all().item()), dtype=torch.bool),
+            "counterfactual_valid": counterfactual_valid,
+            "rng": int.from_bytes(self._rng.bytes(4), "big"),
+            "scene_path": scene_info["scene_dir"],
+            "vfm_name": self.vfm_name,
+        }
 
     def _load_shuffled_feat(self, scene_info, num_frames, sel_global):
         """Load shuffled-context vfm features for A3.
@@ -643,24 +1148,66 @@ class InsScene15KDataset(EasyDataset):
         scene_info = self.scenes[idx]
         num_frames = scene_info["num_frames"]
 
-        # Window bounds (defaults to full scene)
-        window_start = scene_info.get("window_start", 0)
-        window_end = scene_info.get("window_end", num_frames)
-        window_frames = window_end - window_start
-
-        # Sample frame indices within the window
-        sample_range = min(window_frames, self.context_len)
-        sel = self._sample_query_frames(self._rng, self.num_views, sample_range)
-
-        if self.query_idx_divisor is not None:
-            sel = (
-                torch.floor((sel - 1) / self.query_idx_divisor) * self.query_idx_divisor
-                + 1
+        if self.streaming_prefix:
+            sel_global = torch.as_tensor(
+                scene_info["streaming_indices"], dtype=torch.long
             )
-            sel = sel.clamp(min=0, max=window_frames - 1).long()
+        else:
+            # Window bounds (defaults to full scene)
+            window_start = scene_info.get("window_start", 0)
+            window_end = scene_info.get("window_end", num_frames)
+            window_frames = window_end - window_start
 
-        # Convert to global frame indices for loading
-        sel_global = sel + window_start
+            # Sample frame indices within the window. Multi-action diagnostic probes
+            # use explicit offsets from one anchor frame so horizons have a stable
+            # interpretation: [anchor, anchor+1, anchor+10, anchor+30, ...].
+            explicit_action_horizons = (
+                (self.diag_path_integration or self.diag_counterfactual)
+                and len(self.action_horizons) > 0
+                and window_frames > max(self.action_horizons)
+            )
+            if explicit_action_horizons:
+                max_start = min(window_frames, self.context_len) - max(self.action_horizons)
+                max_start = max(max_start, 1)
+                anchor = int(self._rng.integers(0, max_start))
+                sel = torch.as_tensor(
+                    [anchor] + [anchor + h for h in self.action_horizons],
+                    dtype=torch.long,
+                )
+            else:
+                sample_range = min(window_frames, self.context_len)
+                sel = self._sample_query_frames(self._rng, self.num_views, sample_range)
+
+            if self.query_idx_divisor is not None and not explicit_action_horizons:
+                sel = (
+                    torch.floor((sel - 1) / self.query_idx_divisor) * self.query_idx_divisor
+                    + 1
+                )
+                sel = sel.clamp(min=0, max=window_frames - 1).long()
+
+            # Convert to global frame indices for loading
+            sel_global = sel + window_start
+
+            # C1 target caches may contain a sparse set of isolated frames.
+            # Align the sampled target before loading RGB/geometry so feature,
+            # extrinsic and action all refer to the same exact frame.
+            if self.diag_action:
+                cached_targets = self._target_indices(scene_info)
+                if cached_targets is not None and cached_targets.numel() > 0:
+                    candidates = cached_targets[
+                        (cached_targets >= window_start)
+                        & (cached_targets < window_end)
+                        & (cached_targets > sel_global[-2])
+                    ]
+                    if candidates.numel() > 0:
+                        nearest = (candidates - sel_global[-1]).abs().argmin()
+                        sel_global[-1] = candidates[nearest]
+
+        if (
+            (self.diag_path_integration or self.diag_counterfactual)
+            and not (self.diag_overlap or self.diag_hidden_obj or self.diag_action or self.diag_abnormal)
+        ):
+            return self._getitem_feature_action_diag(scene_info, num_frames, sel_global)
 
         # Load data based on source
         if scene_info["source"] == "infinigen":
@@ -696,16 +1243,24 @@ class InsScene15KDataset(EasyDataset):
         else:
             pointmaps = None
 
-        # Normalize scene: extrinsics relative to first frame.
+        # Normalize scene. Streaming prefix uses the current tail frame as ego;
+        # standard sampled clips keep the historical first-frame reference.
         # If point maps are disabled, scale by depth instead of points.
+        depthmaps_metric = depthmaps.clone() if self.streaming_prefix else None
+        ref_idx = len(sel_global) - 1 if self.streaming_prefix else 0
         extrinsics, pointmaps_scaled, depthmaps_hw1 = invert_pose_ref_and_scale(
             extrinsics,                        # (S, 3, 4)
             pointmaps,
             depthmaps=depthmaps.unsqueeze(-1),  # (S, H, W, 1)
-            ref_idx=0,
+            ref_idx=ref_idx,
             scale_by_points=self.include_pmaps,
         )
-        depthmaps = depthmaps_hw1.squeeze(-1)  # (S, H, W)
+        if self.streaming_prefix:
+            # The online protocol rebases camera pose to the current tail frame
+            # but leaves per-frame depth scalars in their original metric form.
+            depthmaps = depthmaps_metric
+        else:
+            depthmaps = depthmaps_hw1.squeeze(-1)  # (S, H, W)
 
         # Remap identity IDs
         masks = self._remap_identity_ids(masks)
@@ -722,7 +1277,13 @@ class InsScene15KDataset(EasyDataset):
             output["pmaps"] = pointmaps_scaled.permute(0, 3, 1, 2)  # (S, 3, H, W)
 
         # VFM features
-        if self.root_vfm is not None:
+        if self.streaming_prefix:
+            vfm_feat, vfm_idx = self._load_streaming_prefix_feat(
+                scene_info, sel_global
+            )
+            output["vfm_feat"] = vfm_feat
+            output["vfm_idx"] = vfm_idx
+        elif self.root_vfm is not None:
             source_name = scene_info["source"]
             feat_scene_name = self._feat_scene_name(scene_info)
             vfm_feat_path = os.path.join(
@@ -739,28 +1300,25 @@ class InsScene15KDataset(EasyDataset):
                 # signature instead of using content — see A3 ctrl dtype-leak
                 # finding in PROGRESS_REPORT.md.
                 vfm_feat = load_file(vfm_feat_path)["feat"].float()
-                if self.vfm_name in ["wan", "opensora", "vjepa2"]:
-                    T = vfm_feat.shape[0]
-                    vfm_idx = torch.round(
-                        sel_global.float() / max(num_frames - 1, 1) * (T - 1)
-                    ).long().clamp(0, T - 1)
-                    if self.feat_pixalign:
-                        vfm_feat = vfm_feat[vfm_idx]
-                        vfm_idx = torch.arange(
-                            vfm_feat.shape[0], device=vfm_feat.device
-                        )
-                elif self.vfm_name == "cogvideox":
+                if self.vfm_name == "cogvideox":
                     # CogVideoX: (2, T_clip, H, W, C) → merge clips → (2*T_clip, H, W, C)
                     vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
-                    T = vfm_feat.shape[0]
-                    vfm_idx = torch.round(
-                        sel_global.float() / max(num_frames - 1, 1) * (T - 1)
-                    ).long().clamp(0, T - 1)
-                    if self.feat_pixalign:
-                        vfm_feat = vfm_feat[vfm_idx]
-                        vfm_idx = torch.arange(
-                            vfm_feat.shape[0], device=vfm_feat.device
-                        )
+
+                if vfm_feat.ndim != 4:
+                    raise ValueError(
+                        f"Expected VFM feature feat to be 4D (T,H,W,C), got {tuple(vfm_feat.shape)} "
+                        f"from {vfm_feat_path}. For token models, save activations as a token grid."
+                    )
+
+                T = vfm_feat.shape[0]
+                vfm_idx = torch.round(
+                    sel_global.float() / max(num_frames - 1, 1) * (T - 1)
+                ).long().clamp(0, T - 1)
+                if self.feat_pixalign:
+                    vfm_feat = vfm_feat[vfm_idx]
+                    vfm_idx = torch.arange(
+                        vfm_feat.shape[0], device=vfm_feat.device
+                    )
                 if self.scramble_feat:
                     # Control experiment: replace with unit-normal noise (same shape).
                     # Seed on scene_dir (not idx) so train/val index overlap does not let
@@ -771,7 +1329,7 @@ class InsScene15KDataset(EasyDataset):
                     g.manual_seed(_seed_n)
                     vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
                 if self.pose_only:
-                    # Ablation: zero out VFM feat so only last_pose_enc survives in B1.
+                    # Unconditional ablation: remove all visual feature signal.
                     vfm_feat = torch.zeros_like(vfm_feat)
                 output["vfm_feat"] = vfm_feat
                 output["vfm_idx"] = vfm_idx
@@ -782,12 +1340,7 @@ class InsScene15KDataset(EasyDataset):
                         msg + "; run feature extraction first or set allow_missing_vfm=True for debugging"
                     )
                 logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
-                dummy_channels = {
-                    "wan": 1536,
-                    "cogvideox": 3072,
-                    "vjepa2": 1024,
-                    "vjepa": 1024,
-                }.get(self.vfm_name, 1536)
+                dummy_channels = default_feature_channels(self.vfm_name)
                 output["vfm_feat"] = torch.zeros(
                     self.num_views, 18, 32, dummy_channels, dtype=torch.float32
                 )
@@ -802,11 +1355,22 @@ class InsScene15KDataset(EasyDataset):
         output["rng"] = int.from_bytes(self._rng.bytes(4), "big")
         output["scene_path"] = scene_info["scene_dir"]
         output["vfm_name"] = self.vfm_name
+        if self.streaming_prefix:
+            output["streaming_tail"] = torch.tensor(
+                int(scene_info["streaming_tail"]), dtype=torch.long
+            )
+            output["prefix_indices"] = sel_global.cpu()
 
         # ------------------------------------------------------------ Spatial Diagnostic Suite
         # NOTE: All diagnostic outputs use post-normalization extrinsics + pmaps_scaled.
         # The geometry stays metrically consistent (rigid transform + uniform scale).
-        if self.diag_overlap or self.diag_hidden_obj or self.diag_action:
+        if (
+            self.diag_overlap
+            or self.diag_hidden_obj
+            or self.diag_action
+            or self.diag_path_integration
+            or self.diag_counterfactual
+        ):
             from vidfm3d.utils.spatial_diag import (
                 compute_overlap_ratio,
                 compute_hidden_object_target,
@@ -869,12 +1433,6 @@ class InsScene15KDataset(EasyDataset):
                 if self.no_obj_mask:
                     per_frame_mask = torch.ones_like(per_frame_mask)  # B1 ablation only
                 output["hidden_obj_mask"] = per_frame_mask
-            # Encode last frame's pose as a 9-dim vector for conditioning
-            last_extr = extrinsics[-1]
-            output["last_pose_enc"] = encode_relative_pose(
-                torch.eye(3, 4, dtype=last_extr.dtype), last_extr
-            ).cpu()
-
         if self.diag_action:
             # Input frames = first S-1 of vfm_feat already loaded; target frame = last view.
             # For action_dynamics we need an UNCONTAMINATED target_feat (separate forward).
@@ -887,6 +1445,7 @@ class InsScene15KDataset(EasyDataset):
                 output["action"] = encode_relative_pose(
                     extrinsics[-2], extrinsics[-1]
                 ).cpu()
+                output["target_frame_idx"] = sel_global[-1].to(torch.long).cpu()
                 output["dyn_valid"] = torch.ones((), dtype=torch.bool)
             else:
                 # Fall back: emit zero-valued tensors so collation works, mark invalid
@@ -894,7 +1453,71 @@ class InsScene15KDataset(EasyDataset):
                 output["target_feat"] = torch.zeros_like(vf[0])
                 output["input_feat"] = torch.zeros_like(vf[:-1])
                 output["action"] = torch.zeros(9, dtype=torch.float32)
+                output["target_frame_idx"] = torch.tensor(-1, dtype=torch.long)
                 output["dyn_valid"] = torch.zeros((), dtype=torch.bool)
+
+        if self.diag_path_integration or self.diag_counterfactual:
+            # Multi-horizon target features are loaded from target_isolated cache
+            # so the target frame is not leaked through the context VFM forward.
+            vf = output["vfm_feat"]
+            K = max(vf.shape[0] - 1, 0)
+            target_feats = []
+            target_valid = []
+            loaded_target_feats = self._load_target_feats(
+                scene_info,
+                [int(target_idx.item()) for target_idx in sel_global[1:]],
+                num_frames,
+            )
+            for target_feat in loaded_target_feats:
+                if target_feat is None:
+                    target_feats.append(torch.zeros_like(vf[0]))
+                    target_valid.append(False)
+                else:
+                    target_feats.append(target_feat)
+                    target_valid.append(True)
+
+            if K > 0:
+                target_feat_seq = torch.stack(target_feats)
+                horizon_valid = torch.as_tensor(target_valid, dtype=torch.bool)
+                path_actions = torch.stack([
+                    encode_relative_pose(extrinsics[i], extrinsics[i + 1]).cpu()
+                    for i in range(K)
+                ])
+                counterfactual_actions = torch.stack([
+                    encode_relative_pose(extrinsics[0], extrinsics[i + 1]).cpu()
+                    for i in range(K)
+                ])
+                horizons = (sel_global[1:] - sel_global[0]).to(torch.long).cpu()
+            else:
+                target_feat_seq = torch.zeros(0, *vf.shape[1:], dtype=vf.dtype)
+                horizon_valid = torch.zeros(0, dtype=torch.bool)
+                path_actions = torch.zeros(0, 9, dtype=torch.float32)
+                counterfactual_actions = torch.zeros(0, 9, dtype=torch.float32)
+                horizons = torch.zeros(0, dtype=torch.long)
+
+            overlap_anchor = torch.ones(K, dtype=torch.float32)
+            if pointmaps_scaled is not None and K > 0:
+                valid_mask = (depthmaps > 0)
+                overlap_full = compute_overlap_ratio(
+                    pointmaps_scaled, intrinsics, extrinsics, valid_mask
+                )
+                overlap_anchor = overlap_full[0, 1:].cpu()
+
+            counterfactual_valid = horizon_valid & (
+                overlap_anchor >= float(self.counterfactual_min_overlap)
+            )
+
+            output["input_feat_seq"] = vf[:1].clone()
+            output["target_feat_seq"] = target_feat_seq
+            output["path_actions"] = path_actions
+            output["counterfactual_actions"] = counterfactual_actions
+            output["target_extrinsics"] = extrinsics[1:].cpu()
+            output["start_extrinsic"] = extrinsics[0].cpu()
+            output["action_horizons"] = horizons
+            output["counterfactual_overlap"] = overlap_anchor
+            output["path_horizon_valid"] = horizon_valid
+            output["path_valid"] = torch.tensor(bool(horizon_valid.all().item()), dtype=torch.bool)
+            output["counterfactual_valid"] = counterfactual_valid
 
         if self.diag_abnormal:
             shuf = self._load_shuffled_feat(scene_info, num_frames, sel_global)

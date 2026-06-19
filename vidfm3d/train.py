@@ -72,8 +72,39 @@ from vidfm3d.utils import (
     log_hyperparameters,
     task_wrapper,
 )
+from vidfm3d.utils.provenance import write_run_manifest
 
 log = RankedLogger(__name__, rank_zero_only=True)
+
+
+def _requested_world_size(cfg: DictConfig) -> int:
+    devices = cfg.trainer.get("devices", 1)
+    if isinstance(devices, (list, tuple, ListConfig)):
+        devices_per_node = len(devices)
+    elif isinstance(devices, int):
+        devices_per_node = devices
+    elif str(devices).isdigit():
+        devices_per_node = int(devices)
+    else:
+        devices_per_node = int(os.environ.get("SLURM_GPUS_ON_NODE", "1"))
+    configured = devices_per_node * int(cfg.trainer.get("num_nodes", 1))
+    scheduled = int(os.environ.get("SLURM_NTASKS", "1"))
+    return max(configured, scheduled)
+
+
+def _guard_probe_world_size(cfg: DictConfig) -> None:
+    target = str(cfg.model.get("_target_", ""))
+    world_size = _requested_world_size(cfg)
+    if (
+        target.endswith("ProbeExtensionLitModule")
+        and world_size > 8
+        and not cfg.get("allow_large_probe_ddp", False)
+    ):
+        raise ValueError(
+            f"Refusing {world_size}-way DDP for a small diagnostic probe. "
+            "Use a Slurm job array, or set allow_large_probe_ddp=true only "
+            "after retuning global batch size, learning rate and step budget."
+        )
 
 
 def python_eval_resolver(code: str):
@@ -96,9 +127,13 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     :param cfg: A DictConfig configuration composed by Hydra.
     :return: A tuple with metrics and dict with all instantiated objects.
     """
+    _guard_probe_world_size(cfg)
+
     # set seed for random number generators in pytorch, numpy and python.random
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
+
+    write_run_manifest(cfg, cfg.paths.output_dir)
 
     log.info(f"Instantiating datamodule <{cfg.data.data_module._target_}>")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data.data_module)

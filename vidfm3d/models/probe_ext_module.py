@@ -10,6 +10,9 @@ Supported probe_type values:
     "abnormal"          (A3)
     "ego_belief"        (B1)
     "action_dynamics"   (C1)
+    "path_integration"  (C2)
+    "counterfactual"    (C3)
+    "sae_spatial"       (SAE dictionary + spatial readouts)
 """
 
 from __future__ import annotations
@@ -41,7 +44,16 @@ def _resize_mask_to_feat(
 
 
 class ProbeExtensionLitModule(LightningModule):
-    PROBE_TYPES = {"view_consistency", "abnormal", "ego_belief", "ego_belief_v2", "action_dynamics"}
+    PROBE_TYPES = {
+        "view_consistency",
+        "abnormal",
+        "ego_belief",
+        "ego_belief_v2",
+        "action_dynamics",
+        "path_integration",
+        "counterfactual",
+        "sae_spatial",
+    }
 
     def __init__(
         self,
@@ -58,6 +70,10 @@ class ProbeExtensionLitModule(LightningModule):
         # C1 specific
         cosine_loss_weight: float = 1.0,
         mse_loss_weight: float = 1.0,
+        # SAE specific
+        sae_l1_weight: float = 1e-4,
+        sae_overlap_weight: float = 0.2,
+        sae_ego_weight: float = 0.2,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -186,21 +202,24 @@ class ProbeExtensionLitModule(LightningModule):
         vfm_feat = batch["vfm_feat"][valid]            # (B', S, H_f, W_f, C)
         per_pix = batch["hidden_obj_mask"][valid]      # (B', S, H, W)
         polar_gt = batch["hidden_obj_polar"][valid]    # (B', 3)
-        last_pose = batch["last_pose_enc"][valid]      # (B', 9)
 
         H_f, W_f = vfm_feat.shape[2], vfm_feat.shape[3]
         obj_mask_feat = _resize_mask_to_feat(per_pix, H_f, W_f)
 
-        polar_pred = self.probe(vfm_feat, obj_mask_feat, last_pose)  # (B', 3)
+        polar_pred = self.probe(vfm_feat, obj_mask_feat)  # (B', 3)
 
         w = torch.tensor(
             self.hparams.polar_loss_weights, device=polar_pred.device, dtype=polar_pred.dtype
         )
-        per_dim_loss = F.smooth_l1_loss(polar_pred, polar_gt, reduction="none") * w
+        delta = polar_pred - polar_gt
+        # Azimuth lives on S1; wrap it before both optimization and reporting.
+        delta = delta.clone()
+        delta[:, 0] = torch.atan2(torch.sin(delta[:, 0]), torch.cos(delta[:, 0]))
+        per_dim_loss = F.smooth_l1_loss(delta, torch.zeros_like(delta), reduction="none") * w
         loss = per_dim_loss.mean()
 
         with torch.no_grad():
-            ang_err = torch.abs(polar_pred[:, :2] - polar_gt[:, :2]) * (180.0 / 3.14159265)
+            ang_err = torch.abs(delta[:, :2]) * (180.0 / 3.14159265)
             log_dist_err = torch.abs(polar_pred[:, 2] - polar_gt[:, 2])
 
         metrics = {
@@ -321,10 +340,155 @@ class ProbeExtensionLitModule(LightningModule):
             "loss_dyn": loss.detach(),
             "dyn_mse": mse.detach(),
             "dyn_cos": cos_sim_corr,
-            "dyn_R@1": r1,
-            "dyn_mean_rank": mean_rank,
+            "dyn_inbatch_R@1": r1,
+            "dyn_inbatch_mean_rank": mean_rank,
             "dyn_n_valid": torch.tensor(float(n_valid), device=device),
         }
+        return loss, metrics
+
+    def _masked_feature_prediction_loss(
+        self,
+        pred: torch.Tensor,          # (B, K, C)
+        target_feat: torch.Tensor,   # (B, K, H_f, W_f, C)
+        valid: torch.Tensor,         # (B, K) bool
+        prefix: str,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        target = target_feat.mean(dim=(2, 3))
+        valid = valid.bool()
+        n_valid = int(valid.sum().item())
+        device = pred.device
+        if n_valid == 0:
+            zero = self._zero_loss()
+            return zero, {
+                f"loss_{prefix}": zero.detach(),
+                f"{prefix}_n_valid": torch.tensor(0.0, device=device),
+            }
+
+        pred_v = pred[valid]
+        target_v = target[valid]
+        mse = F.mse_loss(pred_v, target_v)
+        cos_loss = 1.0 - F.cosine_similarity(pred_v, target_v, dim=-1).mean()
+        loss = (
+            self.hparams.mse_loss_weight * mse
+            + self.hparams.cosine_loss_weight * cos_loss
+        )
+
+        with torch.no_grad():
+            cos = F.cosine_similarity(pred_v, target_v, dim=-1).mean()
+            if pred_v.shape[0] >= 4:
+                sim = F.normalize(pred_v, dim=-1) @ F.normalize(target_v, dim=-1).T
+                rank = (sim.argsort(dim=-1, descending=True) ==
+                        torch.arange(pred_v.shape[0], device=sim.device).unsqueeze(-1)
+                        ).float().argmax(dim=-1)
+                r1 = (rank == 0).float().mean()
+                mean_rank = rank.float().mean()
+            else:
+                r1 = torch.tensor(float("nan"), device=device)
+                mean_rank = torch.tensor(float("nan"), device=device)
+
+        return loss, {
+            f"loss_{prefix}": loss.detach(),
+            f"{prefix}_mse": mse.detach(),
+            f"{prefix}_cos": cos,
+            f"{prefix}_R@1": r1,
+            f"{prefix}_mean_rank": mean_rank,
+            f"{prefix}_n_valid": torch.tensor(float(n_valid), device=device),
+        }
+
+    # ------------------------------------------------------------------ C2
+    def _step_path_integration(
+        self, batch: Dict[str, torch.Tensor], train: bool
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        input_feat = batch["input_feat_seq"]
+        actions = batch["path_actions"]
+        target_feat = batch["target_feat_seq"]
+        valid = batch.get("path_horizon_valid")
+        if valid is None:
+            valid = torch.ones(actions.shape[:2], dtype=torch.bool, device=actions.device)
+
+        pred = self.probe(input_feat, actions)
+        return self._masked_feature_prediction_loss(pred, target_feat, valid, "path")
+
+    # ------------------------------------------------------------------ C3
+    def _step_counterfactual(
+        self, batch: Dict[str, torch.Tensor], train: bool
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        input_feat = batch["input_feat_seq"]
+        actions = batch["counterfactual_actions"]
+        target_feat = batch["target_feat_seq"]
+        valid = batch.get("counterfactual_valid")
+        if valid is None:
+            valid = torch.ones(actions.shape[:2], dtype=torch.bool, device=actions.device)
+
+        pred = self.probe(input_feat, actions)
+        return self._masked_feature_prediction_loss(pred, target_feat, valid, "cf")
+
+    # ------------------------------------------------------------------ SAE
+    def _step_sae_spatial(
+        self, batch: Dict[str, torch.Tensor], train: bool
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        vfm_feat = batch["vfm_feat"]
+        out = self.probe(vfm_feat)
+        tokens = out["sampled_tokens"]
+        recon = out["recon"]
+        sparse = out["sparse"]
+
+        recon_mse = F.mse_loss(recon, tokens)
+        rel_mse = recon_mse / tokens.pow(2).mean().clamp(min=1e-6)
+        l1 = sparse.abs().mean()
+        loss = recon_mse + self.hparams.sae_l1_weight * l1
+
+        with torch.no_grad():
+            active_frac = (sparse > 0).float().mean()
+            l0 = (sparse > 0).float().sum(dim=-1).mean()
+
+        metrics = {
+            "loss_sae": loss.detach(),
+            "sae_recon_mse": recon_mse.detach(),
+            "sae_rel_mse": rel_mse.detach(),
+            "sae_l1": l1.detach(),
+            "sae_active_frac": active_frac,
+            "sae_l0": l0,
+        }
+
+        frame_sparse = out["frame_sparse"]
+        if getattr(self.probe, "use_overlap_readout", True) and "overlap_gt" in batch:
+            overlap_gt = batch["overlap_gt"]
+            B, S = overlap_gt.shape[:2]
+            logits = self.probe.predict_overlap(frame_sparse)
+            eye = torch.eye(S, dtype=torch.bool, device=logits.device).unsqueeze(0).expand(B, -1, -1)
+            bce = F.binary_cross_entropy_with_logits(
+                logits[~eye], overlap_gt[~eye].float()
+            )
+            loss = loss + self.hparams.sae_overlap_weight * bce
+            with torch.no_grad():
+                prob = torch.sigmoid(logits)
+                mae = (prob[~eye] - overlap_gt[~eye]).abs().mean()
+            metrics.update({
+                "sae_overlap_bce": bce.detach(),
+                "sae_overlap_mae": mae,
+            })
+
+        if getattr(self.probe, "use_ego_readout", True) and "hidden_obj_valid" in batch:
+            valid = batch["hidden_obj_valid"].bool()
+            if valid.any():
+                query = batch.get("belief_query_feat")
+                query = query[valid] if query is not None else None
+                pred = self.probe.predict_ego(frame_sparse[valid], query)
+                target = batch["hidden_obj_polar"][valid]
+                ego_loss = F.smooth_l1_loss(pred, target)
+                loss = loss + self.hparams.sae_ego_weight * ego_loss
+                with torch.no_grad():
+                    ang_err = torch.abs(pred[:, :2] - target[:, :2]) * (180.0 / 3.14159265)
+                    logd_err = torch.abs(pred[:, 2] - target[:, 2]).mean()
+                metrics.update({
+                    "sae_ego_loss": ego_loss.detach(),
+                    "sae_ego_az_err_deg": ang_err[:, 0].mean(),
+                    "sae_ego_el_err_deg": ang_err[:, 1].mean(),
+                    "sae_ego_logd_err": logd_err,
+                    "sae_ego_n_valid": torch.tensor(float(valid.sum().item()), device=vfm_feat.device),
+                })
+
         return loss, metrics
 
     # ------------------------------------------------------------------ dispatch
@@ -346,6 +510,12 @@ class ProbeExtensionLitModule(LightningModule):
             return self._step_ego_belief_v2(batch, train)
         if self.probe_type == "action_dynamics":
             return self._step_action_dynamics(batch, train)
+        if self.probe_type == "path_integration":
+            return self._step_path_integration(batch, train)
+        if self.probe_type == "counterfactual":
+            return self._step_counterfactual(batch, train)
+        if self.probe_type == "sae_spatial":
+            return self._step_sae_spatial(batch, train)
         raise RuntimeError(f"Unhandled probe_type {self.probe_type}")
 
     # ------------------------------------------------------------------ Lightning hooks
@@ -364,16 +534,43 @@ class ProbeExtensionLitModule(LightningModule):
     def validation_step(self, batch, batch_idx):
         loss, metrics = self.model_step(batch, train=False)
         self.val_loss(loss)
-        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        count_keys = {
+            "view_consistency": "overlap_n_used",
+            "abnormal": "abnormal_n_valid",
+            "ego_belief": "ego_n_valid",
+            "ego_belief_v2": "belief_n_valid",
+            "action_dynamics": "dyn_n_valid",
+            "path_integration": "path_n_valid",
+            "counterfactual": "cf_n_valid",
+        }
+        count = metrics.get(count_keys.get(self.probe_type, ""), None)
+        fallback_weight = next(
+            (int(value.shape[0]) for value in batch.values()
+             if isinstance(value, torch.Tensor) and value.ndim > 0),
+            1,
+        )
+        batch_weight = max(int(count.item()), 1) if count is not None else fallback_weight
+        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True,
+                 sync_dist=True, batch_size=batch_weight)
         for k, v in metrics.items():
-            self.log(f"val/{k}", v, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log(f"val/{k}", v, on_step=False, on_epoch=True, prog_bar=False,
+                     sync_dist=True, batch_size=batch_weight)
         return loss
 
     def test_step(self, batch, batch_idx):
         loss, metrics = self.model_step(batch, train=False)
-        self.log("test/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        fallback_weight = next(
+            (int(value.shape[0]) for value in batch.values()
+             if isinstance(value, torch.Tensor) and value.ndim > 0),
+            1,
+        )
+        batch_weight = max(int(next((v.item() for k, v in metrics.items()
+                                    if k.endswith("_n_valid")), fallback_weight)), 1)
+        self.log("test/loss", loss, on_step=False, on_epoch=True, prog_bar=True,
+                 sync_dist=True, batch_size=batch_weight)
         for k, v in metrics.items():
-            self.log(f"test/{k}", v, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log(f"test/{k}", v, on_step=False, on_epoch=True, prog_bar=False,
+                     sync_dist=True, batch_size=batch_weight)
         return loss
 
     def on_train_epoch_start(self) -> None:

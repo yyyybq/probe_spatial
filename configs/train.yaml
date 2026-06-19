@@ -47,3 +47,7 @@ ckpt_path: null
 
 # seed for random number generators in pytorch, numpy and python.random
 seed: 42
+
+# Small diagnostic heads should be parallelized as independent jobs. Override
+# explicitly only after retuning global batch size, LR and optimizer steps.
+allow_large_probe_ddp: false

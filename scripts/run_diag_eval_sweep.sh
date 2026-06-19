@@ -1,26 +1,35 @@
 #!/usr/bin/env bash
-# Run eval_diag.py for every inscene15k_ext run that has a last.ckpt and a matching config.
+# Run eval_diag.py for every inscene15k_ext run that has a checkpoint and a matching config.
 #   bash scripts/run_diag_eval_sweep.sh
 set -euo pipefail
 
 LOGS_ROOT=${LOGS_ROOT:-logs}
 SPLIT=${SPLIT:-val}
+PYTHON=${PYTHON:-python}
+export PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
+export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-${USER:-user}}"
+mkdir -p "${MPLCONFIGDIR}"
 
 mapfile -t ckpts < <(
-    find "${LOGS_ROOT}" -path '*/inscene15k_ext_*/checkpoints/last.ckpt' -type f -printf '%T@ %p\n' 2>/dev/null \
+    find "${LOGS_ROOT}" -path '*/inscene15k_ext_*/checkpoints/*.ckpt' -type f -printf '%T@ %p\n' 2>/dev/null \
         | sort -rn \
         | cut -d' ' -f2-
 )
 
 if (( ${#ckpts[@]} == 0 )); then
-    echo "[skip] no inscene15k_ext last.ckpt files found under ${LOGS_ROOT}"
+    echo "[skip] no inscene15k_ext checkpoint files found under ${LOGS_ROOT}"
     exit 0
 fi
 
 declare -A seen_runs=()
+evaluated_run_dirs=()
 for ckpt in "${ckpts[@]}"; do
-    run_dir=$(dirname "$(dirname "${ckpt}")")
-    run=$(basename "${run_dir}")
+    run=$(grep -o 'inscene15k_ext_[^/]*' <<< "${ckpt}" | tail -n1 || true)
+    if [[ -z "${run}" ]]; then
+        echo "[skip] cannot infer run name from ${ckpt}"
+        continue
+    fi
     if [[ -n "${seen_runs[${run}]:-}" ]]; then
         continue
     fi
@@ -33,21 +42,21 @@ for ckpt in "${ckpts[@]}"; do
         continue
     fi
 
-    echo "==== eval ${run} ===="
-    python vidfm3d/eval_diag.py \
+    echo "==== eval ${run} (${ckpt}) ===="
+    "${PYTHON}" vidfm3d/eval_diag.py \
         experiment="inscene15k_ext/${job}" \
-        ckpt_path="${ckpt}" \
-        eval_split="${SPLIT}" \
+        "ckpt_path='${ckpt}'" \
+        +eval_split="${SPLIT}" \
         train=false test=false
+    evaluated_run_dirs+=("${LOGS_ROOT}/inscene15k_ext/runs/${run}")
 done
 
-mapfile -t run_dirs < <(find "${LOGS_ROOT}" -type d -name 'inscene15k_ext_*' 2>/dev/null | sort)
-if (( ${#run_dirs[@]} == 0 )); then
-    echo "[skip] no evaluated run directories found under ${LOGS_ROOT}"
+if (( ${#evaluated_run_dirs[@]} == 0 )); then
+    echo "[skip] no evaluated run directories"
     exit 0
 fi
 
-python vidfm3d/eval_diag_compare.py \
-    --runs "${run_dirs[@]}" \
+"${PYTHON}" vidfm3d/eval_diag_compare.py \
+    --runs "${evaluated_run_dirs[@]}" \
     --split "${SPLIT}" \
     --output "comparison_${SPLIT}.csv"

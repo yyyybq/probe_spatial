@@ -25,7 +25,6 @@ dist/
 # IDE / tooling
 .vscode/
 .claude/
-.github/
 .editorconfig
 
 # temporary files
@@ -43,6 +42,9 @@ logs/
 gradio_tmp_dir/
 temp**
 demo_outputs/
+comparison_*.csv
+layer_sweep_*.csv
+seed_summary.csv
 
 # Checkpoints
 **tar

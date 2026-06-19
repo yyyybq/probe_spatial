@@ -6,5 +6,5 @@ setup(
     description="VideoProbe",
     author="Zixuan Huang",
     author_email="zixuan32@illinois.edu",
-    packages=find_packages(include=["vidfm3d"]),
+    packages=find_packages(include=["vidfm3d", "vidfm3d.*"]),
 )

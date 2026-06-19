@@ -102,7 +102,7 @@ probe_spatial/
   provide RGB, depth, instance masks, intrinsics, and extrinsics per frame.
 - **On disk**:
   ```
-  /nas/baiqiao/InsScene-15K/data/
+  ${INSCENE_DATA_ROOT}/
       processed_infinigen/scene_XXX/<hash>/frames/Image/camera_0/*.png
       processed_infinigen/scene_XXX/<hash>/{Depth,ObjectSegmentation,camview}/...
       processed_scannetpp_v2/<scene_id>/{images,depth,refined_ins_ids,metadata.npz}
@@ -129,9 +129,8 @@ probe_spatial/
 - Sampled inside the window via `_sample_query_frames` with
   `min_view_interval = 5` and `query_idx_divisor = 4` (snapping to a 4-frame
   grid that matches the VFM's temporal stride).
-- The last view (`sel[-1]`) has special meaning for B1 (= "current" frame the
-  agent has to localize the hidden object from) and for C1 (= "target" frame to
-  be predicted).
+- Predictions are defined in the last view's camera coordinate system. This is
+  a target/reference convention, not a pose or current-frame conditioning input.
 
 ---
 
@@ -147,6 +146,66 @@ as
 {out_root}/{vfm_dir}/{source}/{scene}/feature{feat_postfix}.sft   key="feat"
 ```
 For Wan: `(81, 18, 32, 1536)` after reshape; `feat_postfix = _t749_layer20`.
+
+### 4.0 Which layer is currently probed?
+
+The default layer choices are intentionally kept identical to the existing
+experiments and are centralized in `vidfm3d/utils/feature_layers.py`.
+
+| Feature backend | Default cache | Layer meaning |
+|---|---|---|
+| Wan2.1 | `feature_t749_layer20.sft` | diffusion transformer block 20 at timestep 749 |
+| CogVideoX | `feature_t749_layer20.sft` | diffusion transformer block 20 at timestep 749 |
+| V-JEPA2 ViT-L | `feature_layer23.sft` | last encoder block, 0-based layer 23 |
+| Qwen2.5-VL / BAGEL | `feature_layer-1.sft` | current MLLM default visual-token / last-layer cache |
+
+Layer selection is a filename convention, not a probe-head change.  The dataset
+loads `feature{feat_postfix}.sft` by default, or can derive the filename from
+`feature_layer` plus `feature_timestep`.  The probe heads see the same tensor
+shape contract `(S, H_f, W_f, C)`.
+
+To extract extra layers:
+
+```bash
+# Wan/CogVideoX: explicit transformer blocks at the same diffusion timestep.
+python -m features.run_inscene15k --vfm wan \
+  --data-root ${INSCENE_DATA_ROOT} \
+  --out-root ${INSCENE_FEAT_ROOT} \
+  --t 749 --output-layers 0 5 10 15 20 25 29
+
+# V-JEPA2: all encoder blocks, or aliases such as default/last.
+python -m features.run_inscene15k --vfm vjepa2 \
+  --data-root ${INSCENE_DATA_ROOT} \
+  --out-root ${INSCENE_FEAT_ROOT} \
+  --all-layers
+
+# Qwen2.5-VL: -1 is the current visual-merger cache; non-negative layers are
+# vision-tower block outputs captured with forward hooks.
+python -m features.run_inscene15k_mllm --backend qwen2_5_vl \
+  --data-root ${INSCENE_DATA_ROOT} \
+  --out-root ${INSCENE_MLLM_FEAT_ROOT} \
+  --output-layers -1 0 8 16 24 31
+```
+
+To train a layer-wise sweep, reuse one experiment config and override only the
+feature layer/run identity:
+
+```bash
+VFM=wan PROBE=ego_belief LAYERS="0 5 10 15 20 25 29" DEV=0 \
+  bash scripts/run_layer_sweep.sh
+```
+
+After `eval_diag.py` has produced `eval/val_summary.json` for each run:
+
+```bash
+python scripts/summarize_layer_sweep.py \
+  --vfm wan --probe ego_belief \
+  --pattern "inscene15k_ext_ego_belief_wan_layer*" \
+  --output layer_sweep_ego_belief_wan.csv
+```
+
+The summary reports the layer-wise CSV, `best_layer`, the registered default
+layer score, and the last-layer score when a static last layer is known.
 
 ### 4.1 Three modes
 
@@ -179,8 +238,8 @@ GPU per process.
 - A3 sets `diag_abnormal=True` + `shuffled_feat_root=...` and the dataset
   also loads `vfm_feat_shuffled`.
 - C1 sets `diag_action=True` + `target_feat_root=...` and the dataset loads
-  the `target_isolated` feature for the closest target index to the last
-  sampled frame, into `target_feat`. It also slices `vfm_feat[:-1]` →
+  an exact cached `target_isolated` frame and aligns the sampled target,
+  camera extrinsic, and action before loading `target_feat`. It also slices `vfm_feat[:-1]` →
   `input_feat`.
 
 ---
@@ -232,11 +291,15 @@ Common conventions:
   = `num_visible_frames * 1e6 + total_visible_pixels` — so we always pick the
   most informative target. If no candidate, sample is marked `valid=False`
   and skipped during training.
-- **Head**: per-frame masked average pool inside the object's footprint
-  (empty-mask frames are masked out via `src_key_padding_mask`), prepended
-  with a learnable `frame_query` token initialized with the encoded last
-  pose; 2-layer Transformer encoder; head reads `[query]` and outputs 3
-  scalars.
+- **Object condition**: B1 receives the object's past masks; B2 receives a
+  masked-pooled appearance query. This condition is part of the main task.
+- **No pose condition**: neither B1 nor B2 receives camera intrinsics,
+  extrinsics, relative pose, or an explicit current-frame role token.
+- **Head**: B1 masked-pools the specified object while it is visible and uses
+  global frame tokens after it disappears (including the final reference
+  observation), then prepends a learned task query. B2 attends from the object
+  query to all ordered patch tokens.
+  The last-frame reference is implicit in sequence order and the GT definition.
 - **Loss**: weighted Smooth-L1 with weights `(1, 1, 0.5)` on (azimuth,
   elevation, log-dist).
 - **Metrics**: per-axis errors in degrees for angles and natural-log error
@@ -257,8 +320,11 @@ Common conventions:
   2-layer Transformer encoder → linear back to `C` dims, returned at
   `[query]`.
 - **Loss**: MSE + (1 − cosine).
-- **Metrics**: cosine similarity, in-batch retrieval R@1, mean rank
-  (R@1/mean-rank skipped when `B<4` to avoid trivial 100%).
+- **Training diagnostics**: cosine similarity plus explicitly named
+  `inbatch_R@1`/mean-rank; these depend on batch size and are not final metrics.
+- **Final metrics**: `eval_diag.py` retrieves against the complete evaluation
+  set and reports global R@1/R@5/mean-rank plus no-action, shuffled-action and
+  last-observation controls.
 - **Action variant in use**: **C1a** — replicate target frame to fill clip
   during target extraction. (We considered C1b = noise-pad; rejected because
   C1a's target language is purely a function of the target frame.)
@@ -331,11 +397,19 @@ overrides:
   `diag_*` flag(s).
 - `model.probe_type` and `model.probe._target_ + dims`.
 
-| VFM | `feat_postfix` | `in_channels` |
-|---|---|---|
-| Wan2.1-T2V-1.3B | `_t749_layer20` | 1536 |
-| CogVideoX-5b-I2V | `_t749_layer20` | 3072 |
-| V-JEPA2-vitl-fpc64-256 | `_layer23` | 1024 |
+| Backbone | Current default feature | Meaning | `in_channels` |
+|---|---|---|---|
+| Wan2.1-T2V-1.3B | `_t749_layer20` | diffusion transformer block 20 at timestep 749 | 1536 |
+| CogVideoX-5b-I2V | `_t749_layer20` | diffusion transformer block 20 at timestep 749 | 3072 |
+| V-JEPA2-vitl-fpc64-256 | `_layer23` | final ViT encoder block, 0-indexed | 1024 |
+| Qwen2.5-VL-7B | `_layer-1` | historical default: final visual-merger tokens | 3584 |
+| Qwen2.5-VL-3B | `_layer-1` | historical default: final visual-merger tokens | 2048 |
+| BAGEL HF backend | `_layer-1` | final HF hidden state / visual-token grid when available | 3584 |
+
+Layer metadata lives in `vidfm3d/utils/feature_layers.py`.  The old
+`feat_postfix` path is still valid; new experiments can instead override
+`feature_layer=<n>` (and, for diffusion VFMs, `feature_timestep=<t>`) to select
+another cached layer without editing YAML.
 
 ---
 
@@ -346,16 +420,86 @@ For each VFM you want to compare, extract all three modes:
 ```bash
 # A1/A2/B1 inputs + C1 input frames
 python -m features.run_inscene15k --vfm wan --mode normal \
-    --data-root /nas/baiqiao/InsScene-15K/data \
-    --out-root  /nas/baiqiao/InsScene-15K/FEAT
+    --data-root ${INSCENE_DATA_ROOT} \
+    --out-root  ${INSCENE_FEAT_ROOT}
 # A3
 python -m features.run_inscene15k --vfm wan --mode shuffled \
-    --out-root /nas/baiqiao/InsScene-15K/FEAT_SHUFFLED
+    --out-root ${INSCENE_SHUFFLED_FEAT_ROOT}
 # C1 targets
 python -m features.run_inscene15k --vfm wan --mode target_isolated \
-    --out-root /nas/baiqiao/InsScene-15K/FEAT_TARGET --num-targets 8
+    --out-root ${INSCENE_TARGET_FEAT_ROOT} --num-targets 8
 ```
 Switch `--vfm cogvideox` / `--vfm vjepa2` for the other VFMs.
+
+### 8.1.1 Layer-wise feature sweeps
+
+To probe where spatial information is strongest, extract multiple layers into
+the same cache.  Existing default behavior is unchanged when `--output-layers`
+is omitted.
+
+```bash
+# Wan/CogVideoX: produces feature_t749_layer{L}.sft
+python -m features.run_inscene15k --vfm wan --mode normal \
+  --data-root ${INSCENE_DATA_ROOT} \
+  --out-root ${INSCENE_FEAT_ROOT} \
+  --t 749 --output-layers 4 8 12 16 20 24 28
+
+# V-JEPA2 / VLM-style filenames: produces feature_layer{L}.sft
+python -m features.run_inscene15k --vfm vjepa2 --mode normal \
+  --data-root ${INSCENE_DATA_ROOT} \
+  --out-root ${INSCENE_FEAT_ROOT} \
+  --output-layers 3 7 11 15 19 23
+```
+
+For A3, C1, C2, and C3, extract the same layer list for `--mode shuffled` and
+`--mode target_isolated` too, because those probes intentionally compare
+different feature caches.
+
+Training a probe on layer `L` is a Hydra override:
+
+```bash
+python vidfm3d/train.py experiment=inscene15k_ext/view_consistency_wan_v1 \
+  feature_layer=12 feature_timestep=749 \
+  model.probe.in_channels=1536 \
+  job_name=view_consistency_wan_layer12
+```
+
+For V-JEPA2 use `feature_layer=12` and `model.probe.in_channels=1024`; for
+Qwen2.5-VL/BAGEL use `features/run_inscene15k_mllm.py --output-layers ...` and
+set the corresponding `model.probe.in_channels` for the cached activation.
+Qwen's default `--output-layers -1` keeps the existing final visual-merger
+feature; explicit non-`-1` layers are VLM hidden-state activations.
+
+After evaluating each layer with `vidfm3d/eval_diag.py`, summarize best layer,
+last-layer score, and the layer-wise curve:
+
+```bash
+python scripts/summarize_layer_sweep.py \
+  --vfm wan --probe view_consistency \
+  --pattern "inscene15k_ext_view_consistency_wan_layer*" \
+  --output layer_sweep_view_consistency_wan.csv
+```
+
+Or run the whole pipeline with one script. It extracts the feature modes needed
+by the selected probe, trains one probe per layer, evaluates all checkpoints,
+and writes the summary CSV:
+
+```bash
+VFM=wan PROBE=view_consistency LAYERS="0 5 10 15 20 25 29" \
+  EXTRA_TRAIN="logger.wandb.offline=true" \
+  bash scripts/run_feature_layer_probe_sweep.sh
+```
+
+Mode selection is automatic: A2/B1/B2 use normal caches, A3 adds shuffled
+caches, and C1/C2/C3 add target-isolated caches. For VLM/UMM experiments whose
+config name is not `{probe}_{vfm}_v1`, pass `CFG` explicitly:
+
+```bash
+CFG=inscene15k_ext/sae_qwen2_5vl_v1 \
+VFM=qwen2_5_vl PROBE=sae SUMMARY_PROBE=sae_spatial \
+LAYERS="-1 8 16 24" \
+bash scripts/run_feature_layer_probe_sweep.sh
+```
 
 ### 8.2 Train a single probe
 ```bash
@@ -405,10 +549,10 @@ bash scripts/run_diag_eval_sweep.sh         # writes comparison_val.csv
 | Probe input resolution | 288 × 512 | Cheap to load, integer ratio to features |
 | Views per sample (S) | 4 | Enough for pair tasks, cheap |
 | Action encoding | 6-D rot (Zhou+2019, first 2 rows of R_rel) + 3-D trans = 9 | Continuous, no singularity |
-| B1 target frame | the last view of the 4 sampled views | well-defined "now" |
+| B1 reference frame | camera coordinates of the last sampled view | target convention; not an input condition |
 | B1 obj selection | single highest-score hidden object per sample | concentrates supervision on a hard, well-posed signal |
 | A2 thresholds | pos ≥ 0.4, neg ≤ 0.05 | empirically separates clean pos/neg |
-| C1 retrieval | in-batch only, skipped at B<4 | avoids degenerate metric |
+| C1 retrieval | global evaluation set | stable candidate pool; training in-batch score is diagnostic only |
 | Loss for B1 distance | weight 0.5 on log-distance | prevents far-object terms dominating |
 | Why fp32 in dataset | cast on load (`.float()`) | mixes well with autocast, avoids dtype errors at concat |
 | Checkpointing | every 5 epochs + last.ckpt forced | survives SIGKILL; resumable wandb |
@@ -480,3 +624,203 @@ and the eval pipeline in §8.4 are introduced by this work.
 | add a new VFM | `features/<vfm>/...` + add a branch in `features/run_inscene15k.py` + new entries to `VFM_DEFAULTS` and `_feat_filename` |
 | add a new probe | new head class + new `_step_<x>` in `probe_ext_module.py` + register in `RECORDERS` of `eval_diag.py` + new experiment yaml |
 | reproduce slides table | `bash scripts/run_diag_eval_sweep.sh` then open `comparison_val.csv` |
+
+---
+
+## 14. VLM / Unified-Model SAE Extension
+
+This section records the new extension for probing spatial representations in
+VLMs and unified multimodal models, beyond the previous video-generation and
+video-SSL backbones.
+
+### 14.1 Motivation
+
+The original diagnostic suite asks how much 3D, temporal, and egocentric spatial
+information is encoded in frozen video foundation model features such as Wan,
+CogVideoX, and V-JEPA2. The new extension asks the analogous question for:
+
+- **VLMs:** Qwen2.5-VL.
+- **Unified multimodal models:** ByteDance BAGEL.
+
+The core design remains unchanged: the backbone is frozen, activations are
+pre-extracted, and only lightweight probes are trained. The new part is an
+SAE-based diagnostic layer that can test whether the internal activations admit
+a sparse dictionary whose features still preserve spatial information.
+
+### 14.2 New feature extraction path
+
+New file:
+
+```text
+features/run_inscene15k_mllm.py
+```
+
+It mirrors `features/run_inscene15k.py`, but targets multimodal language models
+whose hidden states are token sequences rather than video diffusion grids.
+
+Output format:
+
+```text
+{out_root}/{vfm_name}/{source}/{scene}/feature_layer{layer}.sft
+```
+
+Each safetensors file contains:
+
+```text
+feat: (S, H_t, W_t, C)
+```
+
+where `S` is the sampled frame count and `(H_t, W_t)` is the visual-token grid.
+This makes Qwen2.5-VL / BAGEL activations compatible with
+`InsScene15KDataset`, which already expects a frame-aligned `(T,H,W,C)` feature
+cache.
+
+Example Qwen2.5-VL extraction:
+
+```bash
+/data/baiqiao/miniconda3/envs/vidfm3d/bin/python -m features.run_inscene15k_mllm \
+  --data-root ${INSCENE_DATA_ROOT} \
+  --out-root ${INSCENE_MLLM_FEAT_ROOT} \
+  --backend qwen2_5_vl \
+  --output-layers -1 \
+  --num-frames 8
+```
+
+Example BAGEL extraction:
+
+```bash
+/data/baiqiao/miniconda3/envs/vidfm3d/bin/python -m features.run_inscene15k_mllm \
+  --data-root ${INSCENE_DATA_ROOT} \
+  --out-root ${INSCENE_MLLM_FEAT_ROOT} \
+  --backend bagel_hf \
+  --vfm-name bagel \
+  --output-layers -1 \
+  --num-frames 8
+```
+
+Implementation note: Qwen2.5-VL uses the standard Transformers path. BAGEL is
+currently wired through a generic Hugging Face `trust_remote_code` backend,
+because the public model card points users to the upstream BAGEL repository
+rather than exposing a stable Transformers usage snippet. If a local BAGEL repo
+is used later, replace this backend with a native BAGEL adapter while keeping the
+same `.sft` output contract.
+
+### 14.3 Dataset support
+
+`vidfm3d/data/components/inscene15k_dataset.py` now treats any 4D feature cache
+as a frame-aligned token/grid feature:
+
+```text
+feat: (T, H, W, C)
+```
+
+This covers Qwen2.5-VL and BAGEL in the same way as Wan / V-JEPA2 after the
+features are cached. CogVideoX remains special-cased because its cache has an
+extra leading dimension that is flattened before frame alignment.
+
+New default channel hints were added for debug / missing-feature fallbacks:
+
+```text
+qwen2_5_vl: 3584
+bagel:      3584
+```
+
+### 14.4 SAE spatial probe
+
+New file:
+
+```text
+vidfm3d/models/components/probe_sae_spatial.py
+```
+
+The probe is `TopKSAESpatialProbe`. It trains a Top-k sparse autoencoder on
+frozen activations:
+
+```text
+x -> sparse code -> reconstructed x
+```
+
+It also exposes lightweight readouts from frame-level sparse codes:
+
+- overlap readout: predicts A2-style view overlap from sparse frame codes.
+- ego readout: predicts B2-style hidden-object polar target from sparse codes.
+
+By default, `detach_readout=True`, so spatial labels do not shape the SAE
+dictionary itself. The readouts evaluate how much spatial information is already
+available in the learned sparse codes.
+
+Main metrics logged by `probe_type=sae_spatial`:
+
+```text
+sae_recon_mse
+sae_rel_mse
+sae_l1
+sae_l0
+sae_active_frac
+sae_overlap_bce
+sae_overlap_mae
+sae_ego_loss
+sae_ego_az_err_deg
+sae_ego_el_err_deg
+sae_ego_logd_err
+```
+
+### 14.5 Training configs
+
+New experiment configs:
+
+```text
+configs/experiment/inscene15k_ext/sae_qwen2_5vl_v1.yaml
+configs/experiment/inscene15k_ext/sae_bagel_v1.yaml
+```
+
+Example training:
+
+```bash
+/data/baiqiao/miniconda3/envs/vidfm3d/bin/python vidfm3d/train.py \
+  experiment=inscene15k_ext/sae_qwen2_5vl_v1
+```
+
+```bash
+/data/baiqiao/miniconda3/envs/vidfm3d/bin/python vidfm3d/train.py \
+  experiment=inscene15k_ext/sae_bagel_v1
+```
+
+### 14.6 How to interpret this extension
+
+The SAE extension is not a replacement for A2/A3/B1/B2/C1/C2/C3. It is a
+complementary representation diagnostic:
+
+- Direct probes answer: can a lightweight head recover the spatial label from
+  frozen features?
+- SAE probes answer: can the activation space be decomposed into sparse features
+  while retaining spatial information in the sparse code?
+
+Useful comparisons:
+
+1. Qwen2.5-VL SAE vs BAGEL SAE: VLM understanding model vs unified
+   understanding-generation model.
+2. SAE sparse-code readouts vs direct B2/A2 probes: whether sparse
+   decomposition preserves or discards spatial signal.
+3. Real features vs scrambled/random controls: whether the spatial readout is
+   supported by model activations rather than dataset bias.
+
+### 14.7 Validation already performed
+
+The following checks were run after implementation:
+
+```bash
+/data/baiqiao/miniconda3/envs/vidfm3d/bin/python -m py_compile \
+  features/run_inscene15k_mllm.py \
+  vidfm3d/models/components/probe_sae_spatial.py \
+  vidfm3d/models/probe_ext_module.py \
+  vidfm3d/data/components/inscene15k_dataset.py
+```
+
+Additional smoke checks:
+
+- `TopKSAESpatialProbe` forward / backward on small synthetic tensors.
+- `ProbeExtensionLitModule.model_step(probe_type="sae_spatial")` with synthetic
+  `vfm_feat`, `overlap_gt`, `hidden_obj_polar`, and `belief_query_feat`.
+- Hydra config composition for `sae_qwen2_5vl_v1` and `sae_bagel_v1` via
+  `--cfg job`.

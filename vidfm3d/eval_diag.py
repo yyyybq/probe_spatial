@@ -13,6 +13,8 @@ The probe-type-specific record schema:
   ego_belief:        {scene_path, polar_gt (3,), polar_pred (3,), valid, obj_id}
   ego_belief_v2:     {scene_path, polar_gt (3,), pred bins/errors, valid}
   action_dynamics:   {scene_path, action (9,), pred (C,), target (C,), valid}
+  path_integration:  {scene_path, horizons, pred (K,C), target (K,C), poses, valid}
+  counterfactual:    {scene_path, horizons, pred (K,C), target (K,C), overlap, valid}
 
 Usage:
   python vidfm3d/eval_diag.py \
@@ -26,6 +28,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import random
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -41,6 +45,14 @@ log = pylogger.RankedLogger(__name__, rank_zero_only=True)
 
 def _detach_cpu(t: torch.Tensor) -> torch.Tensor:
     return t.detach().to("cpu")
+
+
+def _source_from_path(path: str) -> str:
+    if "processed_infinigen" in path:
+        return "infinigen"
+    if "processed_scannetpp" in path:
+        return "scannetpp"
+    return "unknown"
 
 
 @torch.no_grad()
@@ -92,10 +104,9 @@ def _record_ego_belief(probe_module, batch) -> List[Dict[str, Any]]:
     vfm_feat = batch["vfm_feat"][valid]
     per_pix = batch["hidden_obj_mask"][valid]
     polar_gt = batch["hidden_obj_polar"][valid]
-    last_pose = batch["last_pose_enc"][valid]
     H_f, W_f = vfm_feat.shape[2], vfm_feat.shape[3]
     obj_mask_feat = _resize_mask_to_feat(per_pix, H_f, W_f)
-    polar_pred = probe_module.probe(vfm_feat, obj_mask_feat, last_pose)
+    polar_pred = probe_module.probe(vfm_feat, obj_mask_feat)
     valid_idx = torch.nonzero(valid, as_tuple=False).flatten().tolist()
     obj_ids = batch.get("hidden_obj_id", torch.full_like(valid, -1, dtype=torch.long))
     for k, b in enumerate(valid_idx):
@@ -183,14 +194,69 @@ def _record_action_dynamics(probe_module, batch) -> List[Dict[str, Any]]:
     target_feat = batch["target_feat"][valid]
     target_pooled = target_feat.mean(dim=(1, 2))
     pred = probe_module.probe(input_feat, action)
+    shuffled_action = torch.roll(action, shifts=1, dims=0) if action.shape[0] > 1 else torch.zeros_like(action)
+    pred_no_action = probe_module.probe(input_feat, torch.zeros_like(action))
+    pred_shuffled_action = probe_module.probe(input_feat, shuffled_action)
+    last_observation = input_feat[:, -1].mean(dim=(1, 2))
     valid_idx = torch.nonzero(valid, as_tuple=False).flatten().tolist()
     for k, b in enumerate(valid_idx):
         out.append({
             "scene_path": scene_paths[b] if isinstance(scene_paths, list) else str(scene_paths[b]),
             "action": _detach_cpu(action[k]),
             "pred": _detach_cpu(pred[k]),
+            "pred_no_action": _detach_cpu(pred_no_action[k]),
+            "pred_shuffled_action": _detach_cpu(pred_shuffled_action[k]),
+            "last_observation": _detach_cpu(last_observation[k]),
             "target": _detach_cpu(target_pooled[k]),
+            "target_frame_idx": int(batch.get("target_frame_idx", torch.full_like(valid, -1))[b].item()),
             "valid": True,
+        })
+    return out
+
+
+@torch.no_grad()
+def _record_path_integration(probe_module, batch) -> List[Dict[str, Any]]:
+    valid = batch.get("path_horizon_valid")
+    if valid is None:
+        valid = torch.ones(batch["path_actions"].shape[:2], dtype=torch.bool,
+                           device=batch["path_actions"].device)
+    pred = probe_module.probe(batch["input_feat_seq"], batch["path_actions"])
+    target = batch["target_feat_seq"].mean(dim=(2, 3))
+    out = []
+    scene_paths = batch.get("scene_path", ["?"] * pred.shape[0])
+    for b in range(pred.shape[0]):
+        out.append({
+            "scene_path": scene_paths[b] if isinstance(scene_paths, list) else str(scene_paths[b]),
+            "horizons": _detach_cpu(batch["action_horizons"][b]),
+            "pred": _detach_cpu(pred[b]),
+            "target": _detach_cpu(target[b]),
+            "valid": _detach_cpu(valid[b].bool()),
+            "start_extrinsic": _detach_cpu(batch["start_extrinsic"][b]),
+            "target_extrinsics": _detach_cpu(batch["target_extrinsics"][b]),
+        })
+    return out
+
+
+@torch.no_grad()
+def _record_counterfactual(probe_module, batch) -> List[Dict[str, Any]]:
+    valid = batch.get("counterfactual_valid")
+    if valid is None:
+        valid = torch.ones(batch["counterfactual_actions"].shape[:2], dtype=torch.bool,
+                           device=batch["counterfactual_actions"].device)
+    pred = probe_module.probe(batch["input_feat_seq"], batch["counterfactual_actions"])
+    target = batch["target_feat_seq"].mean(dim=(2, 3))
+    out = []
+    scene_paths = batch.get("scene_path", ["?"] * pred.shape[0])
+    for b in range(pred.shape[0]):
+        out.append({
+            "scene_path": scene_paths[b] if isinstance(scene_paths, list) else str(scene_paths[b]),
+            "horizons": _detach_cpu(batch["action_horizons"][b]),
+            "pred": _detach_cpu(pred[b]),
+            "target": _detach_cpu(target[b]),
+            "valid": _detach_cpu(valid[b].bool()),
+            "overlap": _detach_cpu(batch["counterfactual_overlap"][b]),
+            "start_extrinsic": _detach_cpu(batch["start_extrinsic"][b]),
+            "target_extrinsics": _detach_cpu(batch["target_extrinsics"][b]),
         })
     return out
 
@@ -201,6 +267,8 @@ RECORDERS = {
     "ego_belief": _record_ego_belief,
     "ego_belief_v2": _record_ego_belief_v2,
     "action_dynamics": _record_action_dynamics,
+    "path_integration": _record_path_integration,
+    "counterfactual": _record_counterfactual,
 }
 
 
@@ -224,6 +292,49 @@ def _binary_auc(scores: List[float], labels: List[int]) -> float:
 
     sum_pos_ranks = sum(ranks[i] for i, label in enumerate(labels) if label == 1)
     return (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def _binary_average_precision(scores: List[float], labels: List[int]) -> float:
+    n_pos = sum(labels)
+    if n_pos == 0:
+        return float("nan")
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    hits = 0
+    precision_sum = 0.0
+    for rank, idx in enumerate(order, start=1):
+        if labels[idx]:
+            hits += 1
+            precision_sum += hits / rank
+    return precision_sum / n_pos
+
+
+def _feature_retrieval_summary(preds: torch.Tensor, tgts: torch.Tensor) -> Dict[str, float]:
+    n = preds.shape[0]
+    if n == 0:
+        return {"mean_cos": float("nan"), "global_R@1": float("nan"),
+                "global_R@5": float("nan"), "mean_rank": float("nan")}
+    coss = F.cosine_similarity(preds, tgts, dim=-1)
+    sim = F.normalize(preds, dim=-1) @ F.normalize(tgts, dim=-1).T
+    rank = (sim.argsort(dim=-1, descending=True) ==
+            torch.arange(n).unsqueeze(-1)).float().argmax(dim=-1)
+    return {
+        "mean_cos": float(coss.mean().item()),
+        "global_R@1": float((rank == 0).float().mean().item()),
+        "global_R@5": float((rank < 5).float().mean().item()),
+        "mean_rank": float(rank.float().mean().item()),
+    }
+
+
+def _translation_error(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float(torch.linalg.norm(a[:3, 3].float() - b[:3, 3].float()).item())
+
+
+def _path_length(start: torch.Tensor, targets: torch.Tensor) -> float:
+    poses = torch.cat([start.unsqueeze(0), targets], dim=0)
+    if poses.shape[0] <= 1:
+        return 0.0
+    diffs = poses[1:, :3, 3].float() - poses[:-1, :3, 3].float()
+    return float(torch.linalg.norm(diffs, dim=-1).sum().item())
 
 
 def _summarize(records, probe_type) -> Dict[str, float]:
@@ -269,6 +380,7 @@ def _summarize(records, probe_type) -> Dict[str, float]:
             "neg_acc": float(neg_acc),
             "balanced_acc": float(balanced),
             "roc_auc": float(_binary_auc(hard_scores, hard_labels)) if hard else float("nan"),
+            "pr_auc": float(_binary_average_precision(hard_scores, hard_labels)) if hard else float("nan"),
             "n_pos": len(pos),
             "n_neg": len(neg),
             "pos_frac": float(len(pos) / len(hard)) if hard else float("nan"),
@@ -281,15 +393,24 @@ def _summarize(records, probe_type) -> Dict[str, float]:
         # Discriminability: prob_shuffled - prob_normal (>0 means correct)
         delta = [r["prob_shuffled"] - r["prob_normal"] for r in valids]
         acc = [(r["prob_shuffled"] > 0.5) and (r["prob_normal"] <= 0.5) for r in valids]
+        rank_acc = [r["prob_shuffled"] > r["prob_normal"] for r in valids]
+        scores = [r["prob_normal"] for r in valids] + [r["prob_shuffled"] for r in valids]
+        labels = [0] * len(valids) + [1] * len(valids)
         return {
             "n": n, "n_valid": len(valids),
             "mean_delta": float(sum(delta) / len(delta)),
             "pair_acc": float(sum(acc) / len(acc)),
+            "paired_rank_acc": float(sum(rank_acc) / len(rank_acc)),
+            "roc_auc": float(_binary_auc(scores, labels)),
+            "pr_auc": float(_binary_average_precision(scores, labels)),
         }
     if probe_type == "ego_belief":
         if not records:
             return {"n": 0}
-        az_err = [(r["polar_pred"][0] - r["polar_gt"][0]).abs().item() * 180 / 3.14159265 for r in records]
+        az_err = [abs(math.atan2(
+            math.sin((r["polar_pred"][0] - r["polar_gt"][0]).item()),
+            math.cos((r["polar_pred"][0] - r["polar_gt"][0]).item()),
+        )) * 180 / math.pi for r in records]
         el_err = [(r["polar_pred"][1] - r["polar_gt"][1]).abs().item() * 180 / 3.14159265 for r in records]
         ld_err = [(r["polar_pred"][2] - r["polar_gt"][2]).abs().item() for r in records]
         return {
@@ -311,24 +432,162 @@ def _summarize(records, probe_type) -> Dict[str, float]:
             "mean_log_dist_err": float(sum(r["logd_err"] for r in records) / n),
         }
     if probe_type == "action_dynamics":
-        coss = []
         preds = torch.stack([r["pred"] for r in records])
         tgts = torch.stack([r["target"] for r in records])
-        coss = F.cosine_similarity(preds, tgts, dim=-1)
-        # global retrieval rank
-        sim = F.normalize(preds, dim=-1) @ F.normalize(tgts, dim=-1).T
-        rank = (sim.argsort(dim=-1, descending=True) ==
-                torch.arange(n).unsqueeze(-1)).float().argmax(dim=-1)
-        r1 = (rank == 0).float().mean().item()
-        r5 = (rank < 5).float().mean().item()
-        return {
-            "n": n,
-            "mean_cos": float(coss.mean().item()),
-            "global_R@1": r1,
-            "global_R@5": r5,
-            "mean_rank": float(rank.float().mean().item()),
-        }
+        no_action = torch.stack([r["pred_no_action"] for r in records])
+        shuffled = torch.stack([r["pred_shuffled_action"] for r in records])
+        last_obs = torch.stack([r["last_observation"] for r in records])
+        out = {"n": n, **_feature_retrieval_summary(preds, tgts)}
+        out.update({f"no_action_{k}": v for k, v in _feature_retrieval_summary(no_action, tgts).items()})
+        out.update({f"shuffled_action_{k}": v for k, v in _feature_retrieval_summary(shuffled, tgts).items()})
+        out.update({f"last_observation_{k}": v for k, v in _feature_retrieval_summary(last_obs, tgts).items()})
+        out["action_gain_cos"] = out["mean_cos"] - out["no_action_mean_cos"]
+        return out
+    if probe_type == "path_integration":
+        flat_pred, flat_tgt = [], []
+        final_errors = []
+        drift_rates = []
+        step_errors = []
+        loop_errors = []
+        horizon_err = {}
+        n_valid_records = 0
+        for r in records:
+            valid = r["valid"].bool()
+            if int(valid.sum().item()) == 0:
+                continue
+            n_valid_records += 1
+            pred = r["pred"][valid]
+            tgt = r["target"][valid]
+            poses = r["target_extrinsics"][valid]
+            horizons = r["horizons"][valid]
+            flat_pred.append(pred)
+            flat_tgt.append(tgt)
+
+            sim = F.normalize(pred, dim=-1) @ F.normalize(tgt, dim=-1).T
+            retrieved = sim.argmax(dim=-1)
+            for i, j in enumerate(retrieved.tolist()):
+                err = _translation_error(poses[j], poses[i])
+                step_errors.append(err)
+                h = int(horizons[i].item())
+                horizon_err.setdefault(h, []).append(err)
+
+            final_idx = pred.shape[0] - 1
+            final_ret = int(retrieved[final_idx].item())
+            final_err = _translation_error(poses[final_ret], poses[final_idx])
+            final_errors.append(final_err)
+            length = _path_length(r["start_extrinsic"], poses)
+            if length > 1e-6:
+                drift_rates.append(final_err / length)
+
+            final_to_start = _translation_error(poses[final_idx], r["start_extrinsic"])
+            if final_to_start <= 0.1:
+                loop_errors.append(_translation_error(poses[final_ret], r["start_extrinsic"]))
+
+        if flat_pred:
+            pred_all = torch.cat(flat_pred, dim=0)
+            tgt_all = torch.cat(flat_tgt, dim=0)
+            out = {"n": n, "n_valid_records": n_valid_records,
+                   "n_valid_steps": int(pred_all.shape[0]),
+                   **_feature_retrieval_summary(pred_all, tgt_all)}
+        else:
+            out = {"n": n, "n_valid_records": 0, "n_valid_steps": 0}
+
+        out.update({
+            "final_pose_error": float(sum(final_errors) / len(final_errors)) if final_errors else float("nan"),
+            "drift_rate": float(sum(drift_rates) / len(drift_rates)) if drift_rates else float("nan"),
+            "mean_step_pose_error": float(sum(step_errors) / len(step_errors)) if step_errors else float("nan"),
+            "loop_closure_error": float(sum(loop_errors) / len(loop_errors)) if loop_errors else float("nan"),
+            "n_loop": len(loop_errors),
+        })
+        for h, errs in sorted(horizon_err.items()):
+            out[f"pose_error_h{h}"] = float(sum(errs) / len(errs))
+        return out
+    if probe_type == "counterfactual":
+        flat_pred, flat_tgt = [], []
+        correct_cos = []
+        intervention_hits = []
+        intervention_margins = []
+        valid_by_h = {}
+        cos_by_h = {}
+        for r in records:
+            valid = r["valid"].bool()
+            if int(valid.sum().item()) == 0:
+                continue
+            pred = r["pred"][valid]
+            tgt = r["target"][valid]
+            horizons = r["horizons"][valid]
+            flat_pred.append(pred)
+            flat_tgt.append(tgt)
+            cos = F.cosine_similarity(pred, tgt, dim=-1)
+            correct_cos.extend(cos.tolist())
+            for h, c in zip(horizons.tolist(), cos.tolist()):
+                valid_by_h[int(h)] = valid_by_h.get(int(h), 0) + 1
+                cos_by_h.setdefault(int(h), []).append(float(c))
+
+            if pred.shape[0] >= 2:
+                sim = F.normalize(pred, dim=-1) @ F.normalize(tgt, dim=-1).T
+                diag = sim.diag()
+                best = sim.argmax(dim=-1)
+                intervention_hits.extend((best == torch.arange(pred.shape[0])).float().tolist())
+                offdiag = sim.masked_fill(torch.eye(pred.shape[0], dtype=torch.bool), float("-inf"))
+                margin = diag - offdiag.max(dim=-1).values
+                intervention_margins.extend(margin.tolist())
+
+        if flat_pred:
+            pred_all = torch.cat(flat_pred, dim=0)
+            tgt_all = torch.cat(flat_tgt, dim=0)
+            out = {"n": n, "n_valid_interventions": int(pred_all.shape[0]),
+                   **_feature_retrieval_summary(pred_all, tgt_all)}
+        else:
+            out = {"n": n, "n_valid_interventions": 0}
+        out.update({
+            "counterfactual_consistency": float(sum(correct_cos) / len(correct_cos)) if correct_cos else float("nan"),
+            "intervention_validity": float(sum(intervention_hits) / len(intervention_hits)) if intervention_hits else float("nan"),
+            "intervention_margin": float(sum(intervention_margins) / len(intervention_margins)) if intervention_margins else float("nan"),
+        })
+        for h, vals in sorted(cos_by_h.items()):
+            out[f"cf_cos_h{h}"] = float(sum(vals) / len(vals))
+            out[f"cf_n_h{h}"] = valid_by_h[h]
+        return out
     return {"n": n}
+
+
+def _bootstrap_primary_metrics(records, probe_type, reps=200, seed=0):
+    """Scene-level bootstrap CIs for the headline metrics."""
+    primary = {
+        "view_consistency": ["balanced_acc", "roc_auc", "mean_overlap_mae"],
+        "abnormal": ["paired_rank_acc", "roc_auc", "mean_delta"],
+        "ego_belief": ["mean_az_err_deg", "mean_el_err_deg", "mean_log_dist_err"],
+        "ego_belief_v2": ["mean_ang_err_deg", "top1", "mean_log_dist_err"],
+        "action_dynamics": ["mean_cos", "action_gain_cos"],
+    }.get(probe_type, [])
+    if not primary or reps <= 0:
+        return {}
+    grouped = {}
+    for record in records:
+        grouped.setdefault(record.get("scene_path", "?"), []).append(record)
+    scenes = sorted(grouped)
+    if len(scenes) < 2:
+        return {}
+    rng = random.Random(seed)
+    values = {key: [] for key in primary}
+    for _ in range(reps):
+        sampled = [rng.choice(scenes) for _ in scenes]
+        sample_records = [record for scene in sampled for record in grouped[scene]]
+        summary = _summarize(sample_records, probe_type)
+        for key in primary:
+            value = summary.get(key)
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                values[key].append(float(value))
+    result = {}
+    for key, vals in values.items():
+        if vals:
+            vals.sort()
+            result[key] = {
+                "low": vals[int(0.025 * (len(vals) - 1))],
+                "high": vals[int(0.975 * (len(vals) - 1))],
+            }
+    return result
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
@@ -336,6 +595,15 @@ def main(cfg: DictConfig) -> None:
     if not cfg.get("ckpt_path"):
         raise ValueError("Must provide ckpt_path=<path>")
     split = cfg.get("eval_split", "val")
+
+    if split == "test":
+        # Existing experiment configs name only validation_datasets. Rebind
+        # their explicit split at evaluation time; the dataset then requires a
+        # frozen manifest and cannot silently alias test back to validation.
+        cfg.data.data_module.validation_datasets = [
+            str(spec).replace("split='val'", "split='test'").replace('split="val"', 'split="test"')
+            for spec in cfg.data.data_module.validation_datasets
+        ]
 
     log.info(OmegaConf.to_yaml(cfg))
 
@@ -360,7 +628,7 @@ def main(cfg: DictConfig) -> None:
 
     model = hydra.utils.instantiate(cfg.model)
     state = torch.load(cfg.ckpt_path, map_location="cpu", weights_only=False)
-    model.load_state_dict(state["state_dict"], strict=False)
+    model.load_state_dict(state["state_dict"], strict=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.float().to(device).eval()
 
@@ -384,8 +652,31 @@ def main(cfg: DictConfig) -> None:
     sum_path = out_dir / f"{split}_summary.json"
     torch.save(records, pred_path)
     summary = _summarize(records, probe_type)
+    for record in records:
+        record["source"] = _source_from_path(str(record.get("scene_path", "")))
+    summary["by_source"] = {
+        source: _summarize([r for r in records if r["source"] == source], probe_type)
+        for source in sorted({r["source"] for r in records})
+    }
+    summary["bootstrap_95ci"] = _bootstrap_primary_metrics(
+        records, probe_type, reps=int(cfg.get("bootstrap_reps", 200)), seed=int(cfg.get("seed", 0))
+    )
     summary["probe_type"] = probe_type
     summary["ckpt_path"] = cfg.ckpt_path
+    summary["feature_layer"] = cfg.get("feature_layer", None)
+    summary["feat_postfix"] = cfg.get("feat_postfix", None)
+    summary["feature_timestep"] = cfg.get("feature_timestep", None)
+    summary["vfm_name"] = cfg.get("vfm_name", None)
+    summary["streaming_feat_root"] = cfg.get("streaming_feat_root", None)
+    summary["prefix_min_len"] = cfg.get("prefix_min_len", None)
+    summary["prefix_max_len"] = cfg.get("prefix_max_len", None)
+    summary["prefix_stride"] = cfg.get("prefix_stride", None)
+    if summary["feature_layer"] is None and summary["feat_postfix"] is not None:
+        layer_match = re.search(r"layer(-?\d+)", str(summary["feat_postfix"]))
+        if layer_match:
+            summary["feature_layer"] = int(layer_match.group(1))
+    if cfg.get("job_name"):
+        summary["job_name"] = str(cfg.job_name)
     with open(sum_path, "w") as f:
         json.dump(summary, f, indent=2)
     log.info(f"Wrote {pred_path}")

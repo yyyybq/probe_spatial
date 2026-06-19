@@ -1,0 +1,17 @@
+name: probe-spatial
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cmake=3.14
+  - pytorch=2.6.0
+  - torchvision=0.21.0
+  - torchaudio=2.6.0
+  - pytorch-cuda=12.4
+  - pip
+  - pip:
+      - -r requirements-lock.txt
+      - -e .
+      - pytest==8.3.5

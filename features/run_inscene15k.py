@@ -4,8 +4,8 @@ Extract WAN features for InsScene-15K scenes.
 
 Usage:
   CUDA_VISIBLE_DEVICES=2 python -m features.run_inscene15k \
-      --data-root /nas/baiqiao/InsScene-15K/data \
-      --out-root /nas/baiqiao/InsScene-15K/FEAT \
+      --data-root ${INSCENE_DATA_ROOT} \
+      --out-root ${INSCENE_FEAT_ROOT} \
       --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
       --t 749 --output-layers 20 \
       --source all
@@ -20,8 +20,12 @@ Resume-safe: scenes whose output .sft already exist are skipped.
 """
 
 import argparse
+import hashlib
+import importlib.util
+import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import timedelta
@@ -31,6 +35,17 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+
+try:
+    from vidfm3d.utils.feature_layers import parse_layers_arg
+except Exception:
+    _FEATURE_LAYERS_PATH = Path(__file__).resolve().parents[1] / "vidfm3d" / "utils" / "feature_layers.py"
+    _SPEC = importlib.util.spec_from_file_location("feature_layers", _FEATURE_LAYERS_PATH)
+    feature_layers = importlib.util.module_from_spec(_SPEC)
+    assert _SPEC.loader is not None
+    sys.modules[_SPEC.name] = feature_layers
+    _SPEC.loader.exec_module(feature_layers)
+    parse_layers_arg = feature_layers.parse_layers_arg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,9 +107,14 @@ def collect_scannetpp_scenes(source_path):
         if not os.path.isdir(scene_dir):
             continue
         img_dir = os.path.join(scene_dir, "images")
-        if not os.path.isdir(img_dir):
+        mask_dir = os.path.join(scene_dir, "refined_ins_ids")
+        if not os.path.isdir(img_dir) or not os.path.isdir(mask_dir):
             continue
-        imgs = sorted(f for f in os.listdir(img_dir) if f.endswith(".jpg"))
+        mask_files = set(os.listdir(mask_dir))
+        imgs = sorted(
+            f for f in os.listdir(img_dir)
+            if f.endswith(".jpg") and f"{f}.npy" in mask_files
+        )
         if len(imgs) >= 5:
             scenes.append({
                 "source": "scannetpp",
@@ -124,6 +144,31 @@ def load_and_resize_frames(img_dir, img_files, indices, size=(480, 832)):
         img = Image.open(path).convert("RGB").resize((w, h), Image.LANCZOS)
         frames.append(img)
     return frames
+
+
+def streaming_prefix_records(num_frames, min_len=1, max_len=None, stride=1, model_max_len=None):
+    """Build online prefix records H_t = [I_0, ..., I_t]."""
+    min_len = max(int(min_len), 1)
+    stride = max(int(stride), 1)
+    if max_len is None:
+        max_len = num_frames
+    max_len = min(int(max_len), num_frames)
+    if model_max_len is not None:
+        max_len = min(max_len, int(model_max_len))
+    if max_len < min_len:
+        return []
+    records = []
+    for length in range(min_len, max_len + 1, stride):
+        records.append({
+            "tail": length - 1,
+            "indices": list(range(length)),
+            "valid_length": length,
+        })
+    return records
+
+
+def prefix_dir_name(record):
+    return f"prefix_{int(record['tail']):06d}"
 
 
 def scene_name(scene_info):
@@ -164,7 +209,21 @@ def main():
                         help="Model ID (default per VFM)")
     parser.add_argument("--prompt", default="")
     parser.add_argument("--t", type=int, default=749)
-    parser.add_argument("--output-layers", nargs="+", type=int, default=[20])
+    parser.add_argument(
+        "--output-layers",
+        nargs="+",
+        default=None,
+        help=(
+            "Backbone layers to cache. Accepts integers plus aliases "
+            "`default`, `last`, and `all`. Defaults preserve the historical "
+            "probe layer per VFM."
+        ),
+    )
+    parser.add_argument(
+        "--all-layers",
+        action="store_true",
+        help="Cache every registered layer for this VFM.",
+    )
     parser.add_argument("--ensemble", type=int, default=1)
     parser.add_argument("--num-frames", type=int, default=None,
                         help="Number of frames to sample (default per VFM)")
@@ -178,20 +237,32 @@ def main():
     # ---------------- Spatial Diagnostic Suite extraction modes ----------------
     parser.add_argument(
         "--mode", default="normal",
-        choices=["normal", "shuffled", "target_isolated"],
+        choices=["normal", "shuffled", "target_isolated", "streaming_prefix"],
         help=(
             "normal: standard clip forward (default).\n"
             "shuffled: shuffle frame order before VFM forward (for A3 abnormal probe). "
             "Output features are re-ordered to match the original frame order so that "
             "shuffled[i] = feature of frame i extracted under scrambled temporal context.\n"
             "target_isolated: extract clip-isolated features for M target frames "
-            "(replicate each target frame to fill the clip; for C1 action-dynamics probe)."
+            "(replicate each target frame to fill the clip; for C1 action-dynamics probe).\n"
+            "streaming_prefix: independently forward prefixes [I_0, ..., I_t] and save "
+            "them under prefix_<tail>; short prefixes are padded by repeating I_t."
         ),
     )
     parser.add_argument("--shuffle-seed", type=int, default=42,
                         help="Seed used to permute frame order in --mode shuffled.")
     parser.add_argument("--num-targets", type=int, default=8,
-                        help="Number of target frames per scene in --mode target_isolated.")
+                        help="Target frames per scene in target_isolated mode; 0 means every frame.")
+    parser.add_argument("--no-cache-checksum", action="store_true",
+                        help="Skip SHA-256 in cache sidecars (faster, less robust).")
+    parser.add_argument("--allow-legacy-cache", action="store_true",
+                        help="Treat caches without a current provenance sidecar as complete.")
+    parser.add_argument("--prefix-stride", type=int, default=1,
+                        help="Frame stride between streaming-prefix tails.")
+    parser.add_argument("--prefix-min-len", type=int, default=1,
+                        help="Minimum streaming-prefix length.")
+    parser.add_argument("--prefix-max-len", type=int, default=81,
+                        help="Maximum streaming-prefix length before model padding.")
     args = parser.parse_args()
 
     # Per-VFM defaults
@@ -207,6 +278,13 @@ def main():
     if args.num_frames is None:
         args.num_frames = defaults["num_frames"]
     args.resize = defaults["size"]
+    args.output_layers = parse_layers_arg(
+        args.output_layers,
+        vfm_name=args.vfm,
+        model_id=args.model_id,
+        all_layers=args.all_layers,
+    )
+    log.info(f"Using output layers for {args.vfm}: {args.output_layers}")
 
     # Collect scenes
     scenes = []
@@ -257,16 +335,55 @@ def main():
     # locate it via `vfm_name` regardless of mode.
     vfm_dir_name = args.vfm
 
+    def cache_complete(path):
+        path = Path(path)
+        if not path.exists():
+            return False
+        sidecar = Path(f"{path}.manifest.json")
+        if not sidecar.exists():
+            return args.allow_legacy_cache
+        try:
+            meta = json.loads(sidecar.read_text())
+            return (
+                meta.get("frame_index_schema") == "image_mask_intersection_v1"
+                and meta.get("mode") == args.mode
+                and meta.get("model_id") == args.model_id
+                and path.stat().st_size == meta.get("size_bytes")
+            )
+        except Exception:
+            return False
+
     # Check how many are already done
     done = 0
     for s in scenes:
         name = scene_name(s)
         out_dir = os.path.join(args.out_root, vfm_dir_name, s["source"], name)
-        if args.vfm == "vjepa":
-            all_exist = os.path.exists(os.path.join(out_dir, out_fname(0)))
+        if args.mode == "streaming_prefix":
+            records = streaming_prefix_records(
+                len(s["img_files"]),
+                min_len=args.prefix_min_len,
+                max_len=args.prefix_max_len,
+                stride=args.prefix_stride,
+                model_max_len=args.num_frames,
+            )
+            all_exist = True
+            for record in records:
+                prefix_out_dir = os.path.join(out_dir, prefix_dir_name(record))
+                if args.vfm == "vjepa":
+                    prefix_exists = cache_complete(os.path.join(prefix_out_dir, out_fname(0)))
+                else:
+                    prefix_exists = all(
+                        cache_complete(os.path.join(prefix_out_dir, out_fname(l)))
+                        for l in args.output_layers
+                    )
+                if not prefix_exists:
+                    all_exist = False
+                    break
+        elif args.vfm == "vjepa":
+            all_exist = cache_complete(os.path.join(out_dir, out_fname(0)))
         else:
             all_exist = all(
-                os.path.exists(os.path.join(out_dir, out_fname(l)))
+                cache_complete(os.path.join(out_dir, out_fname(l)))
                 for l in args.output_layers
             )
         if all_exist:
@@ -280,7 +397,81 @@ def main():
     # ------------------------------------------------------------------ #
     # Load model (once)                                                  #
     # ------------------------------------------------------------------ #
-    from safetensors.torch import save_file
+    from safetensors.torch import save_file as _save_file
+
+    try:
+        extractor_git_commit = subprocess.check_output(
+            ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL, timeout=15,
+        ).strip()
+        extractor_git_dirty = bool(subprocess.check_output(
+            ["git", "-C", str(Path(__file__).resolve().parents[1]), "status", "--short"],
+            text=True, stderr=subprocess.DEVNULL, timeout=15,
+        ).strip())
+    except Exception:
+        extractor_git_commit = "unknown"
+        extractor_git_dirty = None
+
+    def save_file(tensors, out_path):
+        """Atomically publish a cache and its provenance sidecar."""
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out_path.with_name(f".{out_path.name}.tmp-{os.getpid()}")
+        _save_file(tensors, str(tmp))
+        digest = None
+        if not args.no_cache_checksum:
+            sha = hashlib.sha256()
+            with open(tmp, "rb") as handle:
+                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                    sha.update(chunk)
+            digest = sha.hexdigest()
+        os.replace(tmp, out_path)
+        manifest = {
+            "schema_version": 1,
+            "frame_index_schema": "image_mask_intersection_v1",
+            "extractor_git_commit": extractor_git_commit,
+            "extractor_git_dirty": extractor_git_dirty,
+            "vfm": args.vfm,
+            "model_id": args.model_id,
+            "mode": args.mode,
+            "timestep": args.t,
+            "prompt": args.prompt,
+            "resize": list(args.resize),
+            "num_frames": args.num_frames,
+            "file": out_path.name,
+            "size_bytes": out_path.stat().st_size,
+            "sha256": digest,
+            "tensors": {
+                key: {"shape": list(value.shape), "dtype": str(value.dtype)}
+                for key, value in tensors.items()
+            },
+        }
+        sidecar = Path(f"{out_path}.manifest.json")
+        sidecar_tmp = sidecar.with_name(f".{sidecar.name}.tmp-{os.getpid()}")
+        sidecar_tmp.write_text(json.dumps(manifest, indent=2) + "\n")
+        os.replace(sidecar_tmp, sidecar)
+
+    def atomic_save_npy(path, array):
+        path = Path(path)
+        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        with open(tmp, "wb") as handle:
+            np.save(handle, array)
+        digest = None
+        if not args.no_cache_checksum:
+            digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
+        os.replace(tmp, path)
+        meta = {
+            "schema_version": 1,
+            "file": path.name,
+            "size_bytes": path.stat().st_size,
+            "sha256": digest,
+            "shape": list(array.shape),
+            "dtype": str(array.dtype),
+        }
+        sidecar = Path(f"{path}.manifest.json")
+        sidecar_tmp = sidecar.with_name(f".{sidecar.name}.tmp-{os.getpid()}")
+        sidecar_tmp.write_text(json.dumps(meta, indent=2) + "\n")
+        os.replace(sidecar_tmp, sidecar)
 
     if args.vfm == "wan":
         from features.wan.wan_feature import get_wan_featurizer
@@ -307,10 +498,6 @@ def main():
         from features.vjepa2.vjepa2_feature import get_vjepa2_featurizer
         log.info(f"Loading V-JEPA 2 model: {args.model_id}")
         model = get_vjepa2_featurizer(model_id=args.model_id)
-        # Override output_layers default to last encoder layer if user kept the default [20]
-        if args.output_layers == [20]:
-            args.output_layers = [model.num_hidden_layers - 1]
-            log.info(f"V-JEPA 2: auto-set output_layers to {args.output_layers}")
 
     log.info("Model loaded.")
 
@@ -326,19 +513,148 @@ def main():
         out_dir = os.path.join(args.out_root, vfm_dir_name, s["source"], name)
 
         # Check resume
-        if args.vfm == "vjepa":
-            if os.path.exists(os.path.join(out_dir, out_fname(0))):
+        if args.mode == "streaming_prefix":
+            records = streaming_prefix_records(
+                len(s["img_files"]),
+                min_len=args.prefix_min_len,
+                max_len=args.prefix_max_len,
+                stride=args.prefix_stride,
+                model_max_len=args.num_frames,
+            )
+            scene_complete = True
+            for record in records:
+                prefix_out_dir = os.path.join(out_dir, prefix_dir_name(record))
+                if args.vfm == "vjepa":
+                    prefix_complete = cache_complete(os.path.join(prefix_out_dir, out_fname(0)))
+                else:
+                    prefix_complete = all(
+                        cache_complete(os.path.join(prefix_out_dir, out_fname(l)))
+                        for l in args.output_layers
+                    )
+                if not prefix_complete:
+                    scene_complete = False
+                    break
+            if scene_complete:
+                continue
+        elif args.vfm == "vjepa":
+            if cache_complete(os.path.join(out_dir, out_fname(0))):
                 continue
         else:
             missing_layers = [
                 l for l in args.output_layers
-                if not os.path.exists(os.path.join(out_dir, out_fname(l)))
+                if not cache_complete(os.path.join(out_dir, out_fname(l)))
             ]
             if not missing_layers:
                 continue
 
         t0 = time.time()
         try:
+            if args.mode == "streaming_prefix":
+                os.makedirs(out_dir, exist_ok=True)
+                records = streaming_prefix_records(
+                    len(s["img_files"]),
+                    min_len=args.prefix_min_len,
+                    max_len=args.prefix_max_len,
+                    stride=args.prefix_stride,
+                    model_max_len=args.num_frames,
+                )
+                if not records:
+                    log.warning(f"{s['source']}/{name}: no streaming prefixes to process")
+                    continue
+
+                prefix_meta = []
+                processed_prefixes = 0
+                skipped_prefixes = 0
+                for record in records:
+                    prefix_out_dir = os.path.join(out_dir, prefix_dir_name(record))
+                    if args.vfm == "vjepa":
+                        missing_layers = [0] if not cache_complete(
+                            os.path.join(prefix_out_dir, out_fname(0))
+                        ) else []
+                    else:
+                        missing_layers = [
+                            l for l in args.output_layers
+                            if not cache_complete(os.path.join(prefix_out_dir, out_fname(l)))
+                        ]
+                    if not missing_layers:
+                        skipped_prefixes += 1
+                        meta_record = dict(record)
+                        meta_record["input_length"] = args.num_frames
+                        meta_record["pad_mode"] = "repeat_tail"
+                        prefix_meta.append(meta_record)
+                        continue
+
+                    frames_input = load_and_resize_frames(
+                        s["img_dir"],
+                        s["img_files"],
+                        record["indices"],
+                        size=args.resize,
+                    )
+                    valid_length = len(frames_input)
+                    while len(frames_input) < args.num_frames:
+                        frames_input.append(frames_input[-1])
+                    if len(frames_input) > args.num_frames:
+                        raise ValueError(
+                            f"Streaming prefix length {len(frames_input)} exceeds "
+                            f"model input length {args.num_frames}; lower --prefix-max-len"
+                        )
+                    os.makedirs(prefix_out_dir, exist_ok=True)
+
+                    if args.vfm == "wan":
+                        with torch.no_grad():
+                            feats = model.forward(
+                                video=frames_input, prompt=args.prompt, t=args.t,
+                                output_layer_indices=missing_layers,
+                                ensemble_size=args.ensemble,
+                            )
+                        for layer_id, raw_feat in feats.items():
+                            reshaped = reshape_to_t_h_w_c(raw_feat)
+                            out_path = os.path.join(prefix_out_dir, out_fname(layer_id))
+                            save_file({"feat": reshaped.half()}, out_path)
+
+                    elif args.vfm == "cogvideox":
+                        feats = forward_cogvideox(model, frames_input, t=args.t, layer_ids=missing_layers)
+                        for layer_id, feat in feats.items():
+                            out_path = os.path.join(prefix_out_dir, out_fname(layer_id))
+                            save_file({"feat": feat.half()}, out_path)
+
+                    elif args.vfm == "vjepa":
+                        feats = model(frames_input)
+                        out_path = os.path.join(prefix_out_dir, out_fname(0))
+                        save_file({"feat": feats.half().contiguous()}, out_path)
+
+                    elif args.vfm == "vjepa2":
+                        feats = model(frames_input, output_layers=missing_layers)
+                        for layer_id, feat in feats.items():
+                            out_path = os.path.join(prefix_out_dir, out_fname(layer_id))
+                            save_file({"feat": feat.half().contiguous()}, out_path)
+
+                    meta_record = dict(record)
+                    meta_record["input_length"] = len(frames_input)
+                    meta_record["valid_length"] = valid_length
+                    meta_record["pad_mode"] = "repeat_tail"
+                    prefix_meta.append(meta_record)
+                    processed_prefixes += 1
+
+                atomic_save_npy(
+                    os.path.join(out_dir, "prefix_index.npy"),
+                    np.array(prefix_meta, dtype=object),
+                )
+
+                elapsed = time.time() - t0
+                total_time += elapsed
+                processed += 1
+                remaining = len(scenes) - done - processed - failed
+                avg = total_time / processed
+                eta = str(timedelta(seconds=int(avg * remaining)))
+                log.info(
+                    f"[{done + processed + failed}/{len(scenes)}] "
+                    f"{s['source']}/{name}: {elapsed:.1f}s "
+                    f"({len(s['img_files'])} frames, prefixes +{processed_prefixes}/skip {skipped_prefixes}) "
+                    f"ETA: {eta}"
+                )
+                continue
+
             # Select and load frames
             indices = select_frames(s["img_files"], n=args.num_frames)
 
@@ -380,10 +696,13 @@ def main():
                 frames_input = [frames[fi] for fi in flat_order]
             elif args.mode == "target_isolated":
                 # M target frame indices spread across the original sequence
-                M = max(2, min(args.num_targets, len(s["img_files"])))
-                target_local_idx = np.linspace(
-                    0, len(s["img_files"]) - 1, M
-                ).round().astype(int).tolist()
+                if args.num_targets == 0:
+                    target_local_idx = list(range(len(s["img_files"])))
+                else:
+                    M = max(2, min(args.num_targets, len(s["img_files"])))
+                    target_local_idx = np.linspace(
+                        0, len(s["img_files"]) - 1, M
+                    ).round().astype(int).tolist()
                 target_global = target_local_idx  # already global within the scene
                 frames_input = None  # filled per-target inside the per-VFM block
             else:
@@ -433,7 +752,7 @@ def main():
                     out_path = os.path.join(out_dir, out_fname(layer_id))
                     save_file({"feat": stacked}, out_path)
                 # Save target index metadata (one per scene, layer-agnostic)
-                np.save(
+                atomic_save_npy(
                     os.path.join(out_dir, "target_indices.npy"),
                     np.array(target_global, dtype=np.int64),
                 )
