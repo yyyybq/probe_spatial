@@ -8,6 +8,8 @@
 - Report aggregate and Infinigen/ScanNet++ metrics with scene-bootstrap 95% CIs.
 - B1 is conditioned on past object masks. B2 is conditioned on an object query.
   Neither receives camera pose or an explicit last/current-frame role flag.
+- B1 ignores frames in which the conditioned object is not visible; it does not
+  replace missing object tokens with global scene features.
 - B1/B2 GT is expressed in the final observation's camera coordinate system.
 - C1/C2/C3 target features must match their action frame exactly.
 - ScanNet++ caches must be extracted after the valid-frame indexing fix; older

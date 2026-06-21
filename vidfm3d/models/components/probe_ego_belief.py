@@ -72,14 +72,7 @@ class EgoBeliefProbe(nn.Module):
         counts = m.sum(dim=(2, 3))                               # (B, S)
         denom = counts.clamp(min=1e-3).unsqueeze(-1)             # (B, S, 1)
         masked = vfm_feat * m.unsqueeze(-1)
-        object_pooled = masked.sum(dim=(2, 3)) / denom           # (B, S, C)
-        global_pooled = vfm_feat.mean(dim=(2, 3))                # (B, S, C)
-        # Visible frames carry the specified-object token. Once the object is
-        # absent, retain the frame observation itself; in particular, the last
-        # frame defines the prediction reference without an explicit pose/role.
-        return torch.where(
-            (counts > 0).unsqueeze(-1), object_pooled, global_pooled
-        )
+        return masked.sum(dim=(2, 3)) / denom                    # (B, S, C)
 
     def forward(
         self,
@@ -97,6 +90,13 @@ class EgoBeliefProbe(nn.Module):
         tokens = torch.cat([query, z], dim=1)                  # (B, S+1, D)
         tokens = tokens + self.pos_embed[:, : S + 1]
 
-        out = self.encoder(tokens)                                 # (B, S+1, D)
+        # Invisible-object frames contribute no substitute scene token. The
+        # final frame defines the GT coordinate convention, not an input.
+        visible = obj_mask_feat.flatten(2).any(dim=-1)             # (B, S)
+        valid = torch.cat(
+            [torch.ones(B, 1, dtype=torch.bool, device=visible.device), visible],
+            dim=1,
+        )
+        out = self.encoder(tokens, src_key_padding_mask=~valid)    # (B, S+1, D)
         polar = self.head(out[:, 0])                               # (B, 3)
         return polar

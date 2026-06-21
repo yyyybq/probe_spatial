@@ -23,13 +23,13 @@ def test_b1_is_object_conditioned_without_pose():
     assert not any("pose" in name for name, _ in probe.named_parameters())
 
 
-def test_b1_retains_last_reference_frame_when_object_is_hidden():
+def test_b1_ignores_frames_where_conditioned_object_is_hidden():
     probe = EgoBeliefProbe(in_channels=8, hidden_dim=16, num_layers=1, num_heads=4)
     feat = torch.randn(1, 4, 3, 5, 8)
     object_mask = torch.zeros(1, 4, 3, 5, dtype=torch.bool)
     object_mask[:, :3, 1, 2] = True
     pooled = probe._mask_pool(feat, object_mask)
-    assert torch.allclose(pooled[:, -1], feat[:, -1].mean(dim=(1, 2)))
+    assert torch.equal(pooled[:, -1], torch.zeros_like(pooled[:, -1]))
 
 
 def test_b2_has_object_query_without_current_role_embedding():

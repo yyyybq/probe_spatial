@@ -295,10 +295,10 @@ Common conventions:
   masked-pooled appearance query. This condition is part of the main task.
 - **No pose condition**: neither B1 nor B2 receives camera intrinsics,
   extrinsics, relative pose, or an explicit current-frame role token.
-- **Head**: B1 masked-pools the specified object while it is visible and uses
-  global frame tokens after it disappears (including the final reference
-  observation), then prepends a learned task query. B2 attends from the object
-  query to all ordered patch tokens.
+- **Head**: B1 masked-pools only the specified object's visible-frame features;
+  invisible frames are ignored. The final frame is only the GT coordinate
+  convention. B2 instead attends from the object query to all ordered patch
+  tokens and therefore measures a broader sequence-level retrieval capability.
   The last-frame reference is implicit in sequence order and the GT definition.
 - **Loss**: weighted Smooth-L1 with weights `(1, 1, 0.5)` on (azimuth,
   elevation, log-dist).
