@@ -171,6 +171,27 @@ def prefix_dir_name(record):
     return f"prefix_{int(record['tail']):06d}"
 
 
+def context_segment_records(num_frames, context_len=76, stride=1, min_tail=1):
+    """Build causal sliding context records [I_start, ..., I_tail]."""
+    context_len = max(int(context_len), 1)
+    stride = max(int(stride), 1)
+    min_tail = max(int(min_tail), 0)
+    records = []
+    for tail in range(min_tail, num_frames, stride):
+        start = max(0, tail - context_len + 1)
+        records.append({
+            "start": start,
+            "tail": tail,
+            "indices": list(range(start, tail + 1)),
+            "valid_length": tail - start + 1,
+        })
+    return records
+
+
+def context_dir_name(record):
+    return f"context_{int(record['start']):06d}_{int(record['tail']):06d}"
+
+
 def scene_name(scene_info):
     """Get a unique name for the scene (used as output dir name)."""
     scene_dir = scene_info["scene_dir"]
@@ -237,7 +258,7 @@ def main():
     # ---------------- Spatial Diagnostic Suite extraction modes ----------------
     parser.add_argument(
         "--mode", default="normal",
-        choices=["normal", "shuffled", "target_isolated", "streaming_prefix"],
+        choices=["normal", "shuffled", "target_isolated", "streaming_prefix", "context_segment"],
         help=(
             "normal: standard clip forward (default).\n"
             "shuffled: shuffle frame order before VFM forward (for A3 abnormal probe). "
@@ -246,7 +267,9 @@ def main():
             "target_isolated: extract clip-isolated features for M target frames "
             "(replicate each target frame to fill the clip; for C1 action-dynamics probe).\n"
             "streaming_prefix: independently forward prefixes [I_0, ..., I_t] and save "
-            "them under prefix_<tail>; short prefixes are padded by repeating I_t."
+            "them under prefix_<tail>; short prefixes are padded by repeating I_t.\n"
+            "context_segment: independently forward sliding causal input segments "
+            "[I_start, ..., I_tail] and save them under context_<start>_<tail>."
         ),
     )
     parser.add_argument("--shuffle-seed", type=int, default=42,
@@ -263,6 +286,10 @@ def main():
                         help="Minimum streaming-prefix length.")
     parser.add_argument("--prefix-max-len", type=int, default=81,
                         help="Maximum streaming-prefix length before model padding.")
+    parser.add_argument("--context-len", type=int, default=76,
+                        help="Maximum causal input segment length for context_segment mode.")
+    parser.add_argument("--context-stride", type=int, default=1,
+                        help="Tail-frame stride for context_segment mode.")
     args = parser.parse_args()
 
     # Per-VFM defaults
@@ -329,7 +356,7 @@ def main():
         def out_fname(layer):
             return f"feature_layer{layer}.sft"
 
-    # The mode (normal / shuffled / target_isolated) is differentiated by
+    # The mode is differentiated by
     # `--out-root` (e.g. FEAT vs FEAT_SHUFFLED vs FEAT_TARGET) — the per-VFM
     # subdirectory keeps a clean, mode-agnostic name so InsScene15KDataset can
     # locate it via `vfm_name` regardless of mode.
@@ -358,17 +385,29 @@ def main():
     for s in scenes:
         name = scene_name(s)
         out_dir = os.path.join(args.out_root, vfm_dir_name, s["source"], name)
-        if args.mode == "streaming_prefix":
-            records = streaming_prefix_records(
-                len(s["img_files"]),
-                min_len=args.prefix_min_len,
-                max_len=args.prefix_max_len,
-                stride=args.prefix_stride,
-                model_max_len=args.num_frames,
+        if args.mode in ("streaming_prefix", "context_segment"):
+            records = (
+                streaming_prefix_records(
+                    len(s["img_files"]),
+                    min_len=args.prefix_min_len,
+                    max_len=args.prefix_max_len,
+                    stride=args.prefix_stride,
+                    model_max_len=args.num_frames,
+                )
+                if args.mode == "streaming_prefix"
+                else context_segment_records(
+                    len(s["img_files"]),
+                    context_len=min(args.context_len, args.num_frames),
+                    stride=args.context_stride,
+                    min_tail=0,
+                )
             )
             all_exist = True
             for record in records:
-                prefix_out_dir = os.path.join(out_dir, prefix_dir_name(record))
+                prefix_out_dir = os.path.join(
+                    out_dir,
+                    prefix_dir_name(record) if args.mode == "streaming_prefix" else context_dir_name(record),
+                )
                 if args.vfm == "vjepa":
                     prefix_exists = cache_complete(os.path.join(prefix_out_dir, out_fname(0)))
                 else:
@@ -513,17 +552,29 @@ def main():
         out_dir = os.path.join(args.out_root, vfm_dir_name, s["source"], name)
 
         # Check resume
-        if args.mode == "streaming_prefix":
-            records = streaming_prefix_records(
-                len(s["img_files"]),
-                min_len=args.prefix_min_len,
-                max_len=args.prefix_max_len,
-                stride=args.prefix_stride,
-                model_max_len=args.num_frames,
+        if args.mode in ("streaming_prefix", "context_segment"):
+            records = (
+                streaming_prefix_records(
+                    len(s["img_files"]),
+                    min_len=args.prefix_min_len,
+                    max_len=args.prefix_max_len,
+                    stride=args.prefix_stride,
+                    model_max_len=args.num_frames,
+                )
+                if args.mode == "streaming_prefix"
+                else context_segment_records(
+                    len(s["img_files"]),
+                    context_len=min(args.context_len, args.num_frames),
+                    stride=args.context_stride,
+                    min_tail=0,
+                )
             )
             scene_complete = True
             for record in records:
-                prefix_out_dir = os.path.join(out_dir, prefix_dir_name(record))
+                prefix_out_dir = os.path.join(
+                    out_dir,
+                    prefix_dir_name(record) if args.mode == "streaming_prefix" else context_dir_name(record),
+                )
                 if args.vfm == "vjepa":
                     prefix_complete = cache_complete(os.path.join(prefix_out_dir, out_fname(0)))
                 else:
@@ -549,24 +600,36 @@ def main():
 
         t0 = time.time()
         try:
-            if args.mode == "streaming_prefix":
+            if args.mode in ("streaming_prefix", "context_segment"):
                 os.makedirs(out_dir, exist_ok=True)
-                records = streaming_prefix_records(
-                    len(s["img_files"]),
-                    min_len=args.prefix_min_len,
-                    max_len=args.prefix_max_len,
-                    stride=args.prefix_stride,
-                    model_max_len=args.num_frames,
+                records = (
+                    streaming_prefix_records(
+                        len(s["img_files"]),
+                        min_len=args.prefix_min_len,
+                        max_len=args.prefix_max_len,
+                        stride=args.prefix_stride,
+                        model_max_len=args.num_frames,
+                    )
+                    if args.mode == "streaming_prefix"
+                    else context_segment_records(
+                        len(s["img_files"]),
+                        context_len=min(args.context_len, args.num_frames),
+                        stride=args.context_stride,
+                        min_tail=0,
+                    )
                 )
                 if not records:
-                    log.warning(f"{s['source']}/{name}: no streaming prefixes to process")
+                    log.warning(f"{s['source']}/{name}: no {args.mode} records to process")
                     continue
 
                 prefix_meta = []
                 processed_prefixes = 0
                 skipped_prefixes = 0
                 for record in records:
-                    prefix_out_dir = os.path.join(out_dir, prefix_dir_name(record))
+                    prefix_out_dir = os.path.join(
+                        out_dir,
+                        prefix_dir_name(record) if args.mode == "streaming_prefix" else context_dir_name(record),
+                    )
                     if args.vfm == "vjepa":
                         missing_layers = [0] if not cache_complete(
                             os.path.join(prefix_out_dir, out_fname(0))
@@ -595,8 +658,8 @@ def main():
                         frames_input.append(frames_input[-1])
                     if len(frames_input) > args.num_frames:
                         raise ValueError(
-                            f"Streaming prefix length {len(frames_input)} exceeds "
-                            f"model input length {args.num_frames}; lower --prefix-max-len"
+                            f"{args.mode} length {len(frames_input)} exceeds "
+                            f"model input length {args.num_frames}; lower the segment length"
                         )
                     os.makedirs(prefix_out_dir, exist_ok=True)
 
@@ -637,7 +700,10 @@ def main():
                     processed_prefixes += 1
 
                 atomic_save_npy(
-                    os.path.join(out_dir, "prefix_index.npy"),
+                    os.path.join(
+                        out_dir,
+                        "prefix_index.npy" if args.mode == "streaming_prefix" else "context_index.npy",
+                    ),
                     np.array(prefix_meta, dtype=object),
                 )
 
@@ -650,7 +716,7 @@ def main():
                 log.info(
                     f"[{done + processed + failed}/{len(scenes)}] "
                     f"{s['source']}/{name}: {elapsed:.1f}s "
-                    f"({len(s['img_files'])} frames, prefixes +{processed_prefixes}/skip {skipped_prefixes}) "
+                    f"({len(s['img_files'])} frames, {args.mode} +{processed_prefixes}/skip {skipped_prefixes}) "
                     f"ETA: {eta}"
                 )
                 continue

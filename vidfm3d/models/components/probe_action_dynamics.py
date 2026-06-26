@@ -1,11 +1,11 @@
 """C1 - Action-Conditioned Prediction probe head.
 
-Given input features for the first (S-1) frames and a 9-D action token (6D rot
-+ 3 trans = relative camera pose from input-last-frame to target frame),
-predict the spatially-pooled VFM feature of the target frame.
+Given features from a causal input video segment and a 9-D action token (6D rot
++ 3 trans = relative camera pose from the segment tail to target frame), predict
+the spatially-pooled isolated VFM feature of the target frame.
 
 Input :
-    input_feat  (B, S-1, H_f, W_f, C)
+    input_feat  (B, T_ctx, H_f, W_f, C)
     action      (B, 9)
 Output:
     pred_feat   (B, C)

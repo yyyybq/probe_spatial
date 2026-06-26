@@ -215,9 +215,10 @@ python -m features.run_inscene15k --vfm wan --mode <MODE> ...
 
 | `--mode` | Output dir suffix | Used by | Frame schedule |
 |---|---|---|---|
-| `normal` (default) | `wan/`        | A1, A2, B1, C1 inputs | the actual 81 frames in order |
+| `normal` (default) | `wan/`        | A1, A2, B1 and other non-causal probes | the actual 81 frames in order |
 | `shuffled`         | `wan_shuffled/` | A3 | frames are permuted (per-scene RNG, seed=42) before being passed to the VFM. We then **un-permute** the output, so `shuf[i]` = the feature of frame `i` *as seen under scrambled context*. This is the entire trick that makes A3 nontrivial — VFM features are clip-contextualized, so the only way to expose temporal-coherence info is to recompute them. |
-| `target_isolated`  | `wan_target/` | C1 | M = 8 evenly-spaced **target** frames. For each one we replicate it 81 times and run the VFM; we keep the center-frame feature only. Output: `(M, H_f, W_f, C)`. We also save `target_indices.npy = (M,)`. The point: an "uncontaminated" feature of one frame, with no future leakage. |
+| `context_segment`  | `wan_context/` | C1/C2/C3 inputs | Each cached input segment is forwarded as `[I_start, ..., I_tail]` without future target frames and saved under `context_<start>_<tail>`. Short segments are padded by repeating the tail frame. |
+| `target_isolated`  | `wan_target/` | C1/C2/C3 targets | Each cached target frame is replicated to fill the VFM clip; we keep the center-frame feature only. Output: `(M, H_f, W_f, C)` plus `target_indices.npy = (M,)`. Cache every frame with `--num-targets 0` unless you intentionally want sparse valid samples. |
 
 > Why we cannot simply re-use the `normal` features:
 > 1. Diffusion-VFM features are **clip-contextualized** (cross-frame attention).
@@ -237,10 +238,14 @@ GPU per process.
   geometry).
 - A3 sets `diag_abnormal=True` + `shuffled_feat_root=...` and the dataset
   also loads `vfm_feat_shuffled`.
-- C1 sets `diag_action=True` + `target_feat_root=...` and the dataset loads
-  an exact cached `target_isolated` frame and aligns the sampled target,
-  camera extrinsic, and action before loading `target_feat`. It also slices `vfm_feat[:-1]` →
-  `input_feat`.
+- C1 sets `diag_action=True`, `context_feat_root=...` and
+  `target_feat_root=...`. The dataset loads `input_feat` from the causal
+  `context_segment` ending at the last input frame, and `target_feat` from the
+  exact `target_isolated` row. The ordinary `vfm_feat` normal cache is not
+  passed to the C1 probe.
+- C2/C3 also use `context_segment` for `input_feat_seq` and `target_isolated`
+  for `target_feat_seq`; horizons with missing context or isolated targets are
+  masked invalid.
 
 ---
 
@@ -253,6 +258,10 @@ projection MLPs and a 2-layer Transformer encoder); the point is to quantify
 Common conventions:
 - Input: `vfm_feat` of shape `(B, S, H_f, W_f, C)` (S = 4 views, fp32).
 - All heads start with `LayerNorm + Linear(C → hidden)` to stabilize the input.
+
+B1/B2 additionally support `decoder_type={linear,mlp,transformer}`. Linear is
+an affine readout; MLP has one hidden GELU layer; Transformer is the existing
+default. See `EXPERIMENT_PROTOCOL.md` for the exact summaries exposed to each.
 
 ### 5.1 A2 — `ViewConsistencyProbe` (predict pairwise overlap)
 
@@ -291,14 +300,16 @@ Common conventions:
   = `num_visible_frames * 1e6 + total_visible_pixels` — so we always pick the
   most informative target. If no candidate, sample is marked `valid=False`
   and skipped during training.
-- **Object condition**: B1 receives the object's past masks; B2 receives a
-  masked-pooled appearance query. This condition is part of the main task.
+- **Object condition**: B1 receives the object's past masks plus a final-view
+  global feature; B2 receives a masked-pooled appearance query. This condition
+  is part of the main task.
 - **No pose condition**: neither B1 nor B2 receives camera intrinsics,
   extrinsics, relative pose, or an explicit current-frame role token.
 - **Head**: B1 masked-pools only the specified object's visible-frame features;
-  invisible frames are ignored. The final frame is only the GT coordinate
-  convention. B2 instead attends from the object query to all ordered patch
-  tokens and therefore measures a broader sequence-level retrieval capability.
+  invisible object frames are ignored. It also receives one global-pooled token
+  from the final sampled frame, giving last-view visual context without camera
+  pose. B2 instead attends from the object query to all ordered patch tokens and
+  therefore measures a broader sequence-level retrieval capability.
   The last-frame reference is implicit in sequence order and the GT definition.
 - **Loss**: weighted Smooth-L1 with weights `(1, 1, 0.5)` on (azimuth,
   elevation, log-dist).
@@ -311,11 +322,12 @@ Common conventions:
 
 ### 5.4 C1 — `ActionDynamicsProbe` (predict pooled future feature)
 
-- **Signal**: given features of the first 3 views and the relative camera
-  pose from view 3 → view 4 (encoded as 9-D action: 6-D rotation Zhou+2019 +
-  3-D translation), predict the spatially-pooled feature of view 4. The
-  target uses the `target_isolated` feature so it carries *no* information
-  about the input frames.
+- **Signal**: given a causal input video segment feature, e.g. `[I_1..I_48]`
+  forwarded together, and the relative camera pose from segment tail to target
+  frame (encoded as 9-D action: 6-D rotation Zhou+2019 + 3-D translation),
+  predict the spatially-pooled isolated feature of a future target frame such as
+  `I_52`, `I_56`, or `I_64`. The input segment forward never contains the
+  target frame.
 - **Head**: pool input feats → linear → prepend `[query, action]` tokens →
   2-layer Transformer encoder → linear back to `C` dims, returned at
   `[query]`.
@@ -334,7 +346,9 @@ Common conventions:
 Each probe-step in `ProbeExtensionLitModule` filters by an explicit boolean
 flag from the dataset:
 - B1: `hidden_obj_valid`
-- C1: `dyn_valid` (False when the target-isolated feature file was missing)
+- C1: `dyn_valid` (False when the context segment or isolated target row is missing)
+- C2: `path_horizon_valid` (False for horizons with missing context or target rows)
+- C3: `counterfactual_valid` (also applies the minimum-overlap filter)
 - A3: `abnormal_feat_valid` (False when the shuffled feature file was missing)
 
 If *all* samples in a batch are invalid we return `params.sum()*0.0` (a
@@ -425,9 +439,12 @@ python -m features.run_inscene15k --vfm wan --mode normal \
 # A3
 python -m features.run_inscene15k --vfm wan --mode shuffled \
     --out-root ${INSCENE_SHUFFLED_FEAT_ROOT}
-# C1 targets
+# C1/C2/C3 input contexts
+python -m features.run_inscene15k --vfm wan --mode context_segment \
+    --out-root ${INSCENE_CONTEXT_FEAT_ROOT} --context-len 76
+# C1/C2/C3 targets
 python -m features.run_inscene15k --vfm wan --mode target_isolated \
-    --out-root ${INSCENE_TARGET_FEAT_ROOT} --num-targets 8
+    --out-root ${INSCENE_TARGET_FEAT_ROOT} --num-targets 0
 ```
 Switch `--vfm cogvideox` / `--vfm vjepa2` for the other VFMs.
 
@@ -451,9 +468,10 @@ python -m features.run_inscene15k --vfm vjepa2 --mode normal \
   --output-layers 3 7 11 15 19 23
 ```
 
-For A3, C1, C2, and C3, extract the same layer list for `--mode shuffled` and
-`--mode target_isolated` too, because those probes intentionally compare
-different feature caches.
+For A3, extract the same layer list for `--mode shuffled`. For C1/C2/C3,
+extract the same layer list for both `--mode context_segment` and
+`--mode target_isolated`, because inputs and targets intentionally come from
+separate VFM forwards.
 
 Training a probe on layer `L` is a Hydra override:
 
@@ -549,7 +567,7 @@ bash scripts/run_diag_eval_sweep.sh         # writes comparison_val.csv
 | Probe input resolution | 288 × 512 | Cheap to load, integer ratio to features |
 | Views per sample (S) | 4 | Enough for pair tasks, cheap |
 | Action encoding | 6-D rot (Zhou+2019, first 2 rows of R_rel) + 3-D trans = 9 | Continuous, no singularity |
-| B1 reference frame | camera coordinates of the last sampled view | target convention; not an input condition |
+| B1 reference frame | camera coordinates of the last sampled view | target convention; final-view global feature is input, final camera pose is not |
 | B1 obj selection | single highest-score hidden object per sample | concentrates supervision on a hard, well-posed signal |
 | A2 thresholds | pos ≥ 0.4, neg ≤ 0.05 | empirically separates clean pos/neg |
 | C1 retrieval | global evaluation set | stable candidate pool; training in-batch score is diagnostic only |
@@ -587,9 +605,11 @@ is what we actually report.
    (`invert_pose_ref_and_scale`) and points are scaled. B1 polar coordinates
    live in this normalized last-frame coords. Always visualize before
    trusting absolute distances.
-4. **C1 target leakage.** Do **not** train C1 against `vfm_feat[-1]` from the
-   normal cache — it has seen frames 0…2. Always use `target_feat` from the
-   `target_isolated` cache.
+4. **C1/C2/C3 contextual leakage.** Do **not** train these probes against
+   features sliced from the normal full-clip cache. A bidirectional video VFM can
+   mix target-frame information into both input and target hidden states. The
+   current protocol uses `context_segment` for inputs and `target_isolated` for
+   targets; do not reuse normal full-clip features for either tensor.
 5. **A3 trivial leakage.** If the shuffled cache is missing for a sample, the
    dataset emits zeros for `vfm_feat_shuffled` and sets
    `abnormal_feat_valid=False`; the LitModule filters them out. Do not

@@ -35,6 +35,10 @@ esac
 FEAT_ROOT=${FEAT_ROOT:-${DEFAULT_FEAT_ROOT}}
 SHUFFLED_FEAT_ROOT=${SHUFFLED_FEAT_ROOT:-${INSCENE_SHUFFLED_FEAT_ROOT:?set INSCENE_SHUFFLED_FEAT_ROOT}}
 TARGET_FEAT_ROOT=${TARGET_FEAT_ROOT:-${INSCENE_TARGET_FEAT_ROOT:?set INSCENE_TARGET_FEAT_ROOT}}
+CONTEXT_FEAT_ROOT=${CONTEXT_FEAT_ROOT:-${INSCENE_CONTEXT_FEAT_ROOT:-}}
+TARGET_NUM_TARGETS=${TARGET_NUM_TARGETS:-0}
+CONTEXT_LEN=${CONTEXT_LEN:-76}
+CONTEXT_STRIDE=${CONTEXT_STRIDE:-1}
 LOGS_ROOT=${LOGS_ROOT:-logs/inscene15k_ext/runs}
 
 EXTRACT=${EXTRACT:-1}
@@ -127,6 +131,9 @@ needs_mode() {
         target_isolated)
             [[ "${PROBE}" == "action_dynamics" || "${PROBE}" == "path_integration" || "${PROBE}" == "counterfactual" ]]
             ;;
+        context_segment)
+            [[ "${PROBE}" == "action_dynamics" || "${PROBE}" == "path_integration" || "${PROBE}" == "counterfactual" ]]
+            ;;
         *)
             return 1
             ;;
@@ -150,7 +157,7 @@ split_extra "${EXTRA_TRAIN}" extra_train_args
 split_extra "${EXTRA_EVAL}" extra_eval_args
 
 if [[ "${EXTRACT}" == "1" ]]; then
-    for mode in normal shuffled target_isolated; do
+    for mode in normal shuffled target_isolated context_segment; do
         if ! needs_mode "${mode}"; then
             continue
         fi
@@ -162,6 +169,13 @@ if [[ "${EXTRACT}" == "1" ]]; then
             normal) out_root="${FEAT_ROOT}" ;;
             shuffled) out_root="${SHUFFLED_FEAT_ROOT}" ;;
             target_isolated) out_root="${TARGET_FEAT_ROOT}" ;;
+            context_segment)
+                if [[ -z "${CONTEXT_FEAT_ROOT}" ]]; then
+                    echo "[err] set CONTEXT_FEAT_ROOT or INSCENE_CONTEXT_FEAT_ROOT for context_segment extraction" >&2
+                    exit 1
+                fi
+                out_root="${CONTEXT_FEAT_ROOT}"
+                ;;
         esac
         echo "==== extract ${VFM} mode=${mode} layers=${layers_joined} ===="
         if [[ "${MLLM}" == "1" ]]; then
@@ -191,6 +205,16 @@ if [[ "${EXTRACT}" == "1" ]]; then
                 --t "${T}"
                 --output-layers "${layers_resolved[@]}"
             )
+            if [[ "${mode}" == "target_isolated" ]]; then
+                # C1/C2/C3 targets are exact isolated frame features. Cache every
+                # frame by default; sparse target caches make many sampled horizons
+                # scientifically unusable.
+                cmd+=(--num-targets "${TARGET_NUM_TARGETS}")
+            elif [[ "${mode}" == "context_segment" ]]; then
+                # C1/C2/C3 inputs are causal video-segment forwards, e.g.
+                # [I_1..I_48], which must not contain future target frames.
+                cmd+=(--context-len "${CONTEXT_LEN}" --context-stride "${CONTEXT_STRIDE}")
+            fi
         fi
         cmd+=("${extra_extract_args[@]}")
         run_cmd "${cmd[@]}"

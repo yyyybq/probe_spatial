@@ -1,9 +1,10 @@
 """C2 - Path Integration probe head.
 
-Given an initial VFM feature and a sequence of relative camera actions, recurrently
-predict the pooled target VFM feature at each waypoint. The evaluation layer maps
-those predicted features back to poses through retrieval, which exposes final
-pose error, drift rate, and loop closure error without training a pose regressor.
+Given a causal context-segment VFM feature and a sequence of relative camera
+actions, recurrently predict the pooled target VFM feature at each waypoint.
+The evaluation layer maps those predicted features back to poses through
+retrieval, which exposes final pose error, drift rate, and loop closure error
+without training a pose regressor.
 """
 
 from __future__ import annotations

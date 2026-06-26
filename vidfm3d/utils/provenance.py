@@ -64,6 +64,7 @@ def write_run_manifest(cfg, output_dir: str) -> Path | None:
             "split_manifest_sha256": split_digest,
             "data_root": os.environ.get("INSCENE_DATA_ROOT"),
             "feature_root": os.environ.get("INSCENE_FEAT_ROOT"),
+            "context_feature_root": os.environ.get("INSCENE_CONTEXT_FEAT_ROOT"),
             "target_feature_root": os.environ.get("INSCENE_TARGET_FEAT_ROOT"),
             "shuffled_feature_root": os.environ.get("INSCENE_SHUFFLED_FEAT_ROOT"),
         },

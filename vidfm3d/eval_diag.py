@@ -667,6 +667,7 @@ def main(cfg: DictConfig) -> None:
     summary["feat_postfix"] = cfg.get("feat_postfix", None)
     summary["feature_timestep"] = cfg.get("feature_timestep", None)
     summary["vfm_name"] = cfg.get("vfm_name", None)
+    summary["context_feat_root"] = cfg.get("context_feat_root", None)
     summary["streaming_feat_root"] = cfg.get("streaming_feat_root", None)
     summary["prefix_min_len"] = cfg.get("prefix_min_len", None)
     summary["prefix_max_len"] = cfg.get("prefix_max_len", None)

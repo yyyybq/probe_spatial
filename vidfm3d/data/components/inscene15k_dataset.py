@@ -99,6 +99,8 @@ class InsScene15KDataset(EasyDataset):
         prefix_max_len: int = None,
         streaming_feat_root: str = None,
         streaming_prefix_dir_fmt: str = "prefix_{tail:06d}",
+        context_feat_root: str = None,
+        context_segment_dir_fmt: str = "context_{start:06d}_{tail:06d}",
         # ---------- Spatial Diagnostic Suite toggles ----------
         diag_overlap: bool = False,        # A2: compute (S,S) overlap matrix
         diag_hidden_obj: bool = False,     # B1: pick hidden object + polar target
@@ -106,7 +108,7 @@ class InsScene15KDataset(EasyDataset):
         diag_abnormal: bool = False,       # A3: load shuffled vfm features
         diag_path_integration: bool = False,  # C2: recurrent multi-action feature prediction
         diag_counterfactual: bool = False,    # C3: multi-horizon action intervention prediction
-        target_feat_root: str = None,      # root for C1 target features
+        target_feat_root: str = None,      # root for C1/C2/C3 isolated target features
         shuffled_feat_root: str = None,    # root for A3 shuffled features
         action_horizons: list = None,      # frame offsets from anchor, e.g. [1, 10, 30]
         counterfactual_min_overlap: float = 0.05,
@@ -137,6 +139,7 @@ class InsScene15KDataset(EasyDataset):
         root_vfm = os.environ.get("INSCENE_FEAT_ROOT", root_vfm)
         target_feat_root = os.environ.get("INSCENE_TARGET_FEAT_ROOT", target_feat_root)
         shuffled_feat_root = os.environ.get("INSCENE_SHUFFLED_FEAT_ROOT", shuffled_feat_root)
+        context_feat_root = os.environ.get("INSCENE_CONTEXT_FEAT_ROOT", context_feat_root)
         if sources is None:
             sources = ["processed_infinigen", "processed_scannetpp_v2"]
 
@@ -150,7 +153,9 @@ class InsScene15KDataset(EasyDataset):
         self.feature_timestep = feature_timestep
         self.feature_prefix = feature_prefix
         self.feat_pixalign = feat_pixalign
-        self.seed = seed
+        # Validation/test samples must not change between epochs. Training keeps
+        # worker-seeded stochastic frame sampling unless a seed is explicit.
+        self.seed = seed if seed is not None else (0 if split in {"val", "test"} else None)
         self.num_views = num_views
         self.min_view_interval = min_view_interval
         self.context_len = context_len
@@ -167,7 +172,10 @@ class InsScene15KDataset(EasyDataset):
         self.prefix_max_len = int(prefix_max_len) if prefix_max_len is not None else None
         self.streaming_feat_root = streaming_feat_root
         self.streaming_prefix_dir_fmt = streaming_prefix_dir_fmt
+        self.context_feat_root = context_feat_root
+        self.context_segment_dir_fmt = context_segment_dir_fmt
         self._streaming_prefix_meta_cache = {}
+        self._context_segment_meta_cache = {}
         self._target_index_cache = {}
         # Diagnostic suite flags
         self.diag_overlap = diag_overlap
@@ -782,6 +790,53 @@ class InsScene15KDataset(EasyDataset):
             int(scene_info["streaming_tail"])
         )
 
+    def _context_segment_dir_name(self, start: int, tail: int) -> str:
+        return self.context_segment_dir_fmt.format(start=int(start), tail=int(tail))
+
+    def _context_segment_scene_dir(self, scene_info) -> str | None:
+        root = self.context_feat_root
+        if root is None:
+            return None
+        return os.path.join(
+            root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+        )
+
+    def _context_segment_records(self, scene_info) -> dict:
+        scene_dir = self._context_segment_scene_dir(scene_info)
+        if scene_dir is None:
+            return {}
+
+        meta_path = os.path.join(scene_dir, "context_index.npy")
+        if meta_path not in self._context_segment_meta_cache:
+            records_by_key = {}
+            if os.path.exists(meta_path):
+                try:
+                    records = np.load(meta_path, allow_pickle=True).tolist()
+                    if isinstance(records, dict):
+                        records = records.values()
+                    for record in records:
+                        if isinstance(record, dict) and "start" in record and "tail" in record:
+                            key = (int(record["start"]), int(record["tail"]))
+                            records_by_key[key] = record
+                except Exception as e:
+                    logger.warning(f"Failed to read context segment metadata {meta_path}: {e}")
+            self._context_segment_meta_cache[meta_path] = records_by_key
+
+        return self._context_segment_meta_cache[meta_path]
+
+    def _context_select_indices(self, context_start: int, context_tail: int) -> torch.Tensor:
+        """Return a fixed-length list of frame ids for batching context features."""
+        valid = list(range(int(context_start), int(context_tail) + 1))
+        target_len = max(int(self.context_len), 1)
+        if len(valid) >= target_len:
+            valid = valid[-target_len:]
+        else:
+            valid = valid + [int(context_tail)] * (target_len - len(valid))
+        return torch.as_tensor(valid, dtype=torch.long)
+
     def _target_indices(self, scene_info):
         """Return the exact frame ids represented by a target cache."""
         if self.target_feat_root is None:
@@ -801,7 +856,7 @@ class InsScene15KDataset(EasyDataset):
         return indices
 
     def _load_target_feat(self, scene_info, target_global_idx, num_frames):
-        """Load a clip-isolated target feature for C1.
+        """Load an isolated feature for one exact frame.
 
         Expected file layout:
             {target_feat_root}/{vfm}/{source}/{scene}/feature{feat_postfix}.sft
@@ -837,7 +892,7 @@ class InsScene15KDataset(EasyDataset):
         return feat[int(matches[0].item())] if matches.numel() else None
 
     def _load_target_feats(self, scene_info, target_global_indices, num_frames):
-        """Load multiple clip-isolated target features with one safetensors read."""
+        """Load multiple isolated frame features with one safetensors read."""
         if self.target_feat_root is None:
             return [None for _ in target_global_indices]
         path = os.path.join(
@@ -1005,6 +1060,92 @@ class InsScene15KDataset(EasyDataset):
 
         return vfm_feat, vfm_idx
 
+    def _load_context_segment_feat(
+        self,
+        scene_info,
+        context_start: int,
+        context_tail: int,
+        select_indices=None,
+    ):
+        """Load features from one causal input segment [start, ..., tail].
+
+        The segment was forwarded as a video clip without any target/future
+        frames. ``select_indices=None`` returns all frames in the segment,
+        approximately aligned to the cached VFM temporal axis.
+        """
+        scene_dir = self._context_segment_scene_dir(scene_info)
+        if scene_dir is None:
+            return None, None
+
+        context_start = int(context_start)
+        context_tail = int(context_tail)
+        segment_dir = os.path.join(
+            scene_dir,
+            self._context_segment_dir_name(context_start, context_tail),
+        )
+        path = os.path.join(segment_dir, self._feat_filename())
+        if not os.path.exists(path):
+            return None, None
+
+        try:
+            vfm_feat = load_file(path)["feat"].float()
+        except Exception as e:
+            logger.warning(f"Failed to read context segment feat {path}: {e}")
+            return None, None
+        if self.vfm_name == "cogvideox":
+            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+        if vfm_feat.ndim != 4:
+            raise ValueError(
+                f"Expected context segment VFM feature feat to be 4D (T,H,W,C), "
+                f"got {tuple(vfm_feat.shape)} from {path}."
+            )
+
+        record = self._context_segment_records(scene_info).get((context_start, context_tail), {})
+        input_length = int(record.get("input_length", 0) or 0)
+        valid_length = int(record.get("valid_length", context_tail - context_start + 1))
+        pad_mode = record.get("pad_mode")
+
+        if select_indices is None:
+            select_indices = torch.arange(context_start, context_tail + 1, dtype=torch.long)
+        else:
+            select_indices = torch.as_tensor(select_indices, dtype=torch.long)
+        if select_indices.numel() == 0:
+            return torch.zeros(0, *vfm_feat.shape[1:], dtype=vfm_feat.dtype), torch.zeros(0, dtype=torch.long)
+        if int(select_indices.min().item()) < context_start or int(select_indices.max().item()) > context_tail:
+            raise ValueError(
+                f"Context select indices [{int(select_indices.min())}, {int(select_indices.max())}] "
+                f"outside segment [{context_start}, {context_tail}]"
+            )
+
+        T = vfm_feat.shape[0]
+        positions = (select_indices - context_start).float()
+        if (
+            pad_mode == "repeat_tail"
+            and input_length > valid_length
+            and (select_indices == context_tail).any()
+        ):
+            positions = positions.clone()
+            positions[select_indices == context_tail] = float(input_length - 1)
+        denom = float(max(input_length - 1, valid_length - 1, 1))
+        if T > 1:
+            vfm_idx = (positions / denom * float(T - 1)).round().long().clamp(0, T - 1)
+        else:
+            vfm_idx = torch.zeros_like(select_indices)
+        if self.feat_pixalign:
+            vfm_feat = vfm_feat[vfm_idx]
+            vfm_idx = torch.arange(vfm_feat.shape[0], device=vfm_feat.device)
+
+        if self.scramble_feat:
+            g = torch.Generator()
+            seed_key = f"{scene_info['scene_dir']}:context:{context_start}:{context_tail}:n"
+            _seed_n = int(hashlib.md5(seed_key.encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+            g.manual_seed(_seed_n)
+            vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
+        if self.pose_only:
+            vfm_feat = torch.zeros_like(vfm_feat)
+
+        return vfm_feat, vfm_idx
+
     def _getitem_feature_action_diag(self, scene_info, num_frames, sel_global):
         """Fast path for C2/C3 probes that do not consume RGB, masks, or identity IDs."""
         from vidfm3d.utils.spatial_diag import (
@@ -1036,6 +1177,21 @@ class InsScene15KDataset(EasyDataset):
         )
         K = max(vf.shape[0] - 1, 0)
 
+        context_tail = int(sel_global[0].item())
+        context_start = max(
+            int(scene_info.get("window_start", 0)),
+            context_tail - int(self.context_len) + 1,
+        )
+        input_feat, _ = self._load_context_segment_feat(
+            scene_info,
+            context_start,
+            context_tail,
+            select_indices=self._context_select_indices(context_start, context_tail),
+        )
+        input_valid = input_feat is not None
+        if not input_valid:
+            input_feat = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
+
         loaded_target_feats = self._load_target_feats(
             scene_info,
             [int(target_idx.item()) for target_idx in sel_global[1:]],
@@ -1053,7 +1209,10 @@ class InsScene15KDataset(EasyDataset):
 
         if K > 0:
             target_feat_seq = torch.stack(target_feats)
-            horizon_valid = torch.as_tensor(target_valid, dtype=torch.bool)
+            horizon_valid = (
+                torch.as_tensor(target_valid, dtype=torch.bool)
+                & bool(input_valid)
+            )
             path_actions = torch.stack([
                 encode_relative_pose(extrinsics[i], extrinsics[i + 1]).cpu()
                 for i in range(K)
@@ -1087,7 +1246,7 @@ class InsScene15KDataset(EasyDataset):
         return {
             "vfm_feat": vf,
             "vfm_idx": vfm_idx,
-            "input_feat_seq": vf[:1].clone(),
+            "input_feat_seq": input_feat.clone(),
             "target_feat_seq": target_feat_seq,
             "path_actions": path_actions,
             "counterfactual_actions": counterfactual_actions,
@@ -1139,7 +1298,7 @@ class InsScene15KDataset(EasyDataset):
         return shuf
 
     def __getitem__(self, idx):
-        if self.seed:
+        if self.seed is not None:
             self._rng = np.random.default_rng(seed=self.seed + idx)
         elif not hasattr(self, "_rng"):
             seed = torch.initial_seed()
@@ -1188,20 +1347,21 @@ class InsScene15KDataset(EasyDataset):
             # Convert to global frame indices for loading
             sel_global = sel + window_start
 
-            # C1 target caches may contain a sparse set of isolated frames.
-            # Align the sampled target before loading RGB/geometry so feature,
-            # extrinsic and action all refer to the same exact frame.
+            # C1 target-isolated caches may contain a sparse set of frames.
+            # Align only the target before loading geometry. Input features are
+            # loaded from a causal context_segment cache ending at sel_global[-2].
             if self.diag_action:
                 cached_targets = self._target_indices(scene_info)
                 if cached_targets is not None and cached_targets.numel() > 0:
                     candidates = cached_targets[
                         (cached_targets >= window_start)
                         & (cached_targets < window_end)
-                        & (cached_targets > sel_global[-2])
-                    ]
-                    if candidates.numel() > 0:
-                        nearest = (candidates - sel_global[-1]).abs().argmin()
-                        sel_global[-1] = candidates[nearest]
+                    ].sort().values
+                    target_candidates = candidates[candidates > sel_global[-2]]
+                    if target_candidates.numel() > 0:
+                        nearest = (target_candidates - sel_global[-1]).abs().argmin()
+                        target = target_candidates[nearest]
+                        sel_global[-1] = target
 
         if (
             (self.diag_path_integration or self.diag_counterfactual)
@@ -1397,7 +1557,8 @@ class InsScene15KDataset(EasyDataset):
             # ------------------------------------------------------------------ B2 query token
             # For B2 we emit a 1D appearance signature of the chosen object,
             # masked-pooled from the past frame with the most visible pixels.
-            # No spatial / pose / mask info is exposed to the probe.
+            # The mask itself and camera pose are not passed to B2. The pooled
+            # backbone feature can still carry spatial/positional information.
             vfm_feat_cur = output["vfm_feat"]   # (S, H_f, W_f, C) -- post scramble/pose_only
             C = vfm_feat_cur.shape[-1]
 
@@ -1414,7 +1575,7 @@ class InsScene15KDataset(EasyDataset):
                 per_frame_mask = target["per_frame_mask"].cpu()
                 output["hidden_obj_id"] = target["obj_id"].cpu()
 
-                # B2: build the appearance-only query token BEFORE any mask ablation,
+                # B2: build the object query token BEFORE any mask ablation,
                 # using the past frame with the most masked pixels.
                 pix_per_frame = per_frame_mask.flatten(1).sum(dim=1)      # (S,)
                 best_frame = int(pix_per_frame.argmax().item())
@@ -1434,14 +1595,27 @@ class InsScene15KDataset(EasyDataset):
                     per_frame_mask = torch.ones_like(per_frame_mask)  # B1 ablation only
                 output["hidden_obj_mask"] = per_frame_mask
         if self.diag_action:
-            # Input frames = first S-1 of vfm_feat already loaded; target frame = last view.
-            # For action_dynamics we need an UNCONTAMINATED target_feat (separate forward).
+            # C1 input is a causal video segment forward that ends before the
+            # target frame. Target supervision remains an isolated exact-frame
+            # feature.
+            context_tail = int(sel_global[-2].item())
+            context_start = max(
+                int(scene_info.get("window_start", 0)),
+                context_tail - int(self.context_len) + 1,
+            )
+            input_feat, _ = self._load_context_segment_feat(
+                scene_info,
+                context_start,
+                context_tail,
+                select_indices=self._context_select_indices(context_start, context_tail),
+            )
             target_feat = self._load_target_feat(
                 scene_info, sel_global[-1].item(), num_frames
             )
-            if target_feat is not None:
+            input_valid = input_feat is not None
+            if target_feat is not None and input_valid:
                 output["target_feat"] = target_feat                       # (H_f, W_f, C)
-                output["input_feat"] = output["vfm_feat"][:-1].clone()     # (S-1, H_f, W_f, C)
+                output["input_feat"] = input_feat.clone()                  # (T_ctx, H_f, W_f, C)
                 output["action"] = encode_relative_pose(
                     extrinsics[-2], extrinsics[-1]
                 ).cpu()
@@ -1451,16 +1625,30 @@ class InsScene15KDataset(EasyDataset):
                 # Fall back: emit zero-valued tensors so collation works, mark invalid
                 vf = output["vfm_feat"]
                 output["target_feat"] = torch.zeros_like(vf[0])
-                output["input_feat"] = torch.zeros_like(vf[:-1])
+                output["input_feat"] = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
                 output["action"] = torch.zeros(9, dtype=torch.float32)
                 output["target_frame_idx"] = torch.tensor(-1, dtype=torch.long)
                 output["dyn_valid"] = torch.zeros((), dtype=torch.bool)
 
         if self.diag_path_integration or self.diag_counterfactual:
-            # Multi-horizon target features are loaded from target_isolated cache
-            # so the target frame is not leaked through the context VFM forward.
+            # C2/C3 input is a causal video segment forward that ends at the
+            # anchor. Target horizons remain isolated exact-frame features.
             vf = output["vfm_feat"]
             K = max(vf.shape[0] - 1, 0)
+            context_tail = int(sel_global[0].item())
+            context_start = max(
+                int(scene_info.get("window_start", 0)),
+                context_tail - int(self.context_len) + 1,
+            )
+            input_feat, _ = self._load_context_segment_feat(
+                scene_info,
+                context_start,
+                context_tail,
+                select_indices=self._context_select_indices(context_start, context_tail),
+            )
+            input_valid = input_feat is not None
+            if not input_valid:
+                input_feat = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
             target_feats = []
             target_valid = []
             loaded_target_feats = self._load_target_feats(
@@ -1478,7 +1666,10 @@ class InsScene15KDataset(EasyDataset):
 
             if K > 0:
                 target_feat_seq = torch.stack(target_feats)
-                horizon_valid = torch.as_tensor(target_valid, dtype=torch.bool)
+                horizon_valid = (
+                    torch.as_tensor(target_valid, dtype=torch.bool)
+                    & bool(input_valid)
+                )
                 path_actions = torch.stack([
                     encode_relative_pose(extrinsics[i], extrinsics[i + 1]).cpu()
                     for i in range(K)
@@ -1507,7 +1698,7 @@ class InsScene15KDataset(EasyDataset):
                 overlap_anchor >= float(self.counterfactual_min_overlap)
             )
 
-            output["input_feat_seq"] = vf[:1].clone()
+            output["input_feat_seq"] = input_feat.clone()
             output["target_feat_seq"] = target_feat_seq
             output["path_actions"] = path_actions
             output["counterfactual_actions"] = counterfactual_actions

@@ -48,11 +48,35 @@ class EgoBeliefProbeV2(nn.Module):
         n_el_bins: int = 8,
         patch_pool: int = 1,
         dropout: float = 0.1,
+        decoder_type: str = "transformer",
+        num_frames: int = 4,
     ) -> None:
         super().__init__()
         self.n_az_bins = n_az_bins
         self.n_el_bins = n_el_bins
         self.patch_pool = patch_pool
+        if decoder_type not in {"linear", "mlp", "transformer"}:
+            raise ValueError(f"Unknown decoder_type={decoder_type!r}")
+        self.decoder_type = decoder_type
+        self.num_frames = num_frames
+
+        if decoder_type in {"linear", "mlp"}:
+            # Fixed, attention-free summary: object query plus one global token
+            # per ordered frame. This is deliberately weaker than the all-patch
+            # Transformer and serves as a readout-capacity control.
+            flat_dim = (num_frames + 1) * in_channels
+            out_dim = n_az_bins * n_el_bins + 1
+            if decoder_type == "linear":
+                self.flat_readout = nn.Linear(flat_dim, out_dim)
+            else:
+                self.flat_readout = nn.Sequential(
+                    nn.LayerNorm(flat_dim),
+                    nn.Linear(flat_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, out_dim),
+                )
+            return
 
         self.feat_proj = nn.Sequential(
             nn.LayerNorm(in_channels),
@@ -117,6 +141,15 @@ class EgoBeliefProbeV2(nn.Module):
     ) -> dict:
         feat = self._patchify(vfm_feat)                       # (B, S, Hp, Wp, C)
         B, S, Hp, Wp, _ = feat.shape
+        if S != self.num_frames:
+            raise ValueError(f"Expected {self.num_frames} frames, got {S}")
+
+        if self.decoder_type != "transformer":
+            per_frame = feat.mean(dim=(2, 3))                  # (B, S, C)
+            flat = torch.cat([query_feat, per_frame.flatten(1)], dim=-1)
+            pred = self.flat_readout(flat)
+            logits = pred[:, :-1].reshape(B, self.n_az_bins, self.n_el_bins)
+            return {"logits": logits, "log_dist": pred[:, -1]}
 
         z = self.feat_proj(feat)                              # (B, S, Hp, Wp, D)
 

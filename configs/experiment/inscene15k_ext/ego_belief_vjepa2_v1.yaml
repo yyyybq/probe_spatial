@@ -41,6 +41,9 @@ model:
   probe:
     _target_: vidfm3d.models.components.probe_ego_belief.EgoBeliefProbe
     in_channels: 1024
+    decoder_type: transformer
+    num_frames: 4
+    use_final_global_feature: true
     hidden_dim: 512
     num_layers: 2
     num_heads: 8
