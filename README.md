@@ -1,6 +1,6 @@
 # probe_spatial: Probing Spatial Understanding in Video Foundation Models
 
-This repository extends [VidFM3D](https://github.com/zxhuang1698/VidFM3D) with a **Spatial Diagnostic Suite** — four orthogonal probes that together characterize what kind of 3D / temporal / ego-centric understanding a Video Foundation Model (VFM) has internalized, all trained on frozen VFM features without touching VFM weights.
+This repository extends [VidFM3D](https://github.com/zxhuang1698/VidFM3D) with a **Spatial Diagnostic Suite** — diagnostic probes that characterize what kind of 3D / temporal / ego-centric understanding a Video Foundation Model (VFM) has internalized, all trained on frozen VFM features without touching VFM weights.
 
 | Family | Probe | Question |
 |--------|-------|---------|
@@ -8,7 +8,10 @@ This repository extends [VidFM3D](https://github.com/zxhuang1698/VidFM3D) with a
 | **A. Global Spatial Perception** | **A2 view consistency** | Can it tell whether two clips share a viewing region? |
 | **A. Global Spatial Perception** | **A3 abnormal detection** | Can it detect temporally shuffled frames? |
 | **B. Ego-Centric Belief** | **B1 hidden-object localization** | Does it remember where objects went off-screen? |
-| **C. Action-Conditioned Prediction** | **C1 latent dynamics** | Can it predict the next-frame feature given a camera motion? |
+| **B. Ego-Centric Belief** | **B2 object-query localization** | Can an object appearance query recover the object's current location? |
+| **C. Action-Conditioned Prediction** | **C1 latent dynamics** | Can it predict a future isolated feature given a camera motion? |
+| **C. Action-Conditioned Prediction** | **C2 path integration** | Can it roll forward through a sequence of relative camera actions? |
+| **C. Action-Conditioned Prediction** | **C3 counterfactual action** | Does changing the action change the predicted future consistently? |
 
 Based on: [VidFM3D: How Much 3D Do Video Foundation Models Encode?](https://arxiv.org/pdf/2512.19949v1)
 
@@ -45,33 +48,41 @@ python -m features.run_inscene15k --vfm wan --mode shuffled \
     --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_SHUFFLED \
     --t 749 --output-layers 20
+python -m features.run_inscene15k --vfm wan --mode context_segment \
+    --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_CONTEXT \
+    --t 749 --output-layers 20 --context-len 76
 python -m features.run_inscene15k --vfm wan --mode target_isolated \
     --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_TARGET \
-    --t 749 --output-layers 20 --num-targets 8
+    --t 749 --output-layers 20 --num-targets 0
 
 # Layer sweeps: pass multiple layers, then train with feature_layer=<L>.
 # Current defaults are Wan/CogVideoX layer20 at t=749, V-JEPA2 layer23,
 # and MLLM/VLM layer -1 caches.
 
-# 5. Train all 4 new probes for Wan on GPU 0
+# 5. Train diagnostic probes for Wan on GPU 0
 bash scripts/run_diag_sweep.sh wan 0
+VFMS="wan" bash scripts/run_diag_new_sweep.sh
 
 # 6. Test & evaluate
 bash scripts/run_diag_eval_sweep.sh   # writes comparison_val.csv
 ```
 
 > **Note**: feature paths are hardcoded in `configs/experiment/inscene15k_ext/*.yaml`.
-> Update the `root_vfm`, `target_feat_root`, and `shuffled_feat_root` fields to match
+> Update the `root_vfm`, `context_feat_root`, `target_feat_root`, and `shuffled_feat_root` fields to match
 > your actual data location before training, or pass overrides via Hydra:
 > ```bash
 > python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
->     model.probe.target_feat_root=/data/InsScene-15K/FEAT_TARGET
+>     context_feat_root=/data/InsScene-15K/FEAT_CONTEXT \
+>     target_feat_root=/data/InsScene-15K/FEAT_TARGET
 > ```
 
 On a shared cluster, the dataset also honors `INSCENE_DATA_ROOT`,
-`INSCENE_FEAT_ROOT`, `INSCENE_TARGET_FEAT_ROOT`, and
-`INSCENE_SHUFFLED_FEAT_ROOT`; these take precedence over legacy YAML paths.
+`INSCENE_FEAT_ROOT`, `INSCENE_CONTEXT_FEAT_ROOT`, `INSCENE_TARGET_FEAT_ROOT`,
+and `INSCENE_SHUFFLED_FEAT_ROOT`; these take precedence over legacy YAML paths.
+See `EXPERIMENT_PROTOCOL.md` and `TRAINING_LOGIC_AUDIT.md` for the current
+causal-cache protocol and task-by-task input contracts.
 > See `PROBE_SPATIAL_GUIDE.md` §8.1.1 for layer-wise extraction, probing, and
 > `scripts/summarize_layer_sweep.py` best-layer/last-layer reports.
 > End-to-end layer sweeps use:
@@ -142,7 +153,8 @@ Expected structure after extraction:
     processed_scannetpp_v2/   # ScanNet++ real-world scenes
   FEAT/                       # filled by feature extraction (step 4)
   FEAT_SHUFFLED/              # filled by feature extraction --mode shuffled (A3)
-  FEAT_TARGET/                # filled by feature extraction --mode target_isolated (C1)
+  FEAT_CONTEXT/               # filled by feature extraction --mode context_segment (C1/C2/C3 inputs)
+  FEAT_TARGET/                # filled by feature extraction --mode target_isolated (C1/C2/C3 targets)
 ```
 
 ### CO3Dv2 / DL3DV (original VidFM3D datasets)
@@ -155,13 +167,14 @@ Follow the [original VidFM3D instructions](https://github.com/zxhuang1698/VidFM3
 
 Features are pre-extracted once and cached as `.sft` files. The extractor is resume-safe (skips already-done scenes).
 
-### InsScene-15K — three extraction modes
+### InsScene-15K — extraction modes
 
 | Mode | Output dir | Used by |
 |------|-----------|---------|
-| `normal` (default) | `FEAT/` | A1, A2, B1, C1 input |
+| `normal` (default) | `FEAT/` | A1, A2, B1/B2, non-causal/full-clip inputs |
 | `shuffled` | `FEAT_SHUFFLED/` | A3 (temporally shuffled clips) |
-| `target_isolated` | `FEAT_TARGET/` | C1 target features (no temporal context) |
+| `context_segment` | `FEAT_CONTEXT/` | C1/C2/C3 causal inputs, with no future target frames in the VFM forward |
+| `target_isolated` | `FEAT_TARGET/` | C1/C2/C3 isolated target features, with exact frame ids |
 
 ```bash
 INSCENE_DATA=/data/InsScene-15K
@@ -179,12 +192,24 @@ python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_SHUFFLED \
     --t 749 --output-layers 20
 
-# Target-isolated features (C1 only)
+# Causal context features (C1/C2/C3 inputs)
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --mode context_segment \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_CONTEXT \
+    --t 749 --output-layers 20 --context-len 76
+
+# Target-isolated features (C1/C2/C3 targets)
 python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
     --mode target_isolated \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_TARGET \
-    --t 749 --output-layers 20 --num-targets 8
+    --t 749 --output-layers 20 --num-targets 0
 ```
+
+C1/C2/C3 intentionally do not reuse `normal` features for their inputs or
+targets. Input features come from causal `context_segment` forwards ending at
+the last observed frame; target supervision comes from exact `target_isolated`
+rows. This prevents future-frame leakage through clip-contextualized VFM
+features.
 
 Switch `--vfm cogvideox --model-id THUDM/CogVideoX-5b-I2V` or
 `--vfm vjepa2` (uses `features/vjepa2/vjepa2_feature.py`) for other VFMs.
@@ -239,9 +264,10 @@ VFM=vjepa2 PROBE=action_dynamics LAYERS="0 5 11 17 23" DEV=1 \
     bash scripts/run_feature_layer_probe_sweep.sh
 ```
 
-The script extracts required feature modes, trains one probe per layer,
-evaluates checkpoints, and summarizes the layer-wise curve. To summarize
-existing evaluated runs manually:
+The script extracts required feature modes for the selected probe, trains one
+probe per layer, evaluates checkpoints, and summarizes the layer-wise curve. For
+C1/C2/C3, extract the same layer list for both `context_segment` and
+`target_isolated`. To summarize existing evaluated runs manually:
 
 ```bash
 python scripts/summarize_layer_sweep.py \
@@ -254,13 +280,22 @@ python scripts/summarize_layer_sweep.py \
 
 ## Training
 
-### New Diagnostic Probes (A2 / A3 / B1 / C1) — this work
+### Diagnostic probes (A2 / A3 / B1 / B2 / C1 / C2 / C3) — this work
 
-**Train all four probes for one VFM on a single GPU:**
+**Train the original diagnostic sweep for one VFM on a single GPU:**
 ```bash
 bash scripts/run_diag_sweep.sh wan     0   # GPU 0
 bash scripts/run_diag_sweep.sh vjepa2  1   # GPU 1
 bash scripts/run_diag_sweep.sh cogvideox 2 # GPU 2
+```
+
+**Train the newer C2/C3 probes:**
+```bash
+# Sequential
+VFMS="wan vjepa2 cogvideox" bash scripts/run_diag_new_sweep.sh
+
+# Parallel across GPUs
+PYTHON=/path/to/python GPUS="0 1 2 3 4 5" bash scripts/run_diag_new_parallel.sh
 ```
 
 **Train a single probe:**
@@ -277,9 +312,21 @@ CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
 CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
     experiment=inscene15k_ext/ego_belief_wan_v1
 
+# B2 object-query localization
+CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
+    experiment=inscene15k_ext/ego_belief_v2_wan_v1
+
 # C1 latent dynamics
 CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
     experiment=inscene15k_ext/action_dynamics_wan_v1
+
+# C2 path integration
+CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
+    experiment=inscene15k_ext/path_integration_wan_v1
+
+# C3 counterfactual action
+CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
+    experiment=inscene15k_ext/counterfactual_wan_v1
 ```
 
 Training runs for 50 epochs (≈2–4 hours per probe on 1× L40S), auto-resumes from `last.ckpt`.
@@ -304,17 +351,21 @@ Trains for 100 epochs, checkpointed every 5 epochs.
 
 ### Override data paths
 
-If your data is not at the default path, override via Hydra:
+If your data is not at the default path, set the environment roots before
+launching Hydra:
 ```bash
-python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
-    "data.data_module.train_datasets=['InsScene15KDataset(root=\"/your/data\", root_vfm=\"/your/FEAT\", ..., diag_action=True, target_feat_root=\"/your/FEAT_TARGET\")']"
+INSCENE_DATA_ROOT=/your/InsScene-15K/data \
+INSCENE_FEAT_ROOT=/your/InsScene-15K/FEAT \
+INSCENE_CONTEXT_FEAT_ROOT=/your/InsScene-15K/FEAT_CONTEXT \
+INSCENE_TARGET_FEAT_ROOT=/your/InsScene-15K/FEAT_TARGET \
+python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1
 ```
 
 ---
 
 ## Evaluation
 
-### New Diagnostic Probes (A2 / A3 / B1 / C1)
+### Diagnostic Probes (A2 / A3 / B1 / B2 / C1 / C2 / C3)
 
 ```bash
 # Evaluate all trained runs and aggregate into a CSV
@@ -335,7 +386,9 @@ python vidfm3d/eval_diag.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
 ```
 
 `eval_diag.py` computes C1 retrieval globally, so final R@K no longer depends
-on evaluation batch size. It also reports no-action and last-observation baselines.
+on evaluation batch size. It also reports no-action and last-observation
+baselines. C2/C3 reuse the same evaluator and report horizon validity,
+retrieval/path metrics, and counterfactual intervention metrics.
 
 ### A1 Baseline Probe
 
@@ -360,6 +413,8 @@ Results summary (InsScene-15K val, 953 samples):
 | B1 az_err↓ | legacy | legacy | legacy | pre no-pose task definition; rerun required |
 | B1 el_err↓ | legacy | legacy | legacy | pre no-pose task definition; rerun required |
 | C1 R@1↑ | legacy | legacy | legacy | pre exact-target/global-retrieval fix; rerun required |
+| C2 global_R@1↑ | pending | pending | pending | rerun with context_segment + target_isolated caches |
+| C3 intervention_validity↑ | pending | pending | pending | rerun with context_segment + target_isolated caches |
 
 ---
 
@@ -373,12 +428,12 @@ probe_spatial/
 │   ├── train.yaml                   # Hydra top-level config
 │   ├── model/
 │   │   ├── probe.yaml               # A1 probe (depth/camera/identity)
-│   │   └── probe_ext.yaml           # NEW: A2/A3/B1/C1 probes
+│   │   └── probe_ext.yaml           # Diagnostic probes
 │   └── experiment/
 │       ├── inscene15k/              # A1 experiments
-│       └── inscene15k_ext/          # NEW: 4 probes × 3 VFMs + ctrl variants
+│       └── inscene15k_ext/          # A2/A3/B1/B2/C1/C2/C3 configs
 ├── features/
-│   ├── run_inscene15k.py            # Feature extractor (normal/shuffled/target modes)
+│   ├── run_inscene15k.py            # Feature extractor (normal/shuffled/context/target modes)
 │   ├── wan/                         # Wan feature extraction
 │   ├── cogvideox/                   # CogVideoX feature extraction
 │   └── vjepa2/                      # V-JEPA2 feature extraction
@@ -389,16 +444,21 @@ probe_spatial/
 │   ├── data/components/
 │   │   └── inscene15k_dataset.py    # Dataset (extended with diag flags)
 │   ├── models/
-│   │   ├── probe_ext_module.py      # NEW: LitModule for A2/A3/B1/C1
+│   │   ├── probe_ext_module.py      # LitModule for diagnostic probes
 │   │   └── components/
 │   │       ├── probe_view_consistency.py   # A2 head
 │   │       ├── probe_abnormal.py           # A3 head
 │   │       ├── probe_ego_belief.py         # B1 head
-│   │       └── probe_action_dynamics.py    # C1 head
+│   │       ├── probe_ego_belief_v2.py      # B2 head
+│   │       ├── probe_action_dynamics.py    # C1 head
+│   │       ├── probe_path_integration.py   # C2 head
+│   │       └── probe_counterfactual.py     # C3 head
 │   └── utils/
 │       └── spatial_diag.py          # Geometry helpers (overlap, polar, pose)
 ├── scripts/
-│   ├── run_diag_sweep.sh            # Train all 4 probes for one VFM
+│   ├── run_diag_sweep.sh            # Train A2/A3/B1/C1 for one VFM
+│   ├── run_diag_new_sweep.sh        # Train C2/C3 sequentially
+│   ├── run_diag_new_parallel.sh     # Train C2/C3 in parallel
 │   └── run_diag_eval_sweep.sh       # Eval all runs, write CSV
 └── eval_pertask_v3.py               # A1 evaluation script
 ```
