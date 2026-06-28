@@ -146,7 +146,22 @@ def load_and_resize_frames(img_dir, img_files, indices, size=(480, 832)):
     return frames
 
 
-def streaming_prefix_records(num_frames, min_len=1, max_len=None, stride=1, model_max_len=None):
+def parse_int_list(value):
+    if value is None:
+        return None
+    items = str(value).replace(",", " ").split()
+    parsed = sorted({int(item) for item in items if item.strip()})
+    return parsed or None
+
+
+def streaming_prefix_records(
+    num_frames,
+    min_len=1,
+    max_len=None,
+    stride=1,
+    model_max_len=None,
+    lengths=None,
+):
     """Build online prefix records H_t = [I_0, ..., I_t]."""
     min_len = max(int(min_len), 1)
     stride = max(int(stride), 1)
@@ -157,8 +172,15 @@ def streaming_prefix_records(num_frames, min_len=1, max_len=None, stride=1, mode
         max_len = min(max_len, int(model_max_len))
     if max_len < min_len:
         return []
+    if lengths is not None:
+        candidate_lengths = [
+            int(length) for length in lengths
+            if min_len <= int(length) <= max_len
+        ]
+    else:
+        candidate_lengths = range(min_len, max_len + 1, stride)
     records = []
-    for length in range(min_len, max_len + 1, stride):
+    for length in candidate_lengths:
         records.append({
             "tail": length - 1,
             "indices": list(range(length)),
@@ -286,11 +308,14 @@ def main():
                         help="Minimum streaming-prefix length.")
     parser.add_argument("--prefix-max-len", type=int, default=81,
                         help="Maximum streaming-prefix length before model padding.")
+    parser.add_argument("--prefix-lengths", default=None,
+                        help="Exact streaming prefix lengths to cache, e.g. '4,8,16,32,64'.")
     parser.add_argument("--context-len", type=int, default=76,
                         help="Maximum causal input segment length for context_segment mode.")
     parser.add_argument("--context-stride", type=int, default=1,
                         help="Tail-frame stride for context_segment mode.")
     args = parser.parse_args()
+    args.prefix_lengths = parse_int_list(args.prefix_lengths)
 
     # Per-VFM defaults
     VFM_DEFAULTS = {
@@ -393,6 +418,7 @@ def main():
                     max_len=args.prefix_max_len,
                     stride=args.prefix_stride,
                     model_max_len=args.num_frames,
+                    lengths=args.prefix_lengths,
                 )
                 if args.mode == "streaming_prefix"
                 else context_segment_records(
@@ -560,6 +586,7 @@ def main():
                     max_len=args.prefix_max_len,
                     stride=args.prefix_stride,
                     model_max_len=args.num_frames,
+                    lengths=args.prefix_lengths,
                 )
                 if args.mode == "streaming_prefix"
                 else context_segment_records(
@@ -609,6 +636,7 @@ def main():
                         max_len=args.prefix_max_len,
                         stride=args.prefix_stride,
                         model_max_len=args.num_frames,
+                        lengths=args.prefix_lengths,
                     )
                     if args.mode == "streaming_prefix"
                     else context_segment_records(

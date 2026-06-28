@@ -15,9 +15,16 @@
 - The active B2 definition is query + all-frame patch tokens. There is no
   B2-last implementation or experiment in this repository.
 - B1/B2 GT is expressed in the final observation's camera coordinate system.
-- C1/C2/C3 input features must come from causal `context_segment` forwards, and
-  target features must come from exact `target_isolated` rows. Do not feed these
-  probes features sliced from the normal full-clip cache.
+  In streaming runs, "final observation" means the last frame of the selected
+  prefix.
+- C1/C2/C3 target features must come from exact `target_isolated` rows. Their
+  non-streaming inputs come from causal `context_segment` forwards; their
+  streaming inputs come from independently forwarded `streaming_prefix` caches.
+  Do not feed these probes features sliced from the normal full-clip cache.
+- Streaming is a shared setting across A1/A2/B1/B2/C1/C2/C3. The default prefix
+  lengths are `4,8,16,32,64`, trained as separate fixed-shape jobs. For C probes,
+  actions are defined relative to the current prefix tail `I_t`; that frame is
+  the action reference, not an additional condition.
 - ScanNet++ caches must be extracted after the valid-frame indexing fix; older
   caches used all JPGs while the dataset indexed only image+mask pairs.
 
@@ -43,6 +50,9 @@ query with one global-pooled token per ordered frame. The B2 Transformer still
 sees every patch, so results across decoder types measure both readout capacity
 and token-access differences; they must not be described as parameter-matched
 architecture ablations.
+
+Linear/MLP readouts are fixed-length and are not part of the streaming sweep.
+Streaming B1/B2 use Transformer readouts with `max_seq_len >= 64`.
 
 Example:
 

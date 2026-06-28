@@ -11,6 +11,14 @@
 > alignment and global retrieval evaluation. Older B1/B2/C1 numbers below are
 > historical diagnostics and require rerunning before publication.
 
+> **2026-06-28 protocol change:** Streaming is now a shared setting across
+> A1/A2/B1/B2/C1/C2/C3, using prefix lengths `4,8,16,32,64`. B1 includes a
+> final-prefix-frame global feature and B1/B2 GT is expressed in that final
+> prefix frame's camera coordinates. Streaming C probes use `streaming_prefix`
+> inputs, actions relative to the prefix tail, and exact `target_isolated`
+> future targets. Treat older non-streaming numbers below as historical unless
+> explicitly rerun under the new configs.
+
 ## 2026-06-14 方法更新：支持 layer-wise probing
 
 当前默认 probe 层已确认并保持不变：

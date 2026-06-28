@@ -97,6 +97,7 @@ class InsScene15KDataset(EasyDataset):
         prefix_stride: int = 1,
         prefix_min_len: int = 1,
         prefix_max_len: int = None,
+        prefix_lengths: list = None,
         streaming_feat_root: str = None,
         streaming_prefix_dir_fmt: str = "prefix_{tail:06d}",
         context_feat_root: str = None,
@@ -110,7 +111,7 @@ class InsScene15KDataset(EasyDataset):
         diag_counterfactual: bool = False,    # C3: multi-horizon action intervention prediction
         target_feat_root: str = None,      # root for C1/C2/C3 isolated target features
         shuffled_feat_root: str = None,    # root for A3 shuffled features
-        action_horizons: list = None,      # frame offsets from anchor, e.g. [1, 10, 30]
+        action_horizons: list = None,      # frame offsets from action-reference frame, e.g. [1, 10, 30]
         counterfactual_min_overlap: float = 0.05,
         scramble_feat: bool = False,       # Control: replace VFM feat with randn (same shape)
         allow_missing_vfm: bool = False,   # Debug only: use dummy zeros if a normal VFM feature is missing
@@ -170,6 +171,12 @@ class InsScene15KDataset(EasyDataset):
         self.prefix_stride = max(int(prefix_stride), 1)
         self.prefix_min_len = max(int(prefix_min_len), 1)
         self.prefix_max_len = int(prefix_max_len) if prefix_max_len is not None else None
+        if isinstance(prefix_lengths, str):
+            prefix_lengths = prefix_lengths.replace(",", " ").split()
+        self.prefix_lengths = (
+            sorted({int(v) for v in prefix_lengths if int(v) > 0})
+            if prefix_lengths is not None else None
+        )
         self.streaming_feat_root = streaming_feat_root
         self.streaming_prefix_dir_fmt = streaming_prefix_dir_fmt
         self.context_feat_root = context_feat_root
@@ -241,7 +248,7 @@ class InsScene15KDataset(EasyDataset):
 
         # Expand scenes with windowing for long videos. Streaming prefix is its
         # own indexing scheme: each sample is exactly [0, ..., tail].
-        if self.streaming_prefix:
+        if getattr(self, "streaming_prefix", False):
             self._expand_scenes_with_streaming_prefix()
         elif self.window_size > 0:
             self._expand_scenes_with_windows()
@@ -255,12 +262,22 @@ class InsScene15KDataset(EasyDataset):
     def _expand_scenes_with_streaming_prefix(self):
         """Expand each scene into online prefix samples H_t = [I_0, ..., I_t]."""
         expanded = []
+        max_future = max(self._streaming_future_horizons(default=[]), default=0)
         for scene in self.scenes:
             nf = int(scene["num_frames"])
-            max_len = nf if self.prefix_max_len is None else min(nf, self.prefix_max_len)
+            max_len = nf - max_future
+            if self.prefix_max_len is not None:
+                max_len = min(max_len, self.prefix_max_len)
             if max_len < self.prefix_min_len:
                 continue
-            for length in range(self.prefix_min_len, max_len + 1, self.prefix_stride):
+            if self.prefix_lengths:
+                lengths = [
+                    length for length in self.prefix_lengths
+                    if self.prefix_min_len <= length <= max_len
+                ]
+            else:
+                lengths = range(self.prefix_min_len, max_len + 1, self.prefix_stride)
+            for length in lengths:
                 tail = length - 1
                 prefix_scene = dict(scene)
                 prefix_scene["streaming_tail"] = tail
@@ -269,9 +286,20 @@ class InsScene15KDataset(EasyDataset):
         logger.info(
             f"Streaming prefix expansion: {len(self.scenes)} scenes -> {len(expanded)} samples "
             f"(min_len={self.prefix_min_len}, max_len={self.prefix_max_len}, "
-            f"stride={self.prefix_stride})"
+            f"stride={self.prefix_stride}, lengths={self.prefix_lengths}, "
+            f"max_future={max_future})"
         )
         self.scenes = expanded
+
+    def _streaming_future_horizons(self, default=None):
+        """Future frame offsets predicted from the current streaming tail."""
+        if not self.streaming_prefix:
+            return default if default is not None else []
+        if self.diag_path_integration or self.diag_counterfactual:
+            return list(self.action_horizons)
+        if getattr(self, "diag_action", False):
+            return list(self.action_horizons) if self.action_horizons else [1]
+        return default if default is not None else []
 
     def _expand_scenes_with_windows(self):
         """Expand scenes into overlapping windows for long videos.
@@ -1147,7 +1175,7 @@ class InsScene15KDataset(EasyDataset):
         return vfm_feat, vfm_idx
 
     def _getitem_feature_action_diag(self, scene_info, num_frames, sel_global):
-        """Fast path for C2/C3 probes that do not consume RGB, masks, or identity IDs."""
+        """Fast path for C1/C2/C3 probes that do not consume RGB, masks, or identity IDs."""
         from vidfm3d.utils.spatial_diag import (
             compute_overlap_ratio,
             encode_relative_pose,
@@ -1172,40 +1200,70 @@ class InsScene15KDataset(EasyDataset):
         )
         depthmaps = depthmaps_hw1.squeeze(-1)
 
-        vf, vfm_idx = self._load_vfm_feat_for_selection(
-            scene_info, num_frames, sel_global
-        )
-        K = max(vf.shape[0] - 1, 0)
+        target_global = sel_global[1:]
+        K = int(target_global.numel())
 
-        context_tail = int(sel_global[0].item())
-        context_start = max(
-            int(scene_info.get("window_start", 0)),
-            context_tail - int(self.context_len) + 1,
-        )
-        input_feat, _ = self._load_context_segment_feat(
-            scene_info,
-            context_start,
-            context_tail,
-            select_indices=self._context_select_indices(context_start, context_tail),
-        )
-        input_valid = input_feat is not None
-        if not input_valid:
-            input_feat = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
+        if getattr(self, "streaming_prefix", False):
+            prefix_global = torch.as_tensor(
+                scene_info["streaming_indices"], dtype=torch.long
+            )
+            input_feat, vfm_idx = self._load_streaming_prefix_feat(
+                scene_info, prefix_global
+            )
+            output_vfm_feat = input_feat
+            input_valid = True
+        else:
+            vf, vfm_idx = self._load_vfm_feat_for_selection(
+                scene_info, num_frames, sel_global
+            )
+            output_vfm_feat = vf
+            context_tail = int(sel_global[0].item())
+            context_start = max(
+                int(scene_info.get("window_start", 0)),
+                context_tail - int(self.context_len) + 1,
+            )
+            input_feat, _ = self._load_context_segment_feat(
+                scene_info,
+                context_start,
+                context_tail,
+                select_indices=self._context_select_indices(context_start, context_tail),
+            )
+            input_valid = input_feat is not None
+            if not input_valid:
+                input_feat = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
 
         loaded_target_feats = self._load_target_feats(
             scene_info,
-            [int(target_idx.item()) for target_idx in sel_global[1:]],
+            [int(target_idx.item()) for target_idx in target_global],
             num_frames,
         )
         target_feats = []
         target_valid = []
         for target_feat in loaded_target_feats:
             if target_feat is None:
-                target_feats.append(torch.zeros_like(vf[0]))
+                target_feats.append(torch.zeros_like(input_feat[0]))
                 target_valid.append(False)
             else:
                 target_feats.append(target_feat)
                 target_valid.append(True)
+
+        if getattr(self, "diag_action", False):
+            target_feat = target_feats[0] if target_feats else torch.zeros_like(input_feat[0])
+            target_ok = bool(target_valid[0]) if target_valid else False
+            return {
+                "vfm_feat": output_vfm_feat,
+                "vfm_idx": vfm_idx,
+                "input_feat": input_feat.clone(),
+                "target_feat": target_feat,
+                "action": encode_relative_pose(extrinsics[0], extrinsics[1]).cpu()
+                if K > 0 else torch.zeros(9, dtype=torch.float32),
+                "target_frame_idx": target_global[0].to(torch.long).cpu()
+                if K > 0 else torch.tensor(-1, dtype=torch.long),
+                "dyn_valid": torch.tensor(bool(input_valid and target_ok), dtype=torch.bool),
+                "rng": int.from_bytes(self._rng.bytes(4), "big"),
+                "scene_path": scene_info["scene_dir"],
+                "vfm_name": self.vfm_name,
+            }
 
         if K > 0:
             target_feat_seq = torch.stack(target_feats)
@@ -1221,9 +1279,9 @@ class InsScene15KDataset(EasyDataset):
                 encode_relative_pose(extrinsics[0], extrinsics[i + 1]).cpu()
                 for i in range(K)
             ])
-            horizons = (sel_global[1:] - sel_global[0]).to(torch.long).cpu()
+            horizons = (target_global - sel_global[0]).to(torch.long).cpu()
         else:
-            target_feat_seq = torch.zeros(0, *vf.shape[1:], dtype=vf.dtype)
+            target_feat_seq = torch.zeros(0, *input_feat.shape[1:], dtype=input_feat.dtype)
             horizon_valid = torch.zeros(0, dtype=torch.bool)
             path_actions = torch.zeros(0, 9, dtype=torch.float32)
             counterfactual_actions = torch.zeros(0, 9, dtype=torch.float32)
@@ -1244,7 +1302,7 @@ class InsScene15KDataset(EasyDataset):
         )
 
         return {
-            "vfm_feat": vf,
+            "vfm_feat": output_vfm_feat,
             "vfm_idx": vfm_idx,
             "input_feat_seq": input_feat.clone(),
             "target_feat_seq": target_feat_seq,
@@ -1308,9 +1366,22 @@ class InsScene15KDataset(EasyDataset):
         num_frames = scene_info["num_frames"]
 
         if self.streaming_prefix:
-            sel_global = torch.as_tensor(
+            prefix_global = torch.as_tensor(
                 scene_info["streaming_indices"], dtype=torch.long
             )
+            future_horizons = self._streaming_future_horizons(default=[])
+            if (
+                future_horizons
+                and (self.diag_action or self.diag_path_integration or self.diag_counterfactual)
+                and not (self.diag_overlap or self.diag_hidden_obj or self.diag_abnormal)
+            ):
+                tail = int(scene_info["streaming_tail"])
+                sel_global = torch.as_tensor(
+                    [tail] + [tail + int(h) for h in future_horizons],
+                    dtype=torch.long,
+                )
+            else:
+                sel_global = prefix_global
         else:
             # Window bounds (defaults to full scene)
             window_start = scene_info.get("window_start", 0)
@@ -1318,8 +1389,8 @@ class InsScene15KDataset(EasyDataset):
             window_frames = window_end - window_start
 
             # Sample frame indices within the window. Multi-action diagnostic probes
-            # use explicit offsets from one anchor frame so horizons have a stable
-            # interpretation: [anchor, anchor+1, anchor+10, anchor+30, ...].
+            # use explicit offsets from one action-reference frame so horizons
+            # have a stable interpretation: [t, t+1, t+10, t+30, ...].
             explicit_action_horizons = (
                 (self.diag_path_integration or self.diag_counterfactual)
                 and len(self.action_horizons) > 0
@@ -1328,9 +1399,9 @@ class InsScene15KDataset(EasyDataset):
             if explicit_action_horizons:
                 max_start = min(window_frames, self.context_len) - max(self.action_horizons)
                 max_start = max(max_start, 1)
-                anchor = int(self._rng.integers(0, max_start))
+                action_ref = int(self._rng.integers(0, max_start))
                 sel = torch.as_tensor(
-                    [anchor] + [anchor + h for h in self.action_horizons],
+                    [action_ref] + [action_ref + h for h in self.action_horizons],
                     dtype=torch.long,
                 )
             else:
@@ -1364,8 +1435,9 @@ class InsScene15KDataset(EasyDataset):
                         sel_global[-1] = target
 
         if (
-            (self.diag_path_integration or self.diag_counterfactual)
-            and not (self.diag_overlap or self.diag_hidden_obj or self.diag_action or self.diag_abnormal)
+            (self.diag_action or self.diag_path_integration or self.diag_counterfactual)
+            and not (self.diag_overlap or self.diag_hidden_obj or self.diag_abnormal)
+            and (self.streaming_prefix or not self.diag_action)
         ):
             return self._getitem_feature_action_diag(scene_info, num_frames, sel_global)
 
@@ -1632,7 +1704,8 @@ class InsScene15KDataset(EasyDataset):
 
         if self.diag_path_integration or self.diag_counterfactual:
             # C2/C3 input is a causal video segment forward that ends at the
-            # anchor. Target horizons remain isolated exact-frame features.
+            # action-reference frame. Target horizons remain isolated
+            # exact-frame features.
             vf = output["vfm_feat"]
             K = max(vf.shape[0] - 1, 0)
             context_tail = int(sel_global[0].item())

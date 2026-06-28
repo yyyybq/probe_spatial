@@ -34,8 +34,10 @@ layer sweeps distinct `job_name`/`paths.run_folder_name` values.
   target frames; required by C1/C2/C3 inputs.
 - `target_isolated`: exact future target-frame features from an independent
   forward; required by C1/C2/C3 targets.
-- `streaming_prefix`: each prefix is forwarded independently. This exists but is
-  not the default for C1/C2/C3.
+- `streaming_prefix`: each observed prefix is forwarded independently. This is
+  now the shared online-history cache for streaming A1/A2/B1/B2/C1/C2/C3.
+  The default sweep uses exact prefix lengths `4,8,16,32,64`; training keeps one
+  fixed `prefix_len` per run to avoid variable-length batches.
 
 Wan defaults to layer 20 at timestep 749, CogVideoX to layer 20 at timestep 749,
 and V-JEPA2 to layer 23. Cache files are safetensors with atomic replacement,
@@ -76,8 +78,46 @@ For the standard four-view probes:
    features as `(S,Hf,Wf,C)` fp32 tensors.
 7. Remap instance IDs within the sample and generate probe-specific targets.
 
-For C2/C3 with explicit horizons, indices are `[anchor, anchor+h1, ...]` and a
-geometry-only fast path avoids loading RGB/masks.
+For C2/C3 with explicit horizons, indices are `[t, t+h1, ...]` and a
+geometry-only fast path avoids loading RGB/masks. Frame `t` is the
+action-reference frame used to encode relative motion; it is not an additional
+condition beyond the input feature sequence.
+
+For streaming probes, `InsScene15KDataset(streaming_prefix=True)` expands each
+scene into online prefix samples. A/B probes consume the prefix itself. C probes
+load the observed input from the `streaming_prefix` cache `[I_0..I_t]`, encode
+actions from the prefix tail `I_t` to future target frames, and load future
+supervision from `target_isolated`. The streaming C2/C3 default horizons are
+`[1,4,8,16]`, so `prefix_len=64` remains feasible for 81-frame Wan clips.
+
+## 4.1 Current streaming code path audit
+
+This was rechecked against the current implementation after introducing the
+shared streaming interface:
+
+1. `features/run_inscene15k.py --mode streaming_prefix --prefix-lengths
+   "4,8,16,32,64"` forwards each requested prefix independently and writes
+   `prefix_<tail>/feature...sft` plus `prefix_index.npy`.
+2. `scripts/run_streaming_probe_sweep.sh` extracts that cache once and trains
+   separate fixed-shape jobs for each `(probe, prefix_len, layer)`. Mixed prefix
+   lengths are not collated in the same batch.
+3. Streaming A1/A2/B1/B2 configs set `streaming_prefix=True` and
+   `prefix_min_len=prefix_max_len=prefix_len`; the dataset therefore returns
+   exactly the selected prefix.
+4. Streaming B1/B2 geometry is rebased with `ref_idx=len(prefix)-1`, and
+   `compute_hidden_object_target(..., last_frame_idx=-1)` expresses the target
+   in the prefix-final camera coordinates.
+5. Streaming B1 receives per-frame object masks plus the global pooled final
+   prefix frame. No camera pose is supplied.
+6. Streaming B2 receives one object query plus all patch tokens from the prefix.
+   No camera pose and no explicit current-frame role token are supplied.
+7. Streaming C1/C2/C3 go through `_getitem_feature_action_diag`: input features
+   are loaded from the prefix cache; target features are loaded from
+   `target_isolated`; actions are encoded from the prefix tail to each future
+   target frame.
+8. Non-streaming C1 still uses `context_segment` for input and
+   `target_isolated` for target. Non-streaming C2/C3 use the same fast path but
+   load `context_segment` inputs ending at their action-reference frame.
 
 ## 5. Probe-specific supervision
 
@@ -115,10 +155,12 @@ geometry-only fast path avoids loading RGB/masks.
   convention and is not supplied to B1.
 - Transformer: masked-pool one object token per visible frame, add final global
   token and order embeddings, mask invisible object tokens and regress from a
-  learned query.
+  learned query. In streaming configs this Transformer accepts variable
+  sequence lengths up to `max_seq_len=64`.
 - Linear/MLP: flatten the four ordered masked object tokens, the final global
   token and four visibility bits. `decoder_type={linear,mlp,transformer}`
-  selects the readout.
+  selects the readout. Linear/MLP remain fixed-length and are not used for
+  streaming sweeps.
 - Loss: weighted SmoothL1 with weights `[1,1,0.5]`; azimuth residual is wrapped
   on the circle. Metrics are azimuth/elevation degree error and log-distance
   absolute error.
@@ -129,11 +171,13 @@ geometry-only fast path avoids loading RGB/masks.
 - Condition: mask-pool the chosen object from the past frame where it has the
   most pixels, yielding one object-query vector. The mask and camera pose are
   not passed to the head, although the backbone vector may encode position.
-- Transformer: the query attends to every pooled patch from all four ordered
-  frames with learned frame/row/column embeddings. This includes final-frame
-  patches. There is no explicit current-frame role embedding.
+- Transformer: the query attends to every pooled patch from all ordered frames
+  with learned frame/row/column embeddings. In streaming configs the number of
+  ordered frames is the selected `prefix_len` and may be 4, 8, 16, 32 or 64.
+  There is no explicit current-frame role embedding.
 - Linear/MLP: concatenate the object query with one globally pooled token per
-  ordered frame. These modes do not receive all patches.
+  ordered frame. These modes do not receive all patches, remain fixed-length,
+  and are not used for streaming sweeps.
 - Output: a joint 16x8 azimuth/elevation classification and scalar log distance.
   Loss is joint-bin CE plus 0.3 SmoothL1. Metrics are top-1/top-3, spherical
   angular error and log-distance error.
@@ -145,6 +189,8 @@ geometry-only fast path avoids loading RGB/masks.
 - Input is loaded from a `context_segment` cache ending at the last input frame,
   e.g. `[I_1..I_48]` forwarded together without the future target. If the
   context segment or exact target row is missing, the sample is invalid.
+- In streaming configs, input instead comes from the shared `streaming_prefix`
+  cache `[I_0..I_t]`. The target is `t+h`; C1 defaults to `h=1`.
 - Action is the relative camera transform from the context tail to target
   camera: first two rotation rows plus translation (nine values). Target is the
   spatial mean of the exact isolated target feature.
@@ -157,8 +203,13 @@ geometry-only fast path avoids loading RGB/masks.
 
 ### C2 path integration
 
-- Input is the causal context segment ending at the anchor. Consecutive actions
-  describe each waypoint step; exact isolated targets supervise every horizon.
+- Input is the causal context segment ending at the action-reference frame.
+  Consecutive actions describe each waypoint step; exact isolated targets
+  supervise every horizon.
+- In streaming configs, the action-reference frame is the current prefix tail
+  and the input is the corresponding `streaming_prefix` feature. Default
+  horizons are
+  `[1,4,8,16]`.
 - A stacked GRU recurrently updates state and predicts one pooled target feature
   per step. Valid horizons use MSE plus cosine distance.
 - Evaluation retrieves poses through target features and reports global
@@ -166,9 +217,11 @@ geometry-only fast path avoids loading RGB/masks.
 
 ### C3 counterfactual action
 
-- Input is the same causal context segment ending at the anchor. Each action
-  maps anchor directly to one horizon. Horizons with missing context/target rows
-  or anchor overlap below 0.05 are invalid.
+- Input is the same causal context segment ending at the action-reference frame.
+  Each action maps that frame directly to one horizon. Horizons with missing
+  context/target rows or reference-target overlap below 0.05 are invalid.
+- In streaming configs, the input is again the prefix cache ending at the
+  current tail, with default horizons `[1,4,8,16]`.
 - A Transformer jointly reads context plus alternative action tokens and predicts
   one pooled target per intervention. Loss is MSE plus cosine distance.
 - Evaluation reports global retrieval, correct-target cosine, intervention hit

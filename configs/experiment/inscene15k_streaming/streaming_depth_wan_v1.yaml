@@ -22,8 +22,9 @@ feature_layer: null
 feature_timestep: 749
 vfm_name: wan
 video_channels: 1536
-prefix_min_len: 1
-prefix_max_len: 81
+prefix_len: 4
+prefix_min_len: ${prefix_len}
+prefix_max_len: ${prefix_len}
 prefix_stride: 1
 streaming_feat_root: ${oc.env:INSCENE_STREAMING_FEAT_ROOT}
 

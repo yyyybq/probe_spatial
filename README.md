@@ -29,17 +29,22 @@ cd probe_spatial
 # 2. Create env (see Installation section below)
 conda create -n vidfm3d python=3.11 cmake=3.14.0 -y
 conda activate vidfm3d
-conda install pytorch torchvision torchaudio pytorch-cuda=12.4 \
-    nvidia/label/cuda-12.4.0::cuda-toolkit -c pytorch -c nvidia
+conda install pytorch torchvision torchaudio pytorch-cuda=12.4 nvidia/label/cuda-12.4.0::cuda-toolkit -c pytorch -c nvidia
 pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
 pip install -r requirements.txt
 pip install -e .
 
-# 3. Download InsScene-15K data
-python data/download_inscene15k.py --step all --base-dir /data/InsScene-15K
+# 3. Keep code and data separate
+export PROJECT_ROOT=$PWD
+export DATASET_ROOT=/data/probe_spatial_data/InsScene-15K
+mkdir -p ${DATASET_ROOT}
 
-# 4. Extract VFM features (one VFM shown; repeat for cogvideox / vjepa2)
-INSCENE_DATA=/data/InsScene-15K
+# 4. Download InsScene-15K data outside the git checkout
+python data/download_inscene15k.py --step all --base-dir ${DATASET_ROOT}
+
+# 5. Extract VFM features outside the git checkout
+# One VFM shown; repeat for cogvideox / vjepa2.
+INSCENE_DATA=${DATASET_ROOT}
 python -m features.run_inscene15k --vfm wan \
     --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT \
@@ -56,31 +61,44 @@ python -m features.run_inscene15k --vfm wan --mode target_isolated \
     --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_TARGET \
     --t 749 --output-layers 20 --num-targets 0
+python -m features.run_inscene15k --vfm wan --mode streaming_prefix \
+    --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_STREAMING \
+    --t 749 --output-layers 20 --prefix-lengths "4,8,16,32,64" \
+    --prefix-max-len 64
 
 # Layer sweeps: pass multiple layers, then train with feature_layer=<L>.
 # Current defaults are Wan/CogVideoX layer20 at t=749, V-JEPA2 layer23,
 # and MLLM/VLM layer -1 caches.
+export INSCENE_DATA_ROOT=${INSCENE_DATA}/data
+export INSCENE_FEAT_ROOT=${INSCENE_DATA}/FEAT
+export INSCENE_SHUFFLED_FEAT_ROOT=${INSCENE_DATA}/FEAT_SHUFFLED
+export INSCENE_CONTEXT_FEAT_ROOT=${INSCENE_DATA}/FEAT_CONTEXT
+export INSCENE_TARGET_FEAT_ROOT=${INSCENE_DATA}/FEAT_TARGET
+export INSCENE_STREAMING_FEAT_ROOT=${INSCENE_DATA}/FEAT_STREAMING
 
-# 5. Train diagnostic probes for Wan on GPU 0
+# 6. Train diagnostic probes for Wan on GPU 0
 bash scripts/run_diag_sweep.sh wan 0
 VFMS="wan" bash scripts/run_diag_new_sweep.sh
 
-# 6. Test & evaluate
+# 7. Test & evaluate
 bash scripts/run_diag_eval_sweep.sh   # writes comparison_val.csv
 ```
 
-> **Note**: feature paths are hardcoded in `configs/experiment/inscene15k_ext/*.yaml`.
-> Update the `root_vfm`, `context_feat_root`, `target_feat_root`, and `shuffled_feat_root` fields to match
-> your actual data location before training, or pass overrides via Hydra:
+> **Note**: current configs resolve dataset/cache roots from environment
+> variables first. Set the relevant roots before launching jobs, or pass Hydra
+> overrides explicitly:
 > ```bash
 > python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
+>     root_vfm=/data/InsScene-15K/FEAT \
 >     context_feat_root=/data/InsScene-15K/FEAT_CONTEXT \
 >     target_feat_root=/data/InsScene-15K/FEAT_TARGET
 > ```
 
 On a shared cluster, the dataset also honors `INSCENE_DATA_ROOT`,
 `INSCENE_FEAT_ROOT`, `INSCENE_CONTEXT_FEAT_ROOT`, `INSCENE_TARGET_FEAT_ROOT`,
-and `INSCENE_SHUFFLED_FEAT_ROOT`; these take precedence over legacy YAML paths.
+`INSCENE_STREAMING_FEAT_ROOT`, and `INSCENE_SHUFFLED_FEAT_ROOT`; these take
+precedence over YAML paths.
 See `EXPERIMENT_PROTOCOL.md` and `TRAINING_LOGIC_AUDIT.md` for the current
 causal-cache protocol and task-by-task input contracts.
 > See `PROBE_SPATIAL_GUIDE.md` §8.1.1 for layer-wise extraction, probing, and
@@ -92,6 +110,108 @@ causal-cache protocol and task-by-task input contracts.
 > ```
 
 ---
+
+## New Server Layout: Code/Data Separation
+
+Use the git checkout only for source code, configs, scripts, docs, and small
+CSV summaries. Put raw data, extracted features, packaged archives, and large
+intermediate files under a separate storage root:
+
+```bash
+export PROJECT_ROOT=/workspace/probe_spatial
+export DATASET_ROOT=/data/probe_spatial_data/InsScene-15K
+
+git clone git@github.com:yyyybq/probe_spatial.git ${PROJECT_ROOT}
+cd ${PROJECT_ROOT}
+mkdir -p ${DATASET_ROOT}
+
+export INSCENE_DATA_ROOT=${DATASET_ROOT}/data
+export INSCENE_FEAT_ROOT=${DATASET_ROOT}/FEAT
+export INSCENE_SHUFFLED_FEAT_ROOT=${DATASET_ROOT}/FEAT_SHUFFLED
+export INSCENE_CONTEXT_FEAT_ROOT=${DATASET_ROOT}/FEAT_CONTEXT
+export INSCENE_TARGET_FEAT_ROOT=${DATASET_ROOT}/FEAT_TARGET
+export INSCENE_STREAMING_FEAT_ROOT=${DATASET_ROOT}/FEAT_STREAMING
+```
+
+Do not place `InsScene-15K/`, `FEAT*/`, `.sft`, checkpoint, or archive files
+inside the repository. The `.gitignore` has guards for common mistakes, but the
+clean layout above is the main protection.
+
+To update code without touching data:
+
+```bash
+cd ${PROJECT_ROOT}
+git pull --ff-only origin main
+source /path/to/conda.sh
+conda activate vidfm3d
+```
+
+To extract all feature caches first and then run many probing experiments:
+
+```bash
+cd ${PROJECT_ROOT}
+export DATASET_ROOT=/data/probe_spatial_data/InsScene-15K
+export INSCENE_DATA_ROOT=${DATASET_ROOT}/data
+export INSCENE_FEAT_ROOT=${DATASET_ROOT}/FEAT
+export INSCENE_SHUFFLED_FEAT_ROOT=${DATASET_ROOT}/FEAT_SHUFFLED
+export INSCENE_CONTEXT_FEAT_ROOT=${DATASET_ROOT}/FEAT_CONTEXT
+export INSCENE_TARGET_FEAT_ROOT=${DATASET_ROOT}/FEAT_TARGET
+export INSCENE_STREAMING_FEAT_ROOT=${DATASET_ROOT}/FEAT_STREAMING
+
+python data/download_inscene15k.py --step all --base-dir ${DATASET_ROOT}
+
+VFM=wan
+MODEL_ID=Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --data-root ${INSCENE_DATA_ROOT} --out-root ${INSCENE_FEAT_ROOT} \
+    --t 749 --output-layers 20
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --mode shuffled --data-root ${INSCENE_DATA_ROOT} \
+    --out-root ${INSCENE_SHUFFLED_FEAT_ROOT} --t 749 --output-layers 20
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --mode context_segment --data-root ${INSCENE_DATA_ROOT} \
+    --out-root ${INSCENE_CONTEXT_FEAT_ROOT} --t 749 --output-layers 20 \
+    --context-len 76
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --mode target_isolated --data-root ${INSCENE_DATA_ROOT} \
+    --out-root ${INSCENE_TARGET_FEAT_ROOT} --t 749 --output-layers 20 \
+    --num-targets 0
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --mode streaming_prefix --data-root ${INSCENE_DATA_ROOT} \
+    --out-root ${INSCENE_STREAMING_FEAT_ROOT} --t 749 --output-layers 20 \
+    --prefix-lengths "4,8,16,32,64" --prefix-max-len 64
+```
+
+After extraction, train from the fixed feature dataset:
+
+```bash
+cd ${PROJECT_ROOT}
+VFMS="wan" bash scripts/run_diag_new_sweep.sh
+
+PROBES="streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual" \
+PREFIX_LENGTHS="4 8 16 32 64" LAYERS="default" \
+EXTRACT_STREAMING=0 EXTRACT_TARGETS=0 \
+    bash scripts/run_streaming_probe_sweep.sh
+```
+
+Package extracted features as a Hugging Face dataset bundle:
+
+```bash
+cd ${PROJECT_ROOT}
+DATASET_ROOT=/data/probe_spatial_data/InsScene-15K VFM=wan \
+    bash scripts/package_inscene_feature_dataset.sh
+
+export HF_REPO_ID=your-org/inscene15k-wan-probe-spatial-features
+python -m pip install -U huggingface_hub
+huggingface-cli login
+huggingface-cli repo create ${HF_REPO_ID} --type dataset --private
+huggingface-cli upload --repo-type dataset ${HF_REPO_ID} \
+    /data/probe_spatial_data/InsScene-15K/feature_dataset_bundle/<bundle-name> .
+```
+
+When downloading that feature dataset on another machine, extract the archives
+back under `DATASET_ROOT`, then `source env.sh` from the bundle or export the
+same `INSCENE_*_ROOT` variables manually.
 
 ## Installation
 
@@ -154,6 +274,7 @@ Expected structure after extraction:
   FEAT/                       # filled by feature extraction (step 4)
   FEAT_SHUFFLED/              # filled by feature extraction --mode shuffled (A3)
   FEAT_CONTEXT/               # filled by feature extraction --mode context_segment (C1/C2/C3 inputs)
+  FEAT_STREAMING/             # filled by feature extraction --mode streaming_prefix (streaming A/B/C)
   FEAT_TARGET/                # filled by feature extraction --mode target_isolated (C1/C2/C3 targets)
 ```
 
@@ -171,9 +292,10 @@ Features are pre-extracted once and cached as `.sft` files. The extractor is res
 
 | Mode | Output dir | Used by |
 |------|-----------|---------|
-| `normal` (default) | `FEAT/` | A1, A2, B1/B2, non-causal/full-clip inputs |
+| `normal` (default) | `FEAT/` | Non-streaming A1/A2/B1/B2 and A3 normal branch |
 | `shuffled` | `FEAT_SHUFFLED/` | A3 (temporally shuffled clips) |
 | `context_segment` | `FEAT_CONTEXT/` | C1/C2/C3 causal inputs, with no future target frames in the VFM forward |
+| `streaming_prefix` | `FEAT_STREAMING/` | Streaming A1/A2/B1/B2/C1/C2/C3 inputs at selected prefix lengths |
 | `target_isolated` | `FEAT_TARGET/` | C1/C2/C3 isolated target features, with exact frame ids |
 
 ```bash
@@ -198,6 +320,13 @@ python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_CONTEXT \
     --t 749 --output-layers 20 --context-len 76
 
+# Streaming-prefix features (shared by streaming A1/A2/B1/B2/C1/C2/C3)
+python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
+    --mode streaming_prefix \
+    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_STREAMING \
+    --t 749 --output-layers 20 --prefix-lengths "4,8,16,32,64" \
+    --prefix-max-len 64
+
 # Target-isolated features (C1/C2/C3 targets)
 python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
     --mode target_isolated \
@@ -210,6 +339,38 @@ targets. Input features come from causal `context_segment` forwards ending at
 the last observed frame; target supervision comes from exact `target_isolated`
 rows. This prevents future-frame leakage through clip-contextualized VFM
 features.
+
+Streaming C1/C2/C3 use the same anti-leakage rule with a different input cache:
+the observed history is a `streaming_prefix` forward `[I_0..I_t]`, each action
+is encoded relative to the current prefix tail `I_t`, and future targets still
+come from exact `target_isolated` rows. The prefix tail is only the reference
+frame for the action vector; it is not an extra condition. Training sweeps one
+fixed `prefix_len` per job, usually `4,8,16,32,64`, so batches remain
+fixed-shape while the experiment measures how performance changes as online
+history grows.
+
+Streaming C-series data flow:
+
+```text
+video frames:        I_0  I_1  ...  I_t  |  I_{t+h1}  I_{t+h2}  ...
+                     \______________/       \_______/  \_______/
+                         past only            target    target
+
+input feature:       VFM([I_0, ..., I_t])
+                     -> FEAT_STREAMING/prefix_t/...sft
+
+action condition:    relative camera motion from I_t to I_{t+h}
+
+target feature:      VFM([I_{t+h}])
+                     -> FEAT_TARGET/frame_{t+h}/...sft
+
+probe training:      probe(input_feature, action) predicts target_feature
+```
+
+So yes: in C1/C2/C3 streaming experiments, the input video contains only past
+observed frames. The future target frame is extracted separately as an isolated
+single-frame feature, and never appears in the VFM forward that produced the
+input feature.
 
 Switch `--vfm cogvideox --model-id THUDM/CogVideoX-5b-I2V` or
 `--vfm vjepa2` (uses `features/vjepa2/vjepa2_feature.py`) for other VFMs.
@@ -297,6 +458,21 @@ VFMS="wan vjepa2 cogvideox" bash scripts/run_diag_new_sweep.sh
 # Parallel across GPUs
 PYTHON=/path/to/python GPUS="0 1 2 3 4 5" bash scripts/run_diag_new_parallel.sh
 ```
+
+**Train the shared streaming-prefix sweep:**
+```bash
+INSCENE_STREAMING_FEAT_ROOT=/data/InsScene-15K/FEAT_STREAMING \
+INSCENE_TARGET_FEAT_ROOT=/data/InsScene-15K/FEAT_TARGET \
+PROBES="streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual" \
+PREFIX_LENGTHS="4 8 16 32 64" LAYERS="default" \
+    bash scripts/run_streaming_probe_sweep.sh
+```
+
+`scripts/run_streaming_probe_sweep.sh` first extracts one shared
+`streaming_prefix` cache for the requested prefix lengths, then trains one run
+per `(probe, prefix_len, layer)`. C probes additionally require
+`target_isolated` caches; by default the script extracts every target frame
+with `--num-targets 0`.
 
 **Train a single probe:**
 ```bash
@@ -410,11 +586,11 @@ Results summary (InsScene-15K val, 953 samples):
 |-------|--------|----------|-----------|------|
 | A2 overlap_acc↑ | 85.6% | 78.7% | 85.2% | trivial baseline=84.3% |
 | A3 pair_acc↑ | 86.3% | 16.5% | pending re-eval | Wan numbers after dtype/seed fixes |
-| B1 az_err↓ | legacy | legacy | legacy | pre no-pose task definition; rerun required |
-| B1 el_err↓ | legacy | legacy | legacy | pre no-pose task definition; rerun required |
-| C1 R@1↑ | legacy | legacy | legacy | pre exact-target/global-retrieval fix; rerun required |
-| C2 global_R@1↑ | pending | pending | pending | rerun with context_segment + target_isolated caches |
-| C3 intervention_validity↑ | pending | pending | pending | rerun with context_segment + target_isolated caches |
+| B1 az_err↓ | legacy | legacy | legacy | pre no-pose/final-global/streaming task definition; rerun required |
+| B1 el_err↓ | legacy | legacy | legacy | pre no-pose/final-global/streaming task definition; rerun required |
+| C1 R@1↑ | legacy | legacy | legacy | pre exact-target/global-retrieval/streaming fix; rerun required |
+| C2 global_R@1↑ | pending | pending | pending | rerun with context_segment+target_isolated and streaming_prefix variants |
+| C3 intervention_validity↑ | pending | pending | pending | rerun with context_segment+target_isolated and streaming_prefix variants |
 
 ---
 
@@ -431,7 +607,8 @@ probe_spatial/
 │   │   └── probe_ext.yaml           # Diagnostic probes
 │   └── experiment/
 │       ├── inscene15k/              # A1 experiments
-│       └── inscene15k_ext/          # A2/A3/B1/B2/C1/C2/C3 configs
+│       ├── inscene15k_ext/          # Non-streaming A2/A3/B1/B2/C1/C2/C3 configs
+│       └── inscene15k_streaming/    # Shared streaming A1/A2/B1/B2/C1/C2/C3 configs
 ├── features/
 │   ├── run_inscene15k.py            # Feature extractor (normal/shuffled/context/target modes)
 │   ├── wan/                         # Wan feature extraction
@@ -459,6 +636,8 @@ probe_spatial/
 │   ├── run_diag_sweep.sh            # Train A2/A3/B1/C1 for one VFM
 │   ├── run_diag_new_sweep.sh        # Train C2/C3 sequentially
 │   ├── run_diag_new_parallel.sh     # Train C2/C3 in parallel
+│   ├── run_streaming_probe_sweep.sh # Shared streaming-prefix cache/train/eval sweep
+│   ├── package_inscene_feature_dataset.sh # Package external feature caches for HF
 │   └── run_diag_eval_sweep.sh       # Eval all runs, write CSV
 └── eval_pertask_v3.py               # A1 evaluation script
 ```

@@ -5,6 +5,16 @@
 > moving part does, and exactly which command to run to reproduce / extend
 > any result**.
 
+> **Current-status note.** This guide was originally written before B2, C2/C3,
+> and the shared streaming-prefix protocol were added. It remains useful for
+> background and code orientation, but the authoritative current protocol is:
+> `README.md` for commands, `EXPERIMENT_PROTOCOL.md` for frozen experimental
+> decisions, and `TRAINING_LOGIC_AUDIT.md` for the line-by-line training logic.
+> Current code supports A1/A2/B1/B2/C1/C2/C3 streaming with prefix lengths
+> `4,8,16,32,64`; B1/B2 receive no camera pose, B1 uses object masks plus final
+> global feature, B2 uses object query plus prefix patch tokens, and C probes
+> use `streaming_prefix` inputs with exact `target_isolated` future targets.
+
 ---
 
 ## 0. TL;DR

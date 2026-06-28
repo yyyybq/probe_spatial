@@ -141,7 +141,7 @@ class EgoBeliefProbeV2(nn.Module):
     ) -> dict:
         feat = self._patchify(vfm_feat)                       # (B, S, Hp, Wp, C)
         B, S, Hp, Wp, _ = feat.shape
-        if S != self.num_frames:
+        if self.decoder_type != "transformer" and S != self.num_frames:
             raise ValueError(f"Expected {self.num_frames} frames, got {S}")
 
         if self.decoder_type != "transformer":
@@ -150,6 +150,11 @@ class EgoBeliefProbeV2(nn.Module):
             pred = self.flat_readout(flat)
             logits = pred[:, :-1].reshape(B, self.n_az_bins, self.n_el_bins)
             return {"logits": logits, "log_dist": pred[:, -1]}
+        if S > self.frame_embed.shape[1]:
+            raise ValueError(
+                f"Sequence has {S} frames but frame_embed supports "
+                f"{self.frame_embed.shape[1]}; increase max_seq_len for streaming prefixes."
+            )
 
         z = self.feat_proj(feat)                              # (B, S, Hp, Wp, D)
 

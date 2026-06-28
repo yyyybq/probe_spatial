@@ -33,6 +33,14 @@ vidfm3d/vggt/tmp**
 # Data
 vidfm3d/data/DL3DV
 vidfm3d/data/CO3D
+InsScene-15K/
+data_local/
+features_local/
+feature_dataset_bundle/
+*.sft
+*.safetensors
+*.tar.gz
+*.tar.zst
 
 # Certificates
 certificate.pem

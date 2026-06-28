@@ -105,7 +105,7 @@ class EgoBeliefProbe(nn.Module):
         obj_mask_feat: torch.Tensor,    # (B, S, H_f, W_f) bool
     ) -> torch.Tensor:
         B, S = vfm_feat.shape[:2]
-        if S != self.num_frames:
+        if self.decoder_type != "transformer" and S != self.num_frames:
             raise ValueError(f"Expected {self.num_frames} frames, got {S}")
 
         per_frame = self._mask_pool(vfm_feat, obj_mask_feat)   # (B, S, C)
@@ -118,6 +118,13 @@ class EgoBeliefProbe(nn.Module):
             parts.append(visible.float())
             flat = torch.cat(parts, dim=-1)
             return self.flat_readout(flat)
+        max_tokens = self.pos_embed.shape[1]
+        needed_tokens = S + 1 + (1 if self.use_final_global_feature else 0)
+        if needed_tokens > max_tokens:
+            raise ValueError(
+                f"Sequence needs {needed_tokens} tokens but pos_embed supports "
+                f"{max_tokens}; increase max_seq_len for streaming prefixes."
+            )
 
         z = self.feat_proj(per_frame)                          # (B, S, D)
 

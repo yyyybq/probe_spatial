@@ -37,6 +37,18 @@ def test_b1_supports_linear_mlp_and_transformer_decoders():
             assert isinstance(probe.flat_readout, torch.nn.Linear)
 
 
+def test_b1_transformer_accepts_streaming_variable_lengths():
+    probe = EgoBeliefProbe(
+        in_channels=8, hidden_dim=16, num_layers=1, num_heads=4,
+        decoder_type="transformer", num_frames=4, max_seq_len=64,
+    )
+    for length in (4, 8, 16):
+        feat = torch.randn(2, length, 3, 5, 8)
+        object_mask = torch.zeros(2, length, 3, 5, dtype=torch.bool)
+        object_mask[:, :-1, 1, 2] = True
+        assert probe(feat, object_mask).shape == (2, 3)
+
+
 def test_b1_ignores_frames_where_conditioned_object_is_hidden():
     probe = EgoBeliefProbe(in_channels=8, hidden_dim=16, num_layers=1, num_heads=4)
     feat = torch.randn(1, 4, 3, 5, 8)
@@ -91,6 +103,18 @@ def test_b2_supports_linear_mlp_and_transformer_decoders():
         assert out["log_dist"].shape == (2,)
         if decoder_type == "linear":
             assert isinstance(probe.flat_readout, torch.nn.Linear)
+
+
+def test_b2_transformer_accepts_streaming_variable_lengths():
+    probe = EgoBeliefProbeV2(
+        in_channels=8, hidden_dim=16, num_layers=1, num_heads=4,
+        decoder_type="transformer", num_frames=4, max_seq_len=64,
+        max_h=4, max_w=6, n_az_bins=4, n_el_bins=2,
+    )
+    for length in (4, 8, 16):
+        out = probe(torch.randn(2, length, 3, 5, 8), torch.randn(2, 8))
+        assert out["logits"].shape == (2, 4, 2)
+        assert out["log_dist"].shape == (2,)
 
 
 def test_b1_summary_wraps_azimuth():
