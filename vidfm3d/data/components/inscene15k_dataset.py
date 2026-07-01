@@ -105,6 +105,10 @@ class InsScene15KDataset(EasyDataset):
         # ---------- Spatial Diagnostic Suite toggles ----------
         diag_overlap: bool = False,        # A2: compute (S,S) overlap matrix
         diag_hidden_obj: bool = False,     # B1: pick hidden object + polar target
+        hidden_obj_min_visible_pixels: int = 200,
+        streaming_shared_hidden_obj: bool = False,
+        streaming_hidden_seed_prefix_len: int = 4,
+        streaming_hidden_prefix_lengths: list = None,
         diag_action: bool = False,         # C1: load target_feat + emit action
         diag_abnormal: bool = False,       # A3: load shuffled vfm features
         diag_path_integration: bool = False,  # C2: recurrent multi-action feature prediction
@@ -184,9 +188,19 @@ class InsScene15KDataset(EasyDataset):
         self._streaming_prefix_meta_cache = {}
         self._context_segment_meta_cache = {}
         self._target_index_cache = {}
+        self._streaming_hidden_obj_cache = {}
         # Diagnostic suite flags
         self.diag_overlap = diag_overlap
         self.diag_hidden_obj = diag_hidden_obj
+        self.hidden_obj_min_visible_pixels = int(hidden_obj_min_visible_pixels)
+        self.streaming_shared_hidden_obj = bool(streaming_shared_hidden_obj)
+        self.streaming_hidden_seed_prefix_len = int(streaming_hidden_seed_prefix_len)
+        if isinstance(streaming_hidden_prefix_lengths, str):
+            streaming_hidden_prefix_lengths = streaming_hidden_prefix_lengths.replace(",", " ").split()
+        self.streaming_hidden_prefix_lengths = (
+            sorted({int(v) for v in streaming_hidden_prefix_lengths if int(v) > 0})
+            if streaming_hidden_prefix_lengths is not None else None
+        )
         self.diag_action = diag_action
         self.diag_abnormal = diag_abnormal
         self.diag_path_integration = diag_path_integration
@@ -263,8 +277,14 @@ class InsScene15KDataset(EasyDataset):
         """Expand each scene into online prefix samples H_t = [I_0, ..., I_t]."""
         expanded = []
         max_future = max(self._streaming_future_horizons(default=[]), default=0)
+        required_hidden_len = (
+            max(self._streaming_hidden_prefix_lengths())
+            if self._use_shared_streaming_hidden_obj() else 0
+        )
         for scene in self.scenes:
             nf = int(scene["num_frames"])
+            if required_hidden_len and nf < required_hidden_len:
+                continue
             max_len = nf - max_future
             if self.prefix_max_len is not None:
                 max_len = min(max_len, self.prefix_max_len)
@@ -290,6 +310,33 @@ class InsScene15KDataset(EasyDataset):
             f"max_future={max_future})"
         )
         self.scenes = expanded
+
+    def _use_shared_streaming_hidden_obj(self):
+        return bool(
+            self.streaming_prefix
+            and self.diag_hidden_obj
+            and self.streaming_shared_hidden_obj
+        )
+
+    def _streaming_hidden_prefix_lengths(self):
+        if self.streaming_hidden_prefix_lengths:
+            return list(self.streaming_hidden_prefix_lengths)
+        if self.prefix_lengths:
+            return list(self.prefix_lengths)
+        if self.prefix_max_len is not None:
+            return [int(self.prefix_max_len)]
+        return [int(self.prefix_min_len)]
+
+    def _streaming_hidden_seed_visible_indices(self):
+        # For seed_prefix_len=4, the object must be visible in frames [0,1,2]
+        # and hidden at frame 3.
+        seed_len = max(int(self.streaming_hidden_seed_prefix_len), 2)
+        return list(range(seed_len - 1))
+
+    def _streaming_hidden_tail_indices(self):
+        tails = {max(int(length) - 1, 0) for length in self._streaming_hidden_prefix_lengths()}
+        tails.add(max(int(self.streaming_hidden_seed_prefix_len) - 1, 0))
+        return sorted(tails)
 
     def _streaming_future_horizons(self, default=None):
         """Future frame offsets predicted from the current streaming tail."""
@@ -595,6 +642,39 @@ class InsScene15KDataset(EasyDataset):
             torch.stack(extrinsics),  # (S, 3, 4)
         )
 
+    def _load_identity_masks_scene(self, scene_info, sel_indices):
+        """Load only raw instance masks for the requested frame indices."""
+        masks = []
+        if scene_info["source"] == "infinigen":
+            frames_dir = os.path.join(scene_info["scene_dir"], "frames")
+            img_dir = os.path.join(frames_dir, "Image", "camera_0")
+            mask_dir = os.path.join(frames_dir, "ObjectSegmentation", "camera_0")
+            img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".png")])
+            for idx in sel_indices:
+                idx = min(int(idx.item()), len(img_files) - 1)
+                img_name = img_files[idx]
+                frame_id = img_name.replace("Image_", "").replace(".png", "")
+                mask_path = os.path.join(mask_dir, f"ObjectSegmentation_{frame_id}.npy")
+                if os.path.exists(mask_path):
+                    mask = np.load(mask_path).astype(np.int64)
+                else:
+                    with Image.open(os.path.join(img_dir, img_name)) as img:
+                        w, h = img.size
+                    mask = np.zeros((h, w), dtype=np.int64)
+                masks.append(torch.from_numpy(mask).long())
+        elif scene_info["source"] == "scannetpp":
+            scene_dir = scene_info["scene_dir"]
+            mask_dir = os.path.join(scene_dir, "refined_ins_ids")
+            valid_frames = scene_info["valid_frames"]
+            for idx in sel_indices:
+                idx = min(int(idx.item()), len(valid_frames) - 1)
+                frame_name = valid_frames[idx]
+                mask_path = os.path.join(mask_dir, f"{frame_name}.npy")
+                masks.append(torch.from_numpy(np.load(mask_path).astype(np.int64)).long())
+        else:
+            raise ValueError(f"Unknown source: {scene_info['source']}")
+        return torch.stack(masks)
+
     def _load_camera_depth_scene(self, scene_info, sel_indices):
         """Load only depth, intrinsics, and extrinsics for feature-only probes."""
         depthmaps = []
@@ -720,6 +800,18 @@ class InsScene15KDataset(EasyDataset):
         intrinsics[:, 1, 2] *= scale_h  # cy
 
         return images, masks, depthmaps, intrinsics
+
+    def _resize_masks_to_target(self, masks):
+        """Resize raw instance masks to the dataset target resolution."""
+        return (
+            F.interpolate(
+                masks.unsqueeze(1).float(),
+                size=(self.target_h, self.target_w),
+                mode="nearest",
+            )
+            .squeeze(1)
+            .long()
+        )
 
     def _remap_identity_ids(self, masks):
         """Remap identity IDs to contiguous range [0, N) and cap at max_identity_classes."""
@@ -882,6 +974,36 @@ class InsScene15KDataset(EasyDataset):
         indices = torch.from_numpy(np.load(path)).long() if os.path.exists(path) else None
         self._target_index_cache[cache_key] = indices
         return indices
+
+    def _shared_streaming_hidden_obj_id(self, scene_info):
+        """Return the scene-level object id shared by all B streaming prefixes."""
+        lengths = tuple(self._streaming_hidden_prefix_lengths())
+        seed_len = int(self.streaming_hidden_seed_prefix_len)
+        key = (
+            scene_info["source"],
+            scene_info["scene_dir"],
+            lengths,
+            seed_len,
+            self.hidden_obj_min_visible_pixels,
+        )
+        if key in self._streaming_hidden_obj_cache:
+            cached = self._streaming_hidden_obj_cache[key]
+            return None if cached is None else int(cached)
+
+        from vidfm3d.utils.spatial_diag import select_streaming_hidden_object_id
+
+        required_len = max(max(lengths), seed_len)
+        sel = torch.arange(required_len, dtype=torch.long)
+        masks = self._load_identity_masks_scene(scene_info, sel)
+        masks = self._resize_masks_to_target(masks)
+        obj_id = select_streaming_hidden_object_id(
+            masks,
+            seed_visible_indices=self._streaming_hidden_seed_visible_indices(),
+            hidden_tail_indices=self._streaming_hidden_tail_indices(),
+            min_visible_pixels=self.hidden_obj_min_visible_pixels,
+        )
+        self._streaming_hidden_obj_cache[key] = obj_id
+        return None if obj_id is None else int(obj_id)
 
     def _load_target_feat(self, scene_info, target_global_idx, num_frames):
         """Load an isolated feature for one exact frame.
@@ -1494,6 +1616,10 @@ class InsScene15KDataset(EasyDataset):
         else:
             depthmaps = depthmaps_hw1.squeeze(-1)  # (S, H, W)
 
+        # Keep raw ids for streaming B shared-object selection. Remapped ids are
+        # still used by the normal pixel/identity outputs.
+        raw_identity_ids = masks.clone()
+
         # Remap identity IDs
         masks = self._remap_identity_ids(masks)
 
@@ -1606,6 +1732,7 @@ class InsScene15KDataset(EasyDataset):
             from vidfm3d.utils.spatial_diag import (
                 compute_overlap_ratio,
                 compute_hidden_object_target,
+                compute_object_target_for_id,
                 encode_relative_pose,
             )
 
@@ -1618,13 +1745,27 @@ class InsScene15KDataset(EasyDataset):
 
         if self.diag_hidden_obj:
             assert pointmaps_scaled is not None, "diag_hidden_obj requires include_pmaps=True"
-            target = compute_hidden_object_target(
-                identity_ids=masks,
-                pmaps_world=pointmaps_scaled,
-                confmaps=confmaps,
-                extrinsics=extrinsics,
-                last_frame_idx=-1,
-            )
+            if self._use_shared_streaming_hidden_obj():
+                obj_id = self._shared_streaming_hidden_obj_id(scene_info)
+                target = None if obj_id is None else compute_object_target_for_id(
+                    obj_id=obj_id,
+                    identity_ids=raw_identity_ids,
+                    pmaps_world=pointmaps_scaled,
+                    confmaps=confmaps,
+                    extrinsics=extrinsics,
+                    min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    last_frame_idx=-1,
+                    require_hidden=True,
+                )
+            else:
+                target = compute_hidden_object_target(
+                    identity_ids=masks,
+                    pmaps_world=pointmaps_scaled,
+                    confmaps=confmaps,
+                    extrinsics=extrinsics,
+                    min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    last_frame_idx=-1,
+                )
             S, H, W = masks.shape
             # ------------------------------------------------------------------ B2 query token
             # For B2 we emit a 1D appearance signature of the chosen object,

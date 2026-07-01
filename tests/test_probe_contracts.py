@@ -11,6 +11,10 @@ from vidfm3d.models.components.probe_ego_belief import EgoBeliefProbe
 from vidfm3d.models.components.probe_ego_belief_v2 import EgoBeliefProbeV2
 from vidfm3d.data.components.inscene15k_dataset import InsScene15KDataset
 from vidfm3d.train import _guard_probe_world_size
+from vidfm3d.utils.spatial_diag import (
+    compute_object_target_for_id,
+    select_streaming_hidden_object_id,
+)
 from omegaconf import OmegaConf
 
 
@@ -77,6 +81,51 @@ def test_b1_final_global_feature_is_an_input():
     out1 = probe(feat, object_mask)
     assert out0[0, 0] == 0
     assert out1[0, 0] == 3
+
+
+def test_streaming_b_shared_object_is_selected_from_first_prefix():
+    masks = torch.zeros(64, 4, 4, dtype=torch.long)
+    # Object 1 is visible in the seed prefix and hidden at all streaming tails.
+    masks[0, :3, :3] = 1
+    # Object 2 appears only after prefix=4; it must not be selected.
+    masks[4, :, :] = 2
+    # Object 3 is visible early but not hidden at prefix tail 7.
+    masks[1, :, :] = 3
+    masks[7, :, :] = 3
+
+    obj_id = select_streaming_hidden_object_id(
+        masks,
+        seed_visible_indices=[0, 1, 2],
+        hidden_tail_indices=[3, 7, 15, 31, 63],
+        min_visible_pixels=4,
+    )
+    assert obj_id == 1
+
+
+def test_streaming_b_fixed_object_target_uses_current_prefix_only():
+    masks = torch.zeros(8, 2, 2, dtype=torch.long)
+    masks[0, :, :] = 5
+    masks[4, :, :] = 5
+    pmaps = torch.zeros(8, 2, 2, 3)
+    pmaps[..., 2] = 2.0
+    conf = torch.ones(8, 2, 2)
+    extr = torch.eye(4)[:3].repeat(8, 1, 1)
+
+    target = compute_object_target_for_id(
+        obj_id=5,
+        identity_ids=masks,
+        pmaps_world=pmaps,
+        confmaps=conf,
+        extrinsics=extr,
+        min_visible_pixels=4,
+        last_frame_idx=-1,
+        require_hidden=True,
+    )
+    assert target is not None
+    assert target["per_frame_mask"].shape[0] == 8
+    assert target["per_frame_mask"][0].all()
+    assert target["per_frame_mask"][4].all()
+    assert not target["per_frame_mask"][-1].any()
 
 
 def test_b2_has_object_query_without_current_role_embedding():

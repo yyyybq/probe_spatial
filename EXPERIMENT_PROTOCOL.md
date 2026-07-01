@@ -17,6 +17,12 @@
 - B1/B2 GT is expressed in the final observation's camera coordinate system.
   In streaming runs, "final observation" means the last frame of the selected
   prefix.
+- Streaming B1/B2 reuse one object id across the whole prefix sweep. The object
+  is selected from the first four-frame prefix: it must be visible in one of
+  frames `0,1,2`, hidden at frame `3`, and hidden at every compared prefix tail
+  such as `7,15,31,63`. Each prefix sample returns only that object's masks
+  inside the current prefix and expresses the target in the current prefix-tail
+  camera frame.
 - C1/C2/C3 target features must come from exact `target_isolated` rows. Their
   non-streaming inputs come from causal `context_segment` forwards; their
   streaming inputs come from independently forwarded `streaming_prefix` caches.

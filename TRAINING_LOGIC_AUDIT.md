@@ -104,18 +104,23 @@ shared streaming interface:
 3. Streaming A1/A2/B1/B2 configs set `streaming_prefix=True` and
    `prefix_min_len=prefix_max_len=prefix_len`; the dataset therefore returns
    exactly the selected prefix.
-4. Streaming B1/B2 geometry is rebased with `ref_idx=len(prefix)-1`, and
-   `compute_hidden_object_target(..., last_frame_idx=-1)` expresses the target
-   in the prefix-final camera coordinates.
-5. Streaming B1 receives per-frame object masks plus the global pooled final
+4. Streaming B1/B2 use `streaming_shared_hidden_obj=True`: the object id is
+   selected once per scene from the first four-frame prefix. It must be visible
+   in frames `[0,1,2]`, hidden at frame `3`, and hidden at every configured
+   prefix tail such as `[7,15,31,63]`. Prefix jobs then reuse that raw object id.
+5. Streaming B1/B2 geometry is rebased with `ref_idx=len(prefix)-1`, and
+   `compute_object_target_for_id(..., last_frame_idx=-1)` expresses the shared
+   object's target in the current prefix-final camera coordinates. Only masks
+   inside the current prefix are returned.
+6. Streaming B1 receives per-frame object masks plus the global pooled final
    prefix frame. No camera pose is supplied.
-6. Streaming B2 receives one object query plus all patch tokens from the prefix.
+7. Streaming B2 receives one object query plus all patch tokens from the prefix.
    No camera pose and no explicit current-frame role token are supplied.
-7. Streaming C1/C2/C3 go through `_getitem_feature_action_diag`: input features
+8. Streaming C1/C2/C3 go through `_getitem_feature_action_diag`: input features
    are loaded from the prefix cache; target features are loaded from
    `target_isolated`; actions are encoded from the prefix tail to each future
    target frame.
-8. Non-streaming C1 still uses `context_segment` for input and
+9. Non-streaming C1 still uses `context_segment` for input and
    `target_isolated` for target. Non-streaming C2/C3 use the same fast path but
    load `context_segment` inputs ending at their action-reference frame.
 
@@ -147,6 +152,11 @@ shared streaming interface:
 - Candidate object: >=200 valid pixels in at least one past frame and <200 in
   the final frame. Selection favors the most qualifying past frames, then pixel
   count. Samples without a candidate are invalid.
+- In streaming configs, the candidate is not reselected per prefix. One raw
+  object id is selected from prefix `4`: visible in frames `[0,1,2]`, hidden at
+  frame `3`, and hidden at every configured prefix tail. The same object id is
+  reused for prefix `4,8,16,32,64`; the target reference camera still changes
+  with the current prefix tail.
 - Condition: GT object masks in qualifying past frames plus one global-pooled
   final-frame feature. Invisible object frames contribute no object token and no
   per-frame global substitute.

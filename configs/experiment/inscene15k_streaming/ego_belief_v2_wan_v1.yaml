@@ -21,14 +21,16 @@ feature_timestep: 749
 vfm_name: wan
 video_channels: 1536
 prefix_len: 4
+streaming_hidden_seed_prefix_len: 4
+streaming_hidden_prefix_lengths: [4, 8, 16, 32, 64]
 streaming_feat_root: ${oc.env:INSCENE_STREAMING_FEAT_ROOT}
 
 data:
   data_module:
     train_datasets:
-    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='train', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True)
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='train', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True, streaming_shared_hidden_obj=True, streaming_hidden_seed_prefix_len=${streaming_hidden_seed_prefix_len}, streaming_hidden_prefix_lengths=${streaming_hidden_prefix_lengths})
     validation_datasets:
-    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='val', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True)
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='val', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True, streaming_shared_hidden_obj=True, streaming_hidden_seed_prefix_len=${streaming_hidden_seed_prefix_len}, streaming_hidden_prefix_lengths=${streaming_hidden_prefix_lengths})
     batch_size_per_device: 1
     batch_size_per_device_val: 1
     num_workers: 8

@@ -372,6 +372,15 @@ observed frames. The future target frame is extracted separately as an isolated
 single-frame feature, and never appears in the VFM forward that produced the
 input feature.
 
+Streaming B1/B2 use the same prefix lengths but fix the object identity across
+the sweep. The selected object must be visible in one of frames `[0,1,2]`,
+hidden at frame `3`, and hidden at every compared prefix tail, e.g.
+`[7,15,31,63]` for prefix lengths `4,8,16,32,64`. Each prefix job reuses that
+same raw object id, returns only its masks within the current prefix, and
+expresses the target in the current prefix-tail camera frame. This makes the
+B streaming curve test "more observed history for the same object" rather than
+"a different best hidden object at each prefix length."
+
 Switch `--vfm cogvideox --model-id THUDM/CogVideoX-5b-I2V` or
 `--vfm vjepa2` (uses `features/vjepa2/vjepa2_feature.py`) for other VFMs.
 

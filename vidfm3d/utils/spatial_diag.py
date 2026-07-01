@@ -122,9 +122,7 @@ def compute_hidden_object_target(
                         for masked feature pooling.
         obj_id:       scalar long
     """
-    S, H, W = identity_ids.shape
-    device = identity_ids.device
-    dtype = pmaps_world.dtype
+    S, _H, _W = identity_ids.shape
 
     # Per-frame valid pixel count per object id
     valid_pix = (confmaps > 0)
@@ -170,18 +168,112 @@ def compute_hidden_object_target(
     candidates.sort(reverse=True)
     chosen_id = candidates[0][1]
 
-    centroid_world, _ = _world_centroid_of_object(
-        chosen_id, identity_ids, pmaps_world, confmaps
+    return compute_object_target_for_id(
+        obj_id=chosen_id,
+        identity_ids=identity_ids,
+        pmaps_world=pmaps_world,
+        confmaps=confmaps,
+        extrinsics=extrinsics,
+        min_visible_pixels=min_visible_pixels,
+        last_frame_idx=last_frame_idx,
+        require_hidden=True,
     )
 
-    # Build per-frame mask (only on past frames where the object is visible)
+
+def select_streaming_hidden_object_id(
+    identity_ids: torch.Tensor,       # (S, H, W) long, raw instance ids
+    seed_visible_indices: list[int],
+    hidden_tail_indices: list[int],
+    min_visible_pixels: int = 200,
+) -> Optional[int]:
+    """Select one prefix-invariant hidden object for streaming B probes.
+
+    The object identity is chosen only from the seed prefix, normally frames
+    [0,1,2] for a prefix_len=4 task. It must be hidden at every requested
+    streaming tail, normally frames [3,7,15,31,63]. The returned id is the raw
+    dataset instance id so it can be reused across different prefix lengths.
+    """
+    S = int(identity_ids.shape[0])
+    seed_visible_indices = [int(i) for i in seed_visible_indices]
+    hidden_tail_indices = [int(i) for i in hidden_tail_indices]
+    if not seed_visible_indices or not hidden_tail_indices:
+        return None
+    if min(seed_visible_indices + hidden_tail_indices) < 0:
+        return None
+    if max(seed_visible_indices + hidden_tail_indices) >= S:
+        return None
+
+    visible_frame_count = {}
+    visible_pixels_total = {}
+    for s in seed_visible_indices:
+        ids_s = identity_ids[s]
+        if ids_s.numel() == 0:
+            continue
+        unique_ids, counts = torch.unique(ids_s, return_counts=True)
+        for oid, cnt in zip(unique_ids.tolist(), counts.tolist()):
+            if oid < 0 or cnt < min_visible_pixels:
+                continue
+            visible_frame_count[oid] = visible_frame_count.get(oid, 0) + 1
+            visible_pixels_total[oid] = visible_pixels_total.get(oid, 0) + int(cnt)
+
+    candidates = []
+    for oid, n_frames in visible_frame_count.items():
+        hidden_at_all_tails = True
+        for tail in hidden_tail_indices:
+            n_tail = int((identity_ids[tail] == oid).sum().item())
+            if n_tail >= min_visible_pixels:
+                hidden_at_all_tails = False
+                break
+        if not hidden_at_all_tails:
+            continue
+        score = n_frames * 1_000_000 + visible_pixels_total[oid]
+        candidates.append((score, oid))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return int(candidates[0][1])
+
+
+def compute_object_target_for_id(
+    obj_id: int,
+    identity_ids: torch.Tensor,    # (S, H, W) long
+    pmaps_world: torch.Tensor,     # (S, H, W, 3) world coords
+    confmaps: torch.Tensor,        # (S, H, W) -- 0 means invalid pixel
+    extrinsics: torch.Tensor,      # (S, 3, 4) world->camera
+    min_visible_pixels: int = 200,
+    last_frame_idx: int = -1,
+    require_hidden: bool = True,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Return the current-prefix polar target and masks for a fixed object id."""
+    S, H, W = identity_ids.shape
+    device = identity_ids.device
+    dtype = pmaps_world.dtype
+    obj_id = int(obj_id)
+    valid_pix = confmaps > 0
+    last_idx = last_frame_idx if last_frame_idx >= 0 else (S + last_frame_idx)
+
+    last_count = int(((identity_ids[last_idx] == obj_id) & valid_pix[last_idx]).sum().item())
+    if require_hidden and last_count >= min_visible_pixels:
+        return None
+
+    # Build per-frame mask for the current prefix only. The final/current frame
+    # remains masked out because the task is hidden-object localization.
     per_frame_mask = torch.zeros(S, H, W, dtype=torch.bool, device=device)
+    seen_before = False
     for s in range(S):
         if s == last_idx:
             continue
-        m = (identity_ids[s] == chosen_id) & valid_pix[s]
+        m = (identity_ids[s] == obj_id) & valid_pix[s]
         if m.sum().item() >= min_visible_pixels:
             per_frame_mask[s] = m
+            seen_before = True
+    if not seen_before:
+        return None
+
+    centroid_world, _ = _world_centroid_of_object(
+        obj_id, identity_ids, pmaps_world, confmaps
+    )
 
     # Transform centroid to last frame camera coords
     R = extrinsics[last_idx, :3, :3].to(dtype)
@@ -205,7 +297,7 @@ def compute_hidden_object_target(
         "polar": polar.to(torch.float32),
         "delta_world": centroid_world.to(torch.float32),
         "per_frame_mask": per_frame_mask,
-        "obj_id": torch.tensor(chosen_id, dtype=torch.long, device=device),
+        "obj_id": torch.tensor(obj_id, dtype=torch.long, device=device),
     }
 
 

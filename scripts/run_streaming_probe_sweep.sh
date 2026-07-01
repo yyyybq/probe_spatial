@@ -104,6 +104,11 @@ probe_needs_target_cache() {
     [[ "${probe}" == "action_dynamics" || "${probe}" == "path_integration" || "${probe}" == "counterfactual" ]]
 }
 
+probe_uses_shared_hidden_object() {
+    local probe="$1"
+    [[ "${probe}" == "ego_belief" || "${probe}" == "ego_belief_v2" ]]
+}
+
 layers_resolved=()
 declare -A seen_layers=()
 for token in ${LAYERS}; do
@@ -145,6 +150,7 @@ fi
 
 prefix_name="prefix_$(safe_name "${PREFIX_LENGTHS}")"
 stream_root="${STREAM_ROOT_BASE}/${VFM}_${prefix_name}"
+hidden_prefix_list="[${PREFIX_LENGTHS// /,}]"
 
 split_extra "${EXTRA_EXTRACT}" extra_extract_args
 split_extra "${EXTRA_TARGET_EXTRACT}" extra_target_extract_args
@@ -227,6 +233,9 @@ for probe in ${PROBES}; do
                     "paths.run_folder_name=${run_name}"
                     "logger.wandb.name=${run_name}"
                 )
+                if probe_uses_shared_hidden_object "${probe}"; then
+                    cmd+=("streaming_hidden_prefix_lengths=${hidden_prefix_list}")
+                fi
                 if probe_needs_target_cache "${probe}"; then
                     cmd+=("target_feat_root=${TARGET_FEAT_ROOT}")
                 fi
@@ -255,6 +264,9 @@ for probe in ${PROBES}; do
                     "train=false"
                     "test=false"
                 )
+                if probe_uses_shared_hidden_object "${probe}"; then
+                    cmd+=("streaming_hidden_prefix_lengths=${hidden_prefix_list}")
+                fi
                 if probe_needs_target_cache "${probe}"; then
                     cmd+=("target_feat_root=${TARGET_FEAT_ROOT}")
                 fi

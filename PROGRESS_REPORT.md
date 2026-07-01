@@ -19,6 +19,13 @@
 > future targets. Treat older non-streaming numbers below as historical unless
 > explicitly rerun under the new configs.
 
+> **2026-07-01 protocol change:** Streaming B1/B2 now select one shared object
+> id per scene from the first four-frame prefix. The object must be visible in
+> frames `0,1,2`, hidden at frame `3`, and hidden at every compared prefix tail
+> such as `7,15,31,63`. Prefix `4/8/16/32/64` jobs therefore evaluate the same
+> object with increasing observed history instead of reselecting a different
+> hidden object per prefix.
+
 ## 2026-06-14 方法更新：支持 layer-wise probing
 
 当前默认 probe 层已确认并保持不变：
