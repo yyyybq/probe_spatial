@@ -93,10 +93,7 @@ safe_name() {
 
 probe_cfg() {
     local probe="$1"
-    case "${probe}" in
-        streaming_depth) printf 'inscene15k_streaming/streaming_depth_wan_v1' ;;
-        *) printf 'inscene15k_streaming/%s_wan_v1' "${probe}" ;;
-    esac
+    printf 'inscene15k_streaming/%s_%s_v1' "${probe}" "${VFM}"
 }
 
 probe_needs_target_cache() {
