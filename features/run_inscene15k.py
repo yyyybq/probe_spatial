@@ -280,7 +280,7 @@ def main():
     # ---------------- Spatial Diagnostic Suite extraction modes ----------------
     parser.add_argument(
         "--mode", default="normal",
-        choices=["normal", "shuffled", "target_isolated", "streaming_prefix", "context_segment"],
+        choices=["normal", "shuffled", "target_isolated", "streaming_prefix", "context_segment", "streaming_target"],
         help=(
             "normal: standard clip forward (default).\n"
             "shuffled: shuffle frame order before VFM forward (for A3 abnormal probe). "
@@ -291,7 +291,10 @@ def main():
             "streaming_prefix: independently forward prefixes [I_0, ..., I_t] and save "
             "them under prefix_<tail>; short prefixes are padded by repeating I_t.\n"
             "context_segment: independently forward sliding causal input segments "
-            "[I_start, ..., I_tail] and save them under context_<start>_<tail>."
+            "[I_start, ..., I_tail] and save them under context_<start>_<tail>.\n"
+            "streaming_target: for each prefix_len p, extract isolated features for frames "
+            "{tail+h for h in target_horizons} and save under prefix_<tail>/; "
+            "designed to provide per-prefix C1/C2/C3 targets."
         ),
     )
     parser.add_argument("--shuffle-seed", type=int, default=42,
@@ -314,8 +317,11 @@ def main():
                         help="Maximum causal input segment length for context_segment mode.")
     parser.add_argument("--context-stride", type=int, default=1,
                         help="Tail-frame stride for context_segment mode.")
+    parser.add_argument("--target-horizons", default="1,4,8,16",
+                        help="Comma-separated frame offsets from tail for streaming_target mode (default: 1,4,8,16).")
     args = parser.parse_args()
     args.prefix_lengths = parse_int_list(args.prefix_lengths)
+    args.target_horizons = sorted({int(h) for h in args.target_horizons.replace(',', ' ').split() if int(h) > 0})
 
     # Per-VFM defaults
     VFM_DEFAULTS = {
@@ -410,7 +416,23 @@ def main():
     for s in scenes:
         name = scene_name(s)
         out_dir = os.path.join(args.out_root, vfm_dir_name, s["source"], name)
-        if args.mode in ("streaming_prefix", "context_segment"):
+        if args.mode == "streaming_target":
+            all_exist = True
+            for p in (args.prefix_lengths or []):
+                tail = p - 1
+                if tail >= len(s["img_files"]):
+                    continue
+                prefix_out_dir = os.path.join(out_dir, f"prefix_{tail:06d}")
+                if args.vfm == "vjepa":
+                    if not cache_complete(os.path.join(prefix_out_dir, out_fname(0))):
+                        all_exist = False
+                        break
+                else:
+                    if not all(cache_complete(os.path.join(prefix_out_dir, out_fname(l)))
+                               for l in args.output_layers):
+                        all_exist = False
+                        break
+        elif args.mode in ("streaming_prefix", "context_segment"):
             records = (
                 streaming_prefix_records(
                     len(s["img_files"]),
@@ -578,7 +600,25 @@ def main():
         out_dir = os.path.join(args.out_root, vfm_dir_name, s["source"], name)
 
         # Check resume
-        if args.mode in ("streaming_prefix", "context_segment"):
+        if args.mode == "streaming_target":
+            scene_complete = True
+            for p in (args.prefix_lengths or []):
+                tail = p - 1
+                if tail >= len(s["img_files"]):
+                    continue
+                prefix_out_dir = os.path.join(out_dir, f"prefix_{tail:06d}")
+                if args.vfm == "vjepa":
+                    if not cache_complete(os.path.join(prefix_out_dir, out_fname(0))):
+                        scene_complete = False
+                        break
+                else:
+                    if not all(cache_complete(os.path.join(prefix_out_dir, out_fname(l)))
+                               for l in args.output_layers):
+                        scene_complete = False
+                        break
+            if scene_complete:
+                continue
+        elif args.mode in ("streaming_prefix", "context_segment"):
             records = (
                 streaming_prefix_records(
                     len(s["img_files"]),
@@ -745,6 +785,87 @@ def main():
                     f"[{done + processed + failed}/{len(scenes)}] "
                     f"{s['source']}/{name}: {elapsed:.1f}s "
                     f"({len(s['img_files'])} frames, {args.mode} +{processed_prefixes}/skip {skipped_prefixes}) "
+                    f"ETA: {eta}"
+                )
+                continue
+
+            elif args.mode == "streaming_target":
+                if args.prefix_lengths is None:
+                    raise ValueError("--prefix-lengths required for streaming_target mode")
+                horizons = args.target_horizons or [1, 4, 8, 16]
+                num_scene_frames = len(s["img_files"])
+                os.makedirs(out_dir, exist_ok=True)
+                processed_prefixes = 0
+                skipped_prefixes = 0
+                for p in args.prefix_lengths:
+                    tail = p - 1
+                    if tail >= num_scene_frames:
+                        log.warning(f"{s['source']}/{name}: prefix {p} (tail={tail}) >= scene frames {num_scene_frames}, skipping")
+                        continue
+                    prefix_out_dir = os.path.join(out_dir, f"prefix_{tail:06d}")
+                    if args.vfm == "vjepa":
+                        missing_lyrs = [] if cache_complete(os.path.join(prefix_out_dir, out_fname(0))) else [0]
+                    else:
+                        missing_lyrs = [l for l in args.output_layers
+                                        if not cache_complete(os.path.join(prefix_out_dir, out_fname(l)))]
+                    if not missing_lyrs:
+                        skipped_prefixes += 1
+                        continue
+                    target_frame_ids = [tail + h for h in horizons if (tail + h) < num_scene_frames]
+                    if not target_frame_ids:
+                        log.warning(f"{s['source']}/{name} prefix {p}: no valid target frames, skipping")
+                        continue
+                    target_imgs = [
+                        Image.open(os.path.join(s["img_dir"], s["img_files"][gi]))
+                        .convert("RGB").resize((args.resize[1], args.resize[0]), Image.LANCZOS)
+                        for gi in target_frame_ids
+                    ]
+                    per_layer_collect = {l: [] for l in missing_lyrs}
+                    for tgt_img in target_imgs:
+                        rep_frames = [tgt_img] * args.num_frames
+                        if args.vfm == "wan":
+                            with torch.no_grad():
+                                feats = model.forward(
+                                    video=rep_frames, prompt=args.prompt, t=args.t,
+                                    output_layer_indices=missing_lyrs,
+                                    ensemble_size=args.ensemble,
+                                )
+                            for layer_id, raw_feat in feats.items():
+                                reshaped = reshape_to_t_h_w_c(raw_feat)
+                                per_layer_collect[layer_id].append(reshaped[reshaped.shape[0] // 2])
+                        elif args.vfm == "cogvideox":
+                            feats = forward_cogvideox(model, rep_frames, t=args.t, layer_ids=missing_lyrs)
+                            for layer_id, feat in feats.items():
+                                f = feat.reshape(-1, *feat.shape[2:])
+                                per_layer_collect[layer_id].append(f[f.shape[0] // 2])
+                        elif args.vfm == "vjepa2":
+                            feats = model(rep_frames, output_layers=missing_lyrs)
+                            for layer_id, feat in feats.items():
+                                per_layer_collect[layer_id].append(feat[feat.shape[0] // 2])
+                        else:
+                            raise NotImplementedError(
+                                f"streaming_target mode not implemented for vfm={args.vfm}")
+                    os.makedirs(prefix_out_dir, exist_ok=True)
+                    for layer_id, lst in per_layer_collect.items():
+                        stacked = torch.stack(lst, dim=0).half().contiguous()
+                        out_path = os.path.join(prefix_out_dir, out_fname(layer_id))
+                        save_file({"feat": stacked}, out_path)
+                    atomic_save_npy(
+                        os.path.join(prefix_out_dir, "target_indices.npy"),
+                        np.array(target_frame_ids, dtype=np.int64),
+                    )
+                    processed_prefixes += 1
+
+                elapsed = time.time() - t0
+                total_time += elapsed
+                processed += 1
+                remaining = len(scenes) - done - processed - failed
+                avg = total_time / processed
+                eta = str(timedelta(seconds=int(avg * remaining)))
+                log.info(
+                    f"[{done + processed + failed}/{len(scenes)}] "
+                    f"{s['source']}/{name}: {elapsed:.1f}s "
+                    f"(streaming_target +{processed_prefixes}/skip {skipped_prefixes}) "
                     f"ETA: {eta}"
                 )
                 continue

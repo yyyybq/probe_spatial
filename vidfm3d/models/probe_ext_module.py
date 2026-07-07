@@ -213,8 +213,9 @@ class ProbeExtensionLitModule(LightningModule):
         )
         delta = polar_pred - polar_gt
         # Azimuth lives on S1; wrap it before both optimization and reporting.
-        delta = delta.clone()
-        delta[:, 0] = torch.atan2(torch.sin(delta[:, 0]), torch.cos(delta[:, 0]))
+        # Use out-of-place cat to avoid inplace version-counter mismatch in autograd.
+        delta_az = torch.atan2(torch.sin(delta[:, 0]), torch.cos(delta[:, 0]))
+        delta = torch.cat([delta_az.unsqueeze(1), delta[:, 1:]], dim=1)
         per_dim_loss = F.smooth_l1_loss(delta, torch.zeros_like(delta), reduction="none") * w
         loss = per_dim_loss.mean()
 

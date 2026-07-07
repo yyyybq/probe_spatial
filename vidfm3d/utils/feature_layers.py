@@ -139,6 +139,26 @@ def default_feature_channels(vfm_name: str, fallback: int = 1536) -> int:
     return spec.in_channels
 
 
+# Spatial token grid (H, W) used by each VFM at its standard input resolution.
+# wan: 480×832 → 30×52 patches (patch_size=16)
+# cogvideox: 288×512 → 18×32 patches (patch_size=16)
+# vjepa2*: 256×256 → 16×16 patches (patch_size=16)
+_DEFAULT_FEATURE_HW: dict[str, tuple[int, int]] = {
+    "wan": (30, 52),
+    "cogvideox": (18, 32),
+    "vjepa2": (16, 16),
+    "vjepa2-vitl": (16, 16),
+    "vjepa2-vith": (16, 16),
+    "vjepa2-vitg": (16, 16),
+}
+
+
+def default_feature_hw(vfm_name: str, fallback: tuple[int, int] = (18, 32)) -> tuple[int, int]:
+    """Return the default (H, W) spatial token grid for a given VFM."""
+    name = canonical_vfm_name(vfm_name)
+    return _DEFAULT_FEATURE_HW.get(name, fallback)
+
+
 def feature_filename(
     vfm_name: str,
     *,

@@ -25,9 +25,9 @@ shuffled_feat_root: ${oc.env:INSCENE_SHUFFLED_FEAT_ROOT}
 data:
   data_module:
     train_datasets:
-    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${oc.env:INSCENE_FEAT_ROOT}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='train', vfm_name='wan', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512, window_size=200, include_pmaps=False, diag_abnormal=True, shuffled_feat_root='${shuffled_feat_root}')
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${oc.env:INSCENE_FEAT_ROOT}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='train', vfm_name='wan', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512, window_size=200, include_pmaps=False, diag_abnormal=True, shuffled_feat_root='${shuffled_feat_root}', allow_missing_vfm=True)
     validation_datasets:
-    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${oc.env:INSCENE_FEAT_ROOT}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='val', vfm_name='wan', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512, window_size=200, include_pmaps=False, diag_abnormal=True, shuffled_feat_root='${shuffled_feat_root}')
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${oc.env:INSCENE_FEAT_ROOT}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='val', vfm_name='wan', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512, window_size=200, include_pmaps=False, diag_abnormal=True, shuffled_feat_root='${shuffled_feat_root}', allow_missing_vfm=True)
     batch_size_per_device: 4
     batch_size_per_device_val: 4
     num_workers: 8

@@ -1,5 +1,7 @@
 # @package _global_
-# ego_belief probe with vjepa2 features
+# B2: Ego-Centric Belief Probe v2 — query-token formulation, V-JEPA2 features.
+# A GT past mask specifies the object and is reduced to a 1D appearance query;
+# the head receives neither the spatial mask nor camera pose.
 
 defaults:
   - override /model: probe_ext
@@ -7,10 +9,10 @@ defaults:
 
 seed: 42
 
-tags: ["train", "inscene15k_ext", "vjepa2", "ego_belief"]
+tags: ["train", "inscene15k_ext", "vjepa2", "ego_belief_v2"]
 
 task_name: inscene15k_ext
-job_name: ego_belief_vjepa2_v1
+job_name: ego_belief_v2_vjepa2_v1
 
 autoresume: true
 
@@ -37,16 +39,21 @@ logger:
     group: ${task_name}
 
 model:
-  probe_type: ego_belief
+  probe_type: ego_belief_v2
   probe:
-    _target_: vidfm3d.models.components.probe_ego_belief.EgoBeliefProbe
+    _target_: vidfm3d.models.components.probe_ego_belief_v2.EgoBeliefProbeV2
     in_channels: 1024
     decoder_type: transformer
     num_frames: 4
-    use_final_global_feature: true
     hidden_dim: 512
-    num_layers: 2
+    num_layers: 4
     num_heads: 8
+    max_seq_len: 8
+    max_h: 16
+    max_w: 16
+    n_az_bins: 16
+    n_el_bins: 8
+    patch_pool: 2
 
 trainer:
   devices: [0]

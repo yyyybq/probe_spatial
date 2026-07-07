@@ -26,6 +26,7 @@ from vidfm3d.data.components.video_probe_dataset import invert_pose_ref_and_scal
 from vidfm3d.dust3r.datasets.base.easy_dataset import EasyDataset
 from vidfm3d.utils.feature_layers import (
     default_feature_channels,
+    default_feature_hw,
     feature_filename,
 )
 
@@ -957,20 +958,35 @@ class InsScene15KDataset(EasyDataset):
             valid = valid + [int(context_tail)] * (target_len - len(valid))
         return torch.as_tensor(valid, dtype=torch.long)
 
-    def _target_indices(self, scene_info):
-        """Return the exact frame ids represented by a target cache."""
-        if self.target_feat_root is None:
-            return None
-        cache_key = (scene_info["scene_dir"], self.vfm_name)
-        if cache_key in self._target_index_cache:
-            return self._target_index_cache[cache_key]
-        path = os.path.join(
+    def _target_feat_dir(self, scene_info) -> str:
+        """Return the directory containing target features for a scene.
+
+        For streaming_prefix mode, the targets are stored per prefix under
+        ``prefix_{tail:06d}/`` sub-directories (matching streaming_target
+        extraction layout).  For non-streaming mode the directory is the
+        plain per-scene feature directory.
+        """
+        scene_dir = os.path.join(
             self.target_feat_root,
             self.vfm_name,
             scene_info["source"],
             self._feat_scene_name(scene_info),
-            "target_indices.npy",
         )
+        if getattr(self, "streaming_prefix", False) and "streaming_tail" in scene_info:
+            tail = int(scene_info["streaming_tail"])
+            return os.path.join(scene_dir, f"prefix_{tail:06d}")
+        return scene_dir
+
+    def _target_indices(self, scene_info):
+        """Return the exact frame ids represented by a target cache."""
+        if self.target_feat_root is None:
+            return None
+        # Cache key includes streaming tail so different prefixes stay separate.
+        tail = int(scene_info["streaming_tail"]) if (getattr(self, "streaming_prefix", False) and "streaming_tail" in scene_info) else None
+        cache_key = (scene_info["scene_dir"], self.vfm_name, tail)
+        if cache_key in self._target_index_cache:
+            return self._target_index_cache[cache_key]
+        path = os.path.join(self._target_feat_dir(scene_info), "target_indices.npy")
         indices = torch.from_numpy(np.load(path)).long() if os.path.exists(path) else None
         self._target_index_cache[cache_key] = indices
         return indices
@@ -1008,25 +1024,20 @@ class InsScene15KDataset(EasyDataset):
     def _load_target_feat(self, scene_info, target_global_idx, num_frames):
         """Load an isolated feature for one exact frame.
 
-        Expected file layout:
+        Expected file layout (streaming_target mode):
+            {target_feat_root}/{vfm}/{source}/{scene}/prefix_{tail:06d}/feature{feat_postfix}.sft
+        Non-streaming layout:
             {target_feat_root}/{vfm}/{source}/{scene}/feature{feat_postfix}.sft
-        which contains:
+
+        Each .sft contains:
             feat:           (M, H_f, W_f, C)   — features for M target frames
-            target_indices: (M,) long          — original frame indices
+            target_indices: saved as target_indices.npy alongside
 
         Returns the feature for the exact target index, or None if missing.
-        Nearest-neighbour targets are scientifically invalid because the action
-        and camera reference would then describe a different frame.
         """
         if self.target_feat_root is None:
             return None
-        path = os.path.join(
-            self.target_feat_root,
-            self.vfm_name,
-            scene_info["source"],
-            self._feat_scene_name(scene_info),
-            self._feat_filename(),
-        )
+        path = os.path.join(self._target_feat_dir(scene_info), self._feat_filename())
         if not os.path.exists(path):
             return None
         try:
@@ -1045,13 +1056,7 @@ class InsScene15KDataset(EasyDataset):
         """Load multiple isolated frame features with one safetensors read."""
         if self.target_feat_root is None:
             return [None for _ in target_global_indices]
-        path = os.path.join(
-            self.target_feat_root,
-            self.vfm_name,
-            scene_info["source"],
-            self._feat_scene_name(scene_info),
-            self._feat_filename(),
-        )
+        path = os.path.join(self._target_feat_dir(scene_info), self._feat_filename())
         if not os.path.exists(path):
             return [None for _ in target_global_indices]
         try:
@@ -1073,9 +1078,10 @@ class InsScene15KDataset(EasyDataset):
 
     def _load_vfm_feat_for_selection(self, scene_info, num_frames, sel_global):
         """Load normal VFM features and select the requested global frame indices."""
+        dummy_h, dummy_w = default_feature_hw(self.vfm_name)
         if self.root_vfm is None:
             return (
-                torch.zeros(self.num_views, 18, 32, 1536, dtype=torch.float32),
+                torch.zeros(self.num_views, dummy_h, dummy_w, default_feature_channels(self.vfm_name), dtype=torch.float32),
                 torch.arange(self.num_views),
             )
 
@@ -1095,7 +1101,7 @@ class InsScene15KDataset(EasyDataset):
             logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
             dummy_channels = default_feature_channels(self.vfm_name)
             return (
-                torch.zeros(self.num_views, 18, 32, dummy_channels, dtype=torch.float32),
+                torch.zeros(self.num_views, dummy_h, dummy_w, dummy_channels, dtype=torch.float32),
                 torch.arange(self.num_views),
             )
 
@@ -1125,10 +1131,11 @@ class InsScene15KDataset(EasyDataset):
 
     def _load_streaming_prefix_feat(self, scene_info, sel_global):
         """Load the precomputed VFM feature for one online prefix sample."""
+        dummy_h, dummy_w = default_feature_hw(self.vfm_name)
         scene_dir = self._streaming_prefix_scene_dir(scene_info)
         if scene_dir is None:
             return (
-                torch.zeros(len(sel_global), 18, 32, 1536, dtype=torch.float32),
+                torch.zeros(len(sel_global), dummy_h, dummy_w, default_feature_channels(self.vfm_name), dtype=torch.float32),
                 torch.arange(len(sel_global)),
             )
 
@@ -1147,7 +1154,7 @@ class InsScene15KDataset(EasyDataset):
             logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
             dummy_channels = default_feature_channels(self.vfm_name)
             return (
-                torch.zeros(len(sel_global), 18, 32, dummy_channels, dtype=torch.float32),
+                torch.zeros(len(sel_global), dummy_h, dummy_w, dummy_channels, dtype=torch.float32),
                 torch.arange(len(sel_global)),
             )
 
@@ -1699,14 +1706,16 @@ class InsScene15KDataset(EasyDataset):
                     )
                 logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
                 dummy_channels = default_feature_channels(self.vfm_name)
+                dummy_h, dummy_w = default_feature_hw(self.vfm_name)
                 output["vfm_feat"] = torch.zeros(
-                    self.num_views, 18, 32, dummy_channels, dtype=torch.float32
+                    self.num_views, dummy_h, dummy_w, dummy_channels, dtype=torch.float32
                 )
                 output["vfm_idx"] = torch.arange(self.num_views)
         else:
             # Dummy features for testing
+            dummy_h, dummy_w = default_feature_hw(self.vfm_name)
             output["vfm_feat"] = torch.zeros(
-                self.num_views, 18, 32, 1536, dtype=torch.float32
+                self.num_views, dummy_h, dummy_w, default_feature_channels(self.vfm_name), dtype=torch.float32
             )
             output["vfm_idx"] = torch.arange(self.num_views)
 
