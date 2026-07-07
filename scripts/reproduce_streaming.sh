@@ -77,7 +77,7 @@ set -euo pipefail
 
 INSCENE_BASE="${INSCENE_BASE:?Please set INSCENE_BASE=/path/to/InsScene-15K}"
 
-VFMS="${VFMS:-wan vjepa2}"
+VFMS="${VFMS:-wan vjepa2 cogvideox}"
 PROBES="${PROBES:-streaming_depth view_consistency ego_belief_v2 action_dynamics path_integration counterfactual}"
 PREFIX_LENGTHS="${PREFIX_LENGTHS:-4 8 16 32 64}"
 

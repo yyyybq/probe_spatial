@@ -1,0 +1,77 @@
+# @package _global_
+# A1: Streaming Prefix Depth+Camera for CogVideoX.
+
+defaults:
+  - override /model: probe
+  - override /callbacks: v3_checkpoint
+
+seed: 42
+
+tags: ["train", "inscene15k_streaming", "cogvideox", "streaming_prefix", "depth", "camera"]
+
+task_name: inscene15k_streaming
+job_name: streaming_depth_cogvideox_v1
+
+autoresume: true
+
+paths:
+  run_folder_name: ${task_name}_${job_name}
+
+feat_postfix: _t749_layer20
+feature_layer: null
+feature_timestep: 749
+vfm_name: cogvideox
+video_channels: 3072
+prefix_len: 4
+prefix_min_len: ${prefix_len}
+prefix_max_len: ${prefix_len}
+prefix_stride: 1
+streaming_feat_root: ${oc.env:INSCENE_STREAMING_FEAT_ROOT}
+
+data:
+  data_module:
+    train_datasets:
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='train', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=False, streaming_prefix=True, prefix_min_len=${prefix_min_len}, prefix_max_len=${prefix_max_len}, prefix_stride=${prefix_stride}, allow_missing_vfm=True)
+    validation_datasets:
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_infinigen', 'processed_scannetpp_v2'], split='val', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=False, streaming_prefix=True, prefix_min_len=${prefix_min_len}, prefix_max_len=${prefix_max_len}, prefix_stride=${prefix_stride}, allow_missing_vfm=True)
+    batch_size_per_device: 1
+    batch_size_per_device_val: 1
+    num_workers: 4
+    num_workers_val: 2
+
+logger:
+  wandb:
+    name: ${task_name}_${job_name}
+    group: ${task_name}
+
+model:
+  probe_type: pixalign
+  probe:
+    _target_: vidfm3d.models.components.probe_pixalign.ProbeModelPA
+    embed_dim: 1024
+    video_channels: ${video_channels}
+    backbone_depth: 4
+    dpt_intermediate_layer_idx: [0, 1, 2, 3]
+    gradient_checkpointing: true
+    active_heads: ["depth", "camera"]
+  val_viz_freq: 10
+
+  loss_weights:
+    pmap: 0.0
+    dmap: 1.0
+    pmap_grad: 0.0
+    dmap_grad: 0.0
+    camera: 1.0
+    identity: 0.0
+
+  normalize_pred: true
+  normalize_gt: true
+  soft_bg_weight: 0.0
+  cmap_power: 1.0
+
+trainer:
+  devices: [0]
+  strategy: auto
+  max_epochs: 100
+  precision: bf16-mixed
+  plugins: []
