@@ -246,7 +246,7 @@ def main():
                         choices=["all", "infinigen", "scannetpp"],
                         help="Which data source to process")
     parser.add_argument("--vfm", default="wan",
-                        choices=["wan", "cogvideox", "vjepa", "vjepa2"],
+                        choices=["wan", "cogvideox", "vjepa", "vjepa2", "dino", "aether", "opensora", "f3r"],
                         help="Which VFM to extract features from")
     parser.add_argument("--model-id", default=None,
                         help="Model ID (default per VFM)")
@@ -319,6 +319,10 @@ def main():
                         help="Tail-frame stride for context_segment mode.")
     parser.add_argument("--target-horizons", default="1,4,8,16",
                         help="Comma-separated frame offsets from tail for streaming_target mode (default: 1,4,8,16).")
+    parser.add_argument("--opensora-config", default="features/opensora/configs/diffusion/inference/640px.py",
+                        help="Open-Sora inference config path (only used when --vfm opensora).")
+    parser.add_argument("--dino-batch-size", type=int, default=64,
+                        help="Per-device batch size for DINO feature extraction.")
     args = parser.parse_args()
     args.prefix_lengths = parse_int_list(args.prefix_lengths)
     args.target_horizons = sorted({int(h) for h in args.target_horizons.replace(',', ' ').split() if int(h) > 0})
@@ -329,6 +333,10 @@ def main():
         "cogvideox": {"model_id": "THUDM/CogVideoX-5b-I2V",          "num_frames": 97, "size": (480, 720)},
         "vjepa":     {"model_id": None,                                "num_frames": 76, "size": (480, 832)},
         "vjepa2":    {"model_id": "facebook/vjepa2-vitl-fpc64-256",   "num_frames": 64, "size": (256, 256)},
+        "dino":      {"model_id": "facebook/dinov2-large",             "num_frames": 64, "size": (420, 728)},
+        "aether":    {"model_id": None,                                "num_frames": 81, "size": (480, 720)},
+        "opensora":  {"model_id": None,                                "num_frames": 81, "size": (480, 720)},
+        "f3r":       {"model_id": None,                                "num_frames": 64, "size": (288, 512)},
     }
     defaults = VFM_DEFAULTS[args.vfm]
     if args.model_id is None:
@@ -386,6 +394,15 @@ def main():
     elif args.vfm == "vjepa2":
         def out_fname(layer):
             return f"feature_layer{layer}.sft"
+    elif args.vfm == "dino":
+        def out_fname(layer):
+            return "feature.sft"  # DINO has no layers, single last-hidden-state file
+    elif args.vfm in ("aether", "opensora"):
+        def out_fname(layer):
+            return f"feature_t{args.t}_layer{layer}.sft"
+    elif args.vfm == "f3r":
+        def out_fname(layer):
+            return f"feature_l{layer}.sft"
 
     # The mode is differentiated by
     # `--out-root` (e.g. FEAT vs FEAT_SHUFFLED vs FEAT_TARGET) — the per-VFM
@@ -585,6 +602,32 @@ def main():
         from features.vjepa2.vjepa2_feature import get_vjepa2_featurizer
         log.info(f"Loading V-JEPA 2 model: {args.model_id}")
         model = get_vjepa2_featurizer(model_id=args.model_id)
+    elif args.vfm == "dino":
+        from features.dino.extract_features import dino_forward as _dino_forward, reshape_tokens as _dino_reshape
+        from transformers import AutoImageProcessor, Dinov2Model
+        log.info(f"Loading DINOv2 model: {args.model_id}")
+        _dino_proc = AutoImageProcessor.from_pretrained(args.model_id)
+        _dino_model = Dinov2Model.from_pretrained(args.model_id).cuda().eval()
+        model = (_dino_model, _dino_proc)  # stored as a tuple
+    elif args.vfm == "aether":
+        from features.aether.aether_feature import get_aether_featurizer
+        from features.aether.extract_features import forward_aether
+        log.info("Loading Aether featurizer (may take several minutes)...")
+        model = get_aether_featurizer()
+    elif args.vfm == "opensora":
+        from features.opensora.opensora_features import extract_feature as opensora_extract
+        log.info("OpenSora: will initialise per-scene via config_path=%s", args.opensora_config)
+        model = None  # opensora builds its pipeline internally on each call
+    elif args.vfm == "f3r":
+        from features.f3r.extract_features import (
+            vidfm3d_forward as f3r_forward,
+            load_model as f3r_load_model,
+            HTOK as F3R_HTOK, WTOK as F3R_WTOK, C as F3R_C,
+        )
+        _f3r_model_id = args.model_id or "jedyang97/Fast3R_ViT_Large_512"
+        log.info(f"Loading Fast3R model: {_f3r_model_id}")
+        _f3r_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = f3r_load_model(_f3r_model_id, str(_f3r_device))
 
     log.info("Model loaded.")
 
@@ -759,6 +802,61 @@ def main():
                         for layer_id, feat in feats.items():
                             out_path = os.path.join(prefix_out_dir, out_fname(layer_id))
                             save_file({"feat": feat.half().contiguous()}, out_path)
+
+                    elif args.vfm == "dino":
+                        _dino_model, _dino_proc = model
+                        _dev = next(_dino_model.parameters()).device
+                        with torch.no_grad():
+                            all_feats = []
+                            for bi in range(0, len(frames_input), args.dino_batch_size):
+                                batch = frames_input[bi:bi + args.dino_batch_size]
+                                tok = _dino_forward(_dino_model, _dino_proc, batch, _dev)
+                                for b in range(tok.shape[0]):
+                                    all_feats.append(_dino_reshape(tok[b]))
+                        feat = torch.stack(all_feats, dim=0)
+                        out_path = os.path.join(prefix_out_dir, out_fname(0))
+                        save_file({"feat": feat.half().contiguous()}, out_path)
+
+                    elif args.vfm == "aether":
+                        feats = model.forward(
+                            frames_input, t=args.t, output_layer_indices=missing_layers
+                        )
+                        for layer_id, feat in feats.items():
+                            h_lat = args.resize[0] // 16
+                            w_lat = args.resize[1] // 16
+                            t_lat = feat.shape[1] // (h_lat * w_lat)
+                            reshaped = feat[0].reshape(t_lat, h_lat, w_lat, -1)
+                            out_path = os.path.join(prefix_out_dir, out_fname(layer_id))
+                            save_file({"feat": reshaped.half().contiguous()}, out_path)
+
+                    elif args.vfm == "opensora":
+                        feats = opensora_extract(
+                            frames_input, layer_indices=missing_layers,
+                            config_path=args.opensora_config,
+                        )
+                        for layer_id, feat in feats.items():
+                            out_path = os.path.join(prefix_out_dir, out_fname(layer_id))
+                            save_file({"feat": feat.half().contiguous()}, out_path)
+
+                    elif args.vfm == "f3r":
+                        f3r_indices = list(record["indices"])
+                        while len(f3r_indices) < args.num_frames:
+                            f3r_indices.append(f3r_indices[-1])
+                        f3r_filelist = [
+                            os.path.join(s["img_dir"], s["img_files"][idx])
+                            for idx in f3r_indices
+                        ]
+                        _dev = next(model.parameters()).device
+                        raw_feats = f3r_forward(f3r_filelist, model, _dev)
+                        if isinstance(raw_feats, torch.Tensor):
+                            raw_feats = [raw_feats]
+                        for layer_id in missing_layers:
+                            raw = raw_feats[layer_id]
+                            feat_spatial = raw.reshape(
+                                len(f3r_filelist), F3R_HTOK, F3R_WTOK, F3R_C
+                            ).contiguous()
+                            out_path = os.path.join(prefix_out_dir, out_fname(layer_id))
+                            save_file({"feat": feat_spatial.half()}, out_path)
 
                     meta_record = dict(record)
                     meta_record["input_length"] = len(frames_input)
@@ -1007,6 +1105,57 @@ def main():
                         feat = feat[inv_chunk_perm]
                     out_path = os.path.join(out_dir, out_fname(layer_id))
                     save_file({"feat": feat.half().contiguous()}, out_path)
+
+            elif args.vfm == "dino":
+                _dino_model, _dino_proc = model
+                _dev = next(_dino_model.parameters()).device
+                with torch.no_grad():
+                    all_feats = []
+                    for bi in range(0, len(frames_input), args.dino_batch_size):
+                        batch = frames_input[bi:bi + args.dino_batch_size]
+                        tok = _dino_forward(_dino_model, _dino_proc, batch, _dev)
+                        for b in range(tok.shape[0]):
+                            all_feats.append(_dino_reshape(tok[b]))
+                feat = torch.stack(all_feats, dim=0)
+                out_path = os.path.join(out_dir, out_fname(0))
+                save_file({"feat": feat.half().contiguous()}, out_path)
+
+            elif args.vfm == "aether":
+                feats = model.forward(
+                    frames_input, t=args.t, output_layer_indices=missing_layers
+                )
+                for layer_id, feat in feats.items():
+                    h_lat = args.resize[0] // 16
+                    w_lat = args.resize[1] // 16
+                    t_lat = feat.shape[1] // (h_lat * w_lat)
+                    reshaped = feat[0].reshape(t_lat, h_lat, w_lat, -1)
+                    out_path = os.path.join(out_dir, out_fname(layer_id))
+                    save_file({"feat": reshaped.half().contiguous()}, out_path)
+
+            elif args.vfm == "opensora":
+                feats = opensora_extract(
+                    frames_input, layer_indices=missing_layers,
+                    config_path=args.opensora_config,
+                )
+                for layer_id, feat in feats.items():
+                    out_path = os.path.join(out_dir, out_fname(layer_id))
+                    save_file({"feat": feat.half().contiguous()}, out_path)
+
+            elif args.vfm == "f3r":
+                f3r_filelist = [
+                    os.path.join(s["img_dir"], s["img_files"][idx]) for idx in indices
+                ]
+                _dev = next(model.parameters()).device
+                raw_feats = f3r_forward(f3r_filelist, model, _dev)
+                if isinstance(raw_feats, torch.Tensor):
+                    raw_feats = [raw_feats]
+                for layer_id in missing_layers:
+                    raw = raw_feats[layer_id]
+                    feat_spatial = raw.reshape(
+                        len(f3r_filelist), F3R_HTOK, F3R_WTOK, F3R_C
+                    ).contiguous()
+                    out_path = os.path.join(out_dir, out_fname(layer_id))
+                    save_file({"feat": feat_spatial.half()}, out_path)
 
             elapsed = time.time() - t0
             total_time += elapsed

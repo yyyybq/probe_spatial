@@ -83,6 +83,35 @@ FEATURE_LAYER_SPECS: dict[str, FeatureLayerSpec] = {
         in_channels=3584,
         note="Default cache is the backend's last hidden/visual-token layer.",
     ),
+    # ---- New VFMs --------------------------------------------------------- #
+    "dino": FeatureLayerSpec(
+        default_layer=0,
+        num_layers=1,
+        feat_postfix="",
+        in_channels=1024,
+        note="DINOv2-Large last hidden state; 420×728 input → 30×52 patch grid.",
+    ),
+    "aether": FeatureLayerSpec(
+        default_layer=1,
+        num_layers=42,
+        feat_postfix="_t749_layer1",
+        in_channels=3072,
+        note="Aether (CogVideoX-5B backbone) transformer block at t=749.",
+    ),
+    "opensora": FeatureLayerSpec(
+        default_layer=10,
+        num_layers=None,
+        feat_postfix="_t1_layer10",
+        in_channels=3072,
+        note="Open-Sora MMDiT single_block; default timestep=0.25 (t index 1).",
+    ),
+    "f3r": FeatureLayerSpec(
+        default_layer=24,
+        num_layers=25,
+        feat_postfix="_l24",
+        in_channels=1024,
+        note="Fast3R ViT-L transformer block 24; 288×512 input → 18×32 patch grid.",
+    ),
 }
 
 
@@ -120,8 +149,12 @@ def all_output_layers(vfm_name: str, model_id: str | None = None) -> list[int]:
 
 
 def feat_postfix_for_layer(vfm_name: str, layer: int, t: int = 749) -> str:
-    if vfm_name in {"wan", "cogvideox"}:
+    if vfm_name in {"wan", "cogvideox", "aether", "opensora"}:
         return f"_t{t}_layer{layer}"
+    if vfm_name == "f3r":
+        return f"_l{layer}"
+    if vfm_name == "dino":
+        return ""
     return f"_layer{layer}"
 
 
@@ -150,6 +183,10 @@ _DEFAULT_FEATURE_HW: dict[str, tuple[int, int]] = {
     "vjepa2-vitl": (16, 16),
     "vjepa2-vith": (16, 16),
     "vjepa2-vitg": (16, 16),
+    "dino": (30, 52),    # 420×728, patch_size=14
+    "aether": (30, 45),  # 480×720, patch_size=16
+    "opensora": (30, 53),  # 480×848, patch_size=16
+    "f3r": (18, 32),     # 288×512, patch_size=16
 }
 
 
@@ -175,7 +212,7 @@ def feature_filename(
     ``feature_layer{L}.sft`` for V-JEPA2 / MLLM caches.
     """
 
-    if vfm_name == "vjepa":
+    if vfm_name in {"vjepa", "dino"}:
         return "feature.sft"
 
     if isinstance(feature_layer, str):

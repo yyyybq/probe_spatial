@@ -107,6 +107,54 @@ def scene_name(scene_info: dict) -> str:
     return Path(scene_dir).name
 
 
+def _parse_int_list(value):
+    """Parse comma/space-separated integers into a sorted list, or None."""
+    if value is None:
+        return None
+    items = str(value).replace(",", " ").split()
+    parsed = sorted({int(item) for item in items if item.strip()})
+    return parsed or None
+
+
+def streaming_prefix_records(
+    num_frames,
+    min_len=1,
+    max_len=None,
+    stride=1,
+    model_max_len=None,
+    lengths=None,
+):
+    """Build online prefix records H_t = [I_0, ..., I_t]."""
+    min_len = max(int(min_len), 1)
+    stride = max(int(stride), 1)
+    if max_len is None:
+        max_len = num_frames
+    max_len = min(int(max_len), num_frames)
+    if model_max_len is not None:
+        max_len = min(max_len, int(model_max_len))
+    if max_len < min_len:
+        return []
+    if lengths is not None:
+        candidate_lengths = [
+            int(length) for length in lengths
+            if min_len <= int(length) <= max_len
+        ]
+    else:
+        candidate_lengths = range(min_len, max_len + 1, stride)
+    records = []
+    for length in candidate_lengths:
+        records.append({
+            "tail": length - 1,
+            "indices": list(range(length)),
+            "valid_length": length,
+        })
+    return records
+
+
+def prefix_dir_name(record):
+    return f"prefix_{int(record['tail']):06d}"
+
+
 def select_frames(img_files: Sequence[str], n: int) -> list[int]:
     total = len(img_files)
     if total <= n:
@@ -461,7 +509,25 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-dtype", default="bfloat16", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--attn-implementation", default=None)
+    # Streaming prefix mode
+    parser.add_argument(
+        "--mode", default="normal", choices=["normal", "streaming_prefix"],
+        help=(
+            "normal: select num-frames uniformly from the full scene (default).\n"
+            "streaming_prefix: for each prefix length p, run the model on frames [0..tail] "
+            "(subsampled to num-frames if needed) and save under prefix_<tail>/."
+        ),
+    )
+    parser.add_argument("--prefix-stride", type=int, default=1,
+                        help="Frame stride between streaming-prefix tails.")
+    parser.add_argument("--prefix-min-len", type=int, default=1,
+                        help="Minimum streaming-prefix length.")
+    parser.add_argument("--prefix-max-len", type=int, default=None,
+                        help="Maximum streaming-prefix length (defaults to scene length).")
+    parser.add_argument("--prefix-lengths", default=None,
+                        help="Exact streaming prefix lengths to cache, e.g. '4,8,16,32,64'.")
     args = parser.parse_args()
+    args.prefix_lengths = _parse_int_list(args.prefix_lengths)
 
     default_model = {
         "qwen2_5_vl": "Qwen/Qwen2.5-VL-7B-Instruct",
@@ -497,14 +563,16 @@ def main() -> None:
     def out_fname(layer: int) -> str:
         return f"feature_layer{layer}.sft"
 
+    # Pre-count already-done scenes for normal mode
     done = 0
-    for scene in scenes:
-        out_dir = os.path.join(args.out_root, vfm_name, scene["source"], scene_name(scene))
-        if all(os.path.exists(os.path.join(out_dir, out_fname(l))) for l in args.output_layers):
-            done += 1
-    log.info("Already done: %d/%d", done, len(scenes))
-    if done == len(scenes):
-        return
+    if args.mode == "normal":
+        for scene in scenes:
+            out_dir = os.path.join(args.out_root, vfm_name, scene["source"], scene_name(scene))
+            if all(os.path.exists(os.path.join(out_dir, out_fname(l))) for l in args.output_layers):
+                done += 1
+        log.info("Already done: %d/%d", done, len(scenes))
+        if done == len(scenes):
+            return
 
     extractor = MLLMActivationExtractor(
         backend=args.backend,
@@ -522,32 +590,107 @@ def main() -> None:
     for i, scene in enumerate(scenes):
         name = scene_name(scene)
         out_dir = os.path.join(args.out_root, vfm_name, scene["source"], name)
-        missing_layers = [
-            layer for layer in args.output_layers
-            if not os.path.exists(os.path.join(out_dir, out_fname(layer)))
-        ]
-        if not missing_layers:
-            continue
 
         t0 = time.time()
         try:
-            indices = select_frames(scene["img_files"], args.num_frames)
-            while len(indices) < args.num_frames:
-                indices.append(indices[-1])
-            frames = load_frames(scene["img_dir"], scene["img_files"], indices, resize)
-            os.makedirs(out_dir, exist_ok=True)
+            if args.mode == "streaming_prefix":
+                records = streaming_prefix_records(
+                    len(scene["img_files"]),
+                    min_len=args.prefix_min_len,
+                    max_len=args.prefix_max_len,
+                    stride=args.prefix_stride,
+                    model_max_len=None,
+                    lengths=args.prefix_lengths,
+                )
+                if not records:
+                    log.warning("[%d/%d] %s/%s: no streaming_prefix records, skipping",
+                                done + processed + failed, len(scenes), scene["source"], name)
+                    continue
 
-            feats = extractor(frames, missing_layers)
-            for layer_id, feat in feats.items():
-                save_file({"feat": feat.half().contiguous()}, os.path.join(out_dir, out_fname(layer_id)))
-            np.save(os.path.join(out_dir, "source_indices.npy"), np.array(indices, dtype=np.int64))
+                os.makedirs(out_dir, exist_ok=True)
+                processed_prefixes = 0
+                skipped_prefixes = 0
+                prefix_meta = []
+                for record in records:
+                    pdir = os.path.join(out_dir, prefix_dir_name(record))
+                    missing_layers = [
+                        l for l in args.output_layers
+                        if not os.path.exists(os.path.join(pdir, out_fname(l)))
+                    ]
+                    if not missing_layers:
+                        skipped_prefixes += 1
+                        meta_record = dict(record)
+                        meta_record["input_length"] = args.num_frames
+                        meta_record["pad_mode"] = "repeat_tail"
+                        prefix_meta.append(meta_record)
+                        continue
 
-            elapsed = time.time() - t0
-            total_time += elapsed
-            processed += 1
-            remaining = len(scenes) - done - processed - failed
-            eta = str(timedelta(seconds=int(total_time / max(processed, 1) * remaining)))
-            log.info("[%d/%d] %s/%s %.1fs ETA %s", done + processed + failed, len(scenes), scene["source"], name, elapsed, eta)
+                    # Sub-sample from the prefix to num_frames; pad with repeat_tail if short
+                    prefix_indices = record["indices"]
+                    if len(prefix_indices) > args.num_frames:
+                        sub = select_frames(prefix_indices, args.num_frames)
+                        sample_indices = [prefix_indices[k] for k in sub]
+                    else:
+                        sample_indices = list(prefix_indices)
+                    while len(sample_indices) < args.num_frames:
+                        sample_indices.append(sample_indices[-1])
+
+                    frames = load_frames(scene["img_dir"], scene["img_files"], sample_indices, resize)
+                    os.makedirs(pdir, exist_ok=True)
+
+                    feats = extractor(frames, missing_layers)
+                    for layer_id, feat in feats.items():
+                        save_file({"feat": feat.half().contiguous()}, os.path.join(pdir, out_fname(layer_id)))
+                    np.save(os.path.join(pdir, "prefix_index.npy"), np.array(sample_indices, dtype=np.int64))
+
+                    meta_record = dict(record)
+                    meta_record["input_length"] = len(sample_indices)
+                    meta_record["valid_length"] = record["valid_length"]
+                    meta_record["pad_mode"] = "repeat_tail"
+                    prefix_meta.append(meta_record)
+                    processed_prefixes += 1
+
+                np.save(os.path.join(out_dir, "prefix_index.npy"), np.array(prefix_meta, dtype=object))
+
+                elapsed = time.time() - t0
+                total_time += elapsed
+                processed += 1
+                remaining = len(scenes) - done - processed - failed
+                avg = total_time / processed
+                eta = str(timedelta(seconds=int(avg * remaining)))
+                log.info(
+                    "[%d/%d] %s/%s: %.1fs (%d frames, streaming_prefix +%d/skip %d) ETA %s",
+                    done + processed + failed, len(scenes), scene["source"], name,
+                    elapsed, len(scene["img_files"]), processed_prefixes, skipped_prefixes, eta,
+                )
+
+            else:  # normal mode
+                missing_layers = [
+                    layer for layer in args.output_layers
+                    if not os.path.exists(os.path.join(out_dir, out_fname(layer)))
+                ]
+                if not missing_layers:
+                    done += 1
+                    continue
+
+                indices = select_frames(scene["img_files"], args.num_frames)
+                while len(indices) < args.num_frames:
+                    indices.append(indices[-1])
+                frames = load_frames(scene["img_dir"], scene["img_files"], indices, resize)
+                os.makedirs(out_dir, exist_ok=True)
+
+                feats = extractor(frames, missing_layers)
+                for layer_id, feat in feats.items():
+                    save_file({"feat": feat.half().contiguous()}, os.path.join(out_dir, out_fname(layer_id)))
+                np.save(os.path.join(out_dir, "source_indices.npy"), np.array(indices, dtype=np.int64))
+
+                elapsed = time.time() - t0
+                total_time += elapsed
+                processed += 1
+                remaining = len(scenes) - done - processed - failed
+                eta = str(timedelta(seconds=int(total_time / max(processed, 1) * remaining)))
+                log.info("[%d/%d] %s/%s %.1fs ETA %s", done + processed + failed, len(scenes), scene["source"], name, elapsed, eta)
+
         except Exception as exc:
             failed += 1
             log.error("[%d/%d] FAILED %s/%s: %s", done + processed + failed, len(scenes), scene["source"], name, exc)
