@@ -1,24 +1,24 @@
 # @package _global_
-# B2: Object-query localization under the shared streaming-prefix protocol.
+# B1: Hidden-object localization under the shared streaming-prefix protocol.
 
 defaults:
   - override /model: probe_ext
   - override /callbacks: v3_checkpoint
 
 seed: 42
-tags: ["train", "inscene15k_streaming", "cogvideox", "streaming_prefix", "ego_belief_v2"]
+tags: ["train", "inscene15k_streaming", "aether", "streaming_prefix", "ego_belief"]
 
 task_name: inscene15k_streaming
-job_name: ego_belief_v2_cogvideox_v1
+job_name: ego_belief_aether_v1
 autoresume: true
 
 paths:
   run_folder_name: ${task_name}_${job_name}
 
-feat_postfix: _t749_layer20
+feat_postfix: _t749_layer1
 feature_layer: null
 feature_timestep: 749
-vfm_name: cogvideox
+vfm_name: aether
 video_channels: 3072
 prefix_len: 8
 streaming_hidden_seed_prefix_len: 8
@@ -31,8 +31,8 @@ data:
     - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'], split='train', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True, streaming_shared_hidden_obj=True, streaming_hidden_seed_prefix_len=${streaming_hidden_seed_prefix_len}, streaming_hidden_prefix_lengths=${streaming_hidden_prefix_lengths})
     validation_datasets:
     - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'], split='val', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True, streaming_shared_hidden_obj=True, streaming_hidden_seed_prefix_len=${streaming_hidden_seed_prefix_len}, streaming_hidden_prefix_lengths=${streaming_hidden_prefix_lengths})
-    batch_size_per_device: 1
-    batch_size_per_device_val: 1
+    batch_size_per_device: 4
+    batch_size_per_device_val: 4
     num_workers: 8
     num_workers_val: 4
 
@@ -42,21 +42,17 @@ logger:
     group: ${task_name}
 
 model:
-  probe_type: ego_belief_v2
+  probe_type: ego_belief
   probe:
-    _target_: vidfm3d.models.components.probe_ego_belief_v2.EgoBeliefProbeV2
+    _target_: vidfm3d.models.components.probe_ego_belief.EgoBeliefProbe
     in_channels: ${video_channels}
     decoder_type: transformer
     num_frames: ${prefix_len}
+    use_final_global_feature: true
     hidden_dim: 512
-    num_layers: 4
+    num_layers: 2
     num_heads: 8
     max_seq_len: 64
-    max_h: 18
-    max_w: 32
-    n_az_bins: 16
-    n_el_bins: 8
-    patch_pool: 2
 
 trainer:
   devices: [0]

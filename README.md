@@ -40,7 +40,8 @@ export DATASET_ROOT=/data/probe_spatial_data/InsScene-15K
 mkdir -p ${DATASET_ROOT}
 
 # 4. Download InsScene-15K data outside the git checkout
-python data/download_inscene15k.py --step all --base-dir ${DATASET_ROOT}
+python data/download_inscene15k.py --step download_scannetpp --base-dir ${DATASET_ROOT}
+python data/download_inscene15k.py --step extract_scannetpp  --base-dir ${DATASET_ROOT}
 
 # 5. Extract streaming VFM features outside the git checkout.
 # Streaming temporal probes now use ScanNet++ only.  Infinigen frames are
@@ -53,14 +54,15 @@ python -m features.run_inscene15k --vfm wan --mode streaming_prefix \
     --prefix-lengths "8,12,16,24" --prefix-max-len 24
 
 # Layer sweeps: pass multiple layers, then train with feature_layer=<L>.
-# Current defaults are Wan/CogVideoX layer20 at t=749, V-JEPA2 layer23,
-# and MLLM/VLM layer -1 caches.
+# Current default sweep models:
+#   wan cogvideox vjepa2 dino aether f3r qwen2_5_vl_3b bagel
+# Layer defaults are registered in vidfm3d/utils/feature_layers.py.
 export INSCENE_DATA_ROOT=${INSCENE_DATA}/data
 export INSCENE_STREAMING_FEAT_ROOT=${INSCENE_DATA}/FEAT_STREAMING
 export INSCENE_TARGET_FEAT_ROOT=${INSCENE_DATA}/FEAT_TARGET
 
-# 6. Train streaming diagnostic probes for Wan on GPU 0
-DEV=0 VFM=wan \
+# 6. Train streaming diagnostic probes for the default model matrix on GPU 0
+DEV=0 \
 PROBES="streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual" \
 PREFIX_LENGTHS="8 12 16 24" LAYERS="default" \
     bash scripts/run_streaming_probe_sweep.sh
@@ -372,6 +374,11 @@ Switch `--vfm cogvideox --model-id THUDM/CogVideoX-5b-I2V` or
 | Wan2.1-T2V-1.3B | `wan` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | `_t749_layer20` | 1536 |
 | CogVideoX-5B | `cogvideox` | `THUDM/CogVideoX-5b-I2V` | `_t749_layer20` | 3072 |
 | V-JEPA2-ViT-L | `vjepa2` | see `features/vjepa2/` | `_layer23` | 1024 |
+| DINOv2-Large | `dino` | `facebook/dinov2-large` | `feature.sft` | 1024 |
+| Aether | `aether` | local Aether adapter | `_t749_layer1` | 3072 |
+| Fast3R ViT-L | `f3r` | `jedyang97/Fast3R_ViT_Large_512` | `_l24` | 1024 |
+| Qwen2.5-VL-3B | `qwen2_5_vl_3b` | `Qwen/Qwen2.5-VL-3B-Instruct` | `_layer-1` | 2048 |
+| BAGEL | `bagel` | `ByteDance-Seed/BAGEL-7B-MoT` | `_layer-1` | 3584 |
 
 ### Feature layer convention
 
@@ -383,7 +390,10 @@ The current diagnostic defaults are now centralized in
 | Wan2.1 | 20 | diffusion transformer block 20 at timestep `t=749` |
 | CogVideoX | 20 | diffusion transformer block 20 at timestep `t=749` |
 | V-JEPA2 ViT-L | 23 | last encoder block, 0-based |
-| Qwen2.5-VL / BAGEL caches | -1 | current default visual-token / last-layer cache |
+| DINOv2-Large | 0 | last hidden state patch tokens |
+| Aether | 1 | CogVideoX-backbone block at timestep `t=749` |
+| Fast3R | 24 | last registered Fast3R ViT-L block |
+| Qwen2.5-VL-3B / BAGEL caches | -1 | current default visual-token / last-layer cache |
 
 To probe other layers, extract them by passing explicit layer ids, or use the
 aliases `default`, `last`, and `all`:
@@ -431,6 +441,10 @@ PREFIX_LENGTHS="8 12 16 24" \
 LAYERS="-1 8 16 24 31" \
     bash scripts/run_direct_vlm_probe_sweep.sh
 ```
+
+The main streaming sweep already includes `qwen2_5_vl_3b` and `bagel` by
+default. Set `VFMS=...` to run a smaller subset, or `VFM=wan` for the old
+single-model behavior.
 
 For Qwen, layer `-1` is the visual-merger output; non-negative layers are
 vision-tower block outputs. The sweep script reads an existing `.sft` cache to

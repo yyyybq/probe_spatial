@@ -6,8 +6,16 @@
 # prefix length per job, which avoids variable-length batches while preserving
 # the online-history protocol.
 #
+# Default model matrix:
+#   wan cogvideox vjepa2 dino aether f3r qwen2_5_vl_3b bagel
+#
 # Examples:
+#   # Full default model matrix.
 #   DRY_RUN=1 PROBES="ego_belief ego_belief_v2" PREFIX_LENGTHS="8 12 16 24" \
+#     bash scripts/run_streaming_probe_sweep.sh
+#
+#   # Single-model override, preserving the old usage pattern.
+#   DRY_RUN=1 VFM=wan PROBES="ego_belief ego_belief_v2" PREFIX_LENGTHS="8 12 16 24" \
 #     bash scripts/run_streaming_probe_sweep.sh
 #
 #   # B2 sanity: current-view visible object localization.
@@ -19,6 +27,23 @@
 #   LAYERS="default" EXTRA_TRAIN="trainer.max_epochs=20 logger.wandb.offline=true" \
 #     bash scripts/run_streaming_probe_sweep.sh
 set -euo pipefail
+
+DEFAULT_VFMS=${DEFAULT_VFMS:-"wan cogvideox vjepa2 dino aether f3r qwen2_5_vl_3b bagel"}
+if [[ -z "${STREAMING_SWEEP_SINGLE_VFM:-}" ]]; then
+    if [[ -n "${VFMS:-}" ]]; then
+        sweep_vfms="${VFMS}"
+    elif [[ -n "${VFM:-}" ]]; then
+        sweep_vfms="${VFM}"
+    else
+        sweep_vfms="${DEFAULT_VFMS}"
+    fi
+    echo "[info] streaming sweep vfms=${sweep_vfms}"
+    for sweep_vfm in ${sweep_vfms}; do
+        echo "==== model sweep: ${sweep_vfm} ===="
+        env STREAMING_SWEEP_SINGLE_VFM=1 VFM="${sweep_vfm}" VFM_NAME="${sweep_vfm}" bash "${BASH_SOURCE[0]}"
+    done
+    exit 0
+fi
 
 PYTHON=${PYTHON:-python}
 VFM=${VFM:-wan}

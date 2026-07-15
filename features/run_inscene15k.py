@@ -1211,7 +1211,7 @@ def main():
                 ]
                 per_layer_collect = {l: [] for l in (missing_layers if args.vfm != "vjepa" else [0])}
 
-                for tgt_img in target_imgs:
+                for gi, tgt_img in zip(target_global, target_imgs):
                     rep_frames = [tgt_img] * args.num_frames
                     if args.vfm == "wan":
                         with torch.no_grad():
@@ -1233,6 +1233,37 @@ def main():
                         feats = model(rep_frames, output_layers=missing_layers)
                         for layer_id, feat in feats.items():
                             per_layer_collect[layer_id].append(feat[feat.shape[0] // 2])
+                    elif args.vfm == "dino":
+                        _dino_model, _dino_proc = model
+                        _dev = next(_dino_model.parameters()).device
+                        with torch.no_grad():
+                            tok = _dino_forward(_dino_model, _dino_proc, [tgt_img], _dev)
+                        per_layer_collect[0].append(_dino_reshape(tok[0]))
+                    elif args.vfm == "aether":
+                        with torch.no_grad():
+                            feats = model.forward(
+                                rep_frames, t=args.t, output_layer_indices=missing_layers
+                            )
+                        for layer_id, feat in feats.items():
+                            h_lat = args.resize[0] // 16
+                            w_lat = args.resize[1] // 16
+                            t_lat = feat.shape[1] // (h_lat * w_lat)
+                            reshaped = feat[0].reshape(t_lat, h_lat, w_lat, -1)
+                            per_layer_collect[layer_id].append(reshaped[reshaped.shape[0] // 2])
+                    elif args.vfm == "f3r":
+                        target_path = os.path.join(s["img_dir"], s["img_files"][int(gi)])
+                        f3r_filelist = [target_path] * args.num_frames
+                        _dev = next(model.parameters()).device
+                        with torch.no_grad():
+                            raw_feats = f3r_forward(f3r_filelist, model, _dev)
+                        if isinstance(raw_feats, torch.Tensor):
+                            raw_feats = [raw_feats]
+                        for layer_id in missing_layers:
+                            raw = raw_feats[layer_id]
+                            feat_spatial = raw.reshape(
+                                len(f3r_filelist), F3R_HTOK, F3R_WTOK, F3R_C
+                            ).contiguous()
+                            per_layer_collect[layer_id].append(feat_spatial[feat_spatial.shape[0] // 2])
                     else:
                         raise NotImplementedError(
                             f"target_isolated mode not implemented for vfm={args.vfm}"

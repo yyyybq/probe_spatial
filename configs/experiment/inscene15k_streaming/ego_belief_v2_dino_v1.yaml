@@ -6,20 +6,20 @@ defaults:
   - override /callbacks: v3_checkpoint
 
 seed: 42
-tags: ["train", "inscene15k_streaming", "cogvideox", "streaming_prefix", "ego_belief_v2"]
+tags: ["train", "inscene15k_streaming", "dino", "streaming_prefix", "ego_belief_v2"]
 
 task_name: inscene15k_streaming
-job_name: ego_belief_v2_cogvideox_v1
+job_name: ego_belief_v2_dino_v1
 autoresume: true
 
 paths:
   run_folder_name: ${task_name}_${job_name}
 
-feat_postfix: _t749_layer20
+feat_postfix: ""
 feature_layer: null
 feature_timestep: 749
-vfm_name: cogvideox
-video_channels: 3072
+vfm_name: dino
+video_channels: 1024
 prefix_len: 8
 streaming_hidden_seed_prefix_len: 8
 streaming_hidden_prefix_lengths: [8, 12, 16, 24]
@@ -52,8 +52,8 @@ model:
     num_layers: 4
     num_heads: 8
     max_seq_len: 64
-    max_h: 18
-    max_w: 32
+    max_h: 30
+    max_w: 52
     n_az_bins: 16
     n_el_bins: 8
     patch_pool: 2

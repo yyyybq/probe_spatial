@@ -1,5 +1,5 @@
 # @package _global_
-# B2: Object-query localization under the shared streaming-prefix protocol for V-JEPA2.
+# B2: Object-query localization under the shared streaming-prefix protocol.
 
 defaults:
   - override /model: probe_ext
@@ -20,15 +20,17 @@ feature_layer: null
 feature_timestep: 749
 vfm_name: vjepa2
 video_channels: 1024
-prefix_len: 4
+prefix_len: 8
+streaming_hidden_seed_prefix_len: 8
+streaming_hidden_prefix_lengths: [8, 12, 16, 24]
 streaming_feat_root: ${oc.env:INSCENE_STREAMING_FEAT_ROOT}
 
 data:
   data_module:
     train_datasets:
-    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'], split='train', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=64, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True)
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'], split='train', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True, streaming_shared_hidden_obj=True, streaming_hidden_seed_prefix_len=${streaming_hidden_seed_prefix_len}, streaming_hidden_prefix_lengths=${streaming_hidden_prefix_lengths})
     validation_datasets:
-    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'], split='val', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=64, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True)
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'], split='val', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=76, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=True, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_hidden_obj=True, streaming_shared_hidden_obj=True, streaming_hidden_seed_prefix_len=${streaming_hidden_seed_prefix_len}, streaming_hidden_prefix_lengths=${streaming_hidden_prefix_lengths})
     batch_size_per_device: 1
     batch_size_per_device_val: 1
     num_workers: 8

@@ -1,5 +1,5 @@
 # @package _global_
-# C3: Counterfactual action prediction under the shared streaming-prefix protocol for V-JEPA2.
+# C3: Counterfactual action prediction under the shared streaming-prefix protocol.
 
 defaults:
   - override /model: probe_ext
@@ -20,9 +20,9 @@ feature_layer: null
 feature_timestep: 749
 vfm_name: vjepa2
 video_channels: 1024
-prefix_len: 4
+prefix_len: 8
 streaming_feat_root: ${oc.env:INSCENE_STREAMING_FEAT_ROOT}
-target_feat_root: ${oc.env:INSCENE_TARGET_FEAT_ROOT}
+target_feat_root: ${oc.env:INSCENE_TARGET_FEAT_ROOT,}
 action_horizons: [1, 2, 4]
 counterfactual_min_overlap: 0.05
 

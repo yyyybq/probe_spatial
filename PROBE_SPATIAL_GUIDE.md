@@ -803,6 +803,10 @@ VFM=qwen2_5_vl PREFIX_LENGTHS="8 12 16 24" LAYERS="-1 8 16 24 31" \
   bash scripts/run_streaming_probe_sweep.sh
 ```
 
+The main streaming script defaults to the full model matrix
+`wan cogvideox vjepa2 dino aether f3r qwen2_5_vl_3b bagel`; direct VLM models
+automatically route to `inscene15k_streaming/direct_vlm_*` configs.
+
 `features/run_inscene15k_mllm.py` supports `normal`, `shuffled`,
 `streaming_prefix`, `context_segment` and `target_isolated`. VLM
 `streaming_prefix` forwards the true prefix length without padding; VLM

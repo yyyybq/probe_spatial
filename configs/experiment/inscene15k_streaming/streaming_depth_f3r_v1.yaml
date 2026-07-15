@@ -7,20 +7,20 @@ defaults:
 
 seed: 42
 
-tags: ["train", "inscene15k_streaming", "vjepa2", "streaming_prefix", "depth", "camera"]
+tags: ["train", "inscene15k_streaming", "f3r", "streaming_prefix", "depth", "camera"]
 
 task_name: inscene15k_streaming
-job_name: streaming_depth_vjepa2_v1
+job_name: streaming_depth_f3r_v1
 
 autoresume: true
 
 paths:
   run_folder_name: ${task_name}_${job_name}
 
-feat_postfix: _layer23
+feat_postfix: _l24
 feature_layer: null
 feature_timestep: 749
-vfm_name: vjepa2
+vfm_name: f3r
 video_channels: 1024
 prefix_len: 8
 prefix_min_len: ${prefix_len}

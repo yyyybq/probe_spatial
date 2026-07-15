@@ -6,19 +6,19 @@ defaults:
   - override /callbacks: v3_checkpoint
 
 seed: 42
-tags: ["train", "inscene15k_streaming", "vjepa2", "streaming_prefix", "action_dynamics"]
+tags: ["train", "inscene15k_streaming", "dino", "streaming_prefix", "action_dynamics"]
 
 task_name: inscene15k_streaming
-job_name: action_dynamics_vjepa2_v1
+job_name: action_dynamics_dino_v1
 autoresume: true
 
 paths:
   run_folder_name: ${task_name}_${job_name}
 
-feat_postfix: _layer23
+feat_postfix: ""
 feature_layer: null
 feature_timestep: 749
-vfm_name: vjepa2
+vfm_name: dino
 video_channels: 1024
 prefix_len: 8
 streaming_feat_root: ${oc.env:INSCENE_STREAMING_FEAT_ROOT}

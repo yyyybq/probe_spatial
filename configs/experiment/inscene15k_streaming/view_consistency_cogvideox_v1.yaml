@@ -1,5 +1,5 @@
 # @package _global_
-# A2: View Consistency under the shared streaming-prefix protocol for CogVideoX.
+# A2: View Consistency under the shared streaming-prefix protocol.
 
 defaults:
   - override /model: probe_ext
@@ -20,7 +20,7 @@ feature_layer: null
 feature_timestep: 749
 vfm_name: cogvideox
 video_channels: 3072
-prefix_len: 4
+prefix_len: 8
 streaming_feat_root: ${oc.env:INSCENE_STREAMING_FEAT_ROOT}
 
 data:

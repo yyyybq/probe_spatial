@@ -42,8 +42,11 @@ layer sweeps distinct `job_name`/`paths.run_folder_name` values.
   The default sweep uses exact prefix lengths `8,12,16,24`; training keeps one
   fixed `prefix_len` per run to avoid variable-length batches.
 
-Wan defaults to layer 20 at timestep 749, CogVideoX to layer 20 at timestep 749,
-and V-JEPA2 to layer 23. Cache files are safetensors with atomic replacement,
+The default streaming sweep now covers `wan`, `cogvideox`, `vjepa2`, `dino`,
+`aether`, `f3r`, `qwen2_5_vl_3b`, and `bagel`. Registered default layers are:
+Wan layer 20 at timestep 749, CogVideoX layer 20 at timestep 749, V-JEPA2 layer
+23, DINO layer 0, Aether layer 1 at timestep 749, Fast3R layer 24, and direct
+VLM/BAGEL layer `-1`. Cache files are safetensors with atomic replacement,
 checksums and sidecar manifests. Dataset channel counts and `feat_postfix` must
 match the extractor exactly.
 
@@ -307,9 +310,11 @@ temporal streaming experiments are ScanNet++ only.
 - `scripts/run_direct_vlm_probe_sweep.sh` wraps the existing layer-sweep script
   for non-streaming A2/A3/B1/B2/C1/C2/C3. A3 uses `shuffled` caches; C probes
   use causal `context_segment` inputs and exact `target_isolated` targets.
-- `scripts/run_streaming_probe_sweep.sh` now treats `qwen2_5_vl*` and `bagel`
-  as MLLM backends and selects `inscene15k_streaming/direct_vlm_*` configs.
-  Streaming VLM prefixes are independently forwarded as `[I_0, ..., I_t]`.
+- `scripts/run_streaming_probe_sweep.sh` defaults to the full model matrix
+  `wan cogvideox vjepa2 dino aether f3r qwen2_5_vl_3b bagel`. It treats
+  `qwen2_5_vl*` and `bagel` as MLLM backends and selects
+  `inscene15k_streaming/direct_vlm_*` configs. Streaming VLM prefixes are
+  independently forwarded as `[I_0, ..., I_t]`.
 - The sweep scripts infer `video_channels` from each cached `.sft` file before
   training, which matters because Qwen `-1` visual-merger features and
   non-negative vision-block features can have different channel dimensions.
