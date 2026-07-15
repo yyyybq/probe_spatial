@@ -49,6 +49,7 @@ certificate.pem
 logs/
 gradio_tmp_dir/
 temp**
+!vidfm3d/utils/temporal_sampling.py
 demo_outputs/
 comparison_*.csv
 layer_sweep_*.csv
