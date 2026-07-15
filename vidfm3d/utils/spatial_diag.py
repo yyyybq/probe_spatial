@@ -180,6 +180,56 @@ def compute_hidden_object_target(
     )
 
 
+def compute_visible_object_target(
+    identity_ids: torch.Tensor,    # (S, H, W) long
+    pmaps_world: torch.Tensor,     # (S, H, W, 3) world coords
+    confmaps: torch.Tensor,        # (S, H, W)  -- 0 means invalid pixel
+    extrinsics: torch.Tensor,      # (S, 3, 4) world->camera
+    min_visible_pixels: int = 200,
+    last_frame_idx: int = -1,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Pick a current-view visible object and return its location target.
+
+    This is a B2 sanity target: the object must be visible in the reference
+    frame itself, and the returned per-frame mask includes that reference-frame
+    visibility. It asks whether the probe can solve basic visible-object
+    localization before we ask it to infer hidden-object location from memory.
+    """
+    S, _H, _W = identity_ids.shape
+    valid_pix = confmaps > 0
+    last_idx = last_frame_idx if last_frame_idx >= 0 else (S + last_frame_idx)
+    if last_idx < 0 or last_idx >= S:
+        return None
+
+    ids_last = identity_ids[last_idx][valid_pix[last_idx]]
+    if ids_last.numel() == 0:
+        return None
+    unique_ids, counts = torch.unique(ids_last, return_counts=True)
+
+    candidates = []
+    for oid, cnt in zip(unique_ids.tolist(), counts.tolist()):
+        if oid <= 0 or cnt < min_visible_pixels:
+            continue
+        total_count = int(((identity_ids == int(oid)) & valid_pix).sum().item())
+        score = int(cnt) * 1_000_000 + total_count
+        candidates.append((score, int(oid)))
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    return compute_object_target_for_id(
+        obj_id=candidates[0][1],
+        identity_ids=identity_ids,
+        pmaps_world=pmaps_world,
+        confmaps=confmaps,
+        extrinsics=extrinsics,
+        min_visible_pixels=min_visible_pixels,
+        last_frame_idx=last_frame_idx,
+        require_hidden=False,
+        centroid_frame_idx=last_idx,
+    )
+
+
 def select_streaming_hidden_object_id(
     identity_ids: torch.Tensor,       # (S, H, W) long, raw instance ids
     seed_visible_indices: list[int],
@@ -235,6 +285,130 @@ def select_streaming_hidden_object_id(
     return int(candidates[0][1])
 
 
+def select_common_history_hidden_object_id(
+    identity_ids: torch.Tensor,       # (S, H, W) long, raw instance ids
+    confmaps: torch.Tensor,           # (S, H, W), >0 means valid geometry
+    history_len: int = 8,
+    hidden_tail_indices: list[int] | None = None,
+    required_visible_indices: list[int] | None = None,
+    preferred_visible_indices: list[int] | None = None,
+    min_visible_pixels: int = 200,
+    min_history_visible_frames: int = 3,
+    min_query_pixels: int = 1024,
+    min_border_px: int = 16,
+    strict_post_history: bool = False,
+) -> Optional[int]:
+    """Select one object visible in common history and hidden afterwards.
+
+    This is the main B1/B2 streaming selector for temporal ScanNet++ windows:
+    the object query is grounded in the common history, while every compared
+    prefix tail after the history must be hidden.  Prefixes at or before the
+    common-history tail can be used as visible-current baselines by listing the
+    tail in ``preferred_visible_indices``; this biases selection toward objects
+    visible at that tail without making visibility mandatory.
+    """
+    S, H, W = identity_ids.shape
+    device = identity_ids.device
+    valid = confmaps.to(device) > 0
+    history_len = max(1, min(int(history_len), S))
+    hidden_tail_indices = [int(i) for i in (hidden_tail_indices or []) if 0 <= int(i) < S]
+    required_visible_indices = [
+        int(i) for i in (required_visible_indices or []) if 0 <= int(i) < S
+    ]
+    preferred_visible_indices = [
+        int(i) for i in (preferred_visible_indices or []) if 0 <= int(i) < S
+    ]
+    if not hidden_tail_indices and not required_visible_indices and not preferred_visible_indices:
+        return None
+
+    hidden_checks = set(hidden_tail_indices)
+    if strict_post_history:
+        hidden_checks.update(range(history_len, S))
+
+    visible_frame_count: dict[int, int] = {}
+    visible_pixels_total: dict[int, int] = {}
+    max_pixels: dict[int, int] = {}
+    best_frame: dict[int, int] = {}
+
+    for s in range(history_len):
+        ids_s = identity_ids[s]
+        valid_s = valid[s]
+        unique_ids = torch.unique(ids_s[valid_s])
+        for oid_t in unique_ids:
+            oid = int(oid_t.item())
+            if oid < 0:
+                continue
+            cnt = int(((ids_s == oid) & valid_s).sum().item())
+            if cnt < min_visible_pixels:
+                continue
+            visible_frame_count[oid] = visible_frame_count.get(oid, 0) + 1
+            visible_pixels_total[oid] = visible_pixels_total.get(oid, 0) + cnt
+            if cnt > max_pixels.get(oid, 0):
+                max_pixels[oid] = cnt
+                best_frame[oid] = s
+
+    candidates = []
+    for oid, n_frames in visible_frame_count.items():
+        if n_frames < int(min_history_visible_frames):
+            continue
+        if max_pixels.get(oid, 0) < int(min_query_pixels):
+            continue
+
+        bf = best_frame[oid]
+        m_best = (identity_ids[bf] == oid) & valid[bf]
+        ys, xs = torch.nonzero(m_best, as_tuple=True)
+        if xs.numel() == 0:
+            continue
+        border = min(
+            int(xs.min().item()),
+            int(ys.min().item()),
+            int(W - 1 - xs.max().item()),
+            int(H - 1 - ys.max().item()),
+        )
+        if border < int(min_border_px):
+            continue
+
+        visible_ok = True
+        for s in required_visible_indices:
+            cnt = int(((identity_ids[s] == oid) & valid[s]).sum().item())
+            if cnt < min_visible_pixels:
+                visible_ok = False
+                break
+        if not visible_ok:
+            continue
+
+        hidden_ok = True
+        for s in hidden_checks:
+            cnt = int(((identity_ids[s] == oid) & valid[s]).sum().item())
+            if cnt >= min_visible_pixels:
+                hidden_ok = False
+                break
+        if not hidden_ok:
+            continue
+
+        preferred_visible = 0
+        preferred_pixels = 0
+        for s in preferred_visible_indices:
+            cnt = int(((identity_ids[s] == oid) & valid[s]).sum().item())
+            if cnt >= min_visible_pixels:
+                preferred_visible += 1
+                preferred_pixels += cnt
+
+        score = (
+            preferred_visible * 1_000_000_000_000
+            + n_frames * 1_000_000_000
+            + max_pixels.get(oid, 0) * 1_000
+            + preferred_pixels
+            + visible_pixels_total.get(oid, 0)
+        )
+        candidates.append((score, oid))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return int(candidates[0][1])
+
+
 def compute_object_target_for_id(
     obj_id: int,
     identity_ids: torch.Tensor,    # (S, H, W) long
@@ -244,6 +418,7 @@ def compute_object_target_for_id(
     min_visible_pixels: int = 200,
     last_frame_idx: int = -1,
     require_hidden: bool = True,
+    centroid_frame_idx: Optional[int] = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """Return the current-prefix polar target and masks for a fixed object id."""
     S, H, W = identity_ids.shape
@@ -257,12 +432,12 @@ def compute_object_target_for_id(
     if require_hidden and last_count >= min_visible_pixels:
         return None
 
-    # Build per-frame mask for the current prefix only. The final/current frame
-    # remains masked out because the task is hidden-object localization.
+    # Build per-frame mask for the current prefix only. Hidden-object targets
+    # mask out the reference frame; visible-object sanity targets keep it.
     per_frame_mask = torch.zeros(S, H, W, dtype=torch.bool, device=device)
     seen_before = False
     for s in range(S):
-        if s == last_idx:
+        if require_hidden and s == last_idx:
             continue
         m = (identity_ids[s] == obj_id) & valid_pix[s]
         if m.sum().item() >= min_visible_pixels:
@@ -271,9 +446,22 @@ def compute_object_target_for_id(
     if not seen_before:
         return None
 
-    centroid_world, _ = _world_centroid_of_object(
-        obj_id, identity_ids, pmaps_world, confmaps
-    )
+    if centroid_frame_idx is None:
+        centroid_world, _ = _world_centroid_of_object(
+            obj_id, identity_ids, pmaps_world, confmaps
+        )
+    else:
+        centroid_idx = centroid_frame_idx if centroid_frame_idx >= 0 else (S + centroid_frame_idx)
+        if centroid_idx < 0 or centroid_idx >= S:
+            return None
+        centroid_world, centroid_score = _world_centroid_of_object(
+            obj_id,
+            identity_ids[centroid_idx : centroid_idx + 1],
+            pmaps_world[centroid_idx : centroid_idx + 1],
+            confmaps[centroid_idx : centroid_idx + 1],
+        )
+        if centroid_score < min_visible_pixels:
+            return None
 
     # Transform centroid to last frame camera coords
     R = extrinsics[last_idx, :3, :3].to(dtype)

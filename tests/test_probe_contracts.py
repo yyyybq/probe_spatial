@@ -12,6 +12,7 @@ from vidfm3d.models.components.probe_ego_belief_v2 import EgoBeliefProbeV2
 from vidfm3d.data.components.inscene15k_dataset import InsScene15KDataset
 from vidfm3d.train import _guard_probe_world_size
 from vidfm3d.utils.spatial_diag import (
+    compute_visible_object_target,
     compute_object_target_for_id,
     select_streaming_hidden_object_id,
 )
@@ -126,6 +127,28 @@ def test_streaming_b_fixed_object_target_uses_current_prefix_only():
     assert target["per_frame_mask"][0].all()
     assert target["per_frame_mask"][4].all()
     assert not target["per_frame_mask"][-1].any()
+
+
+def test_visible_object_target_keeps_reference_frame_mask():
+    masks = torch.zeros(4, 3, 3, dtype=torch.long)
+    masks[0, :2, :2] = 5
+    masks[-1, :2, :2] = 5
+    pmaps = torch.zeros(4, 3, 3, 3)
+    pmaps[..., 2] = 2.0
+    conf = torch.ones(4, 3, 3)
+    extr = torch.eye(4)[:3].repeat(4, 1, 1)
+
+    target = compute_visible_object_target(
+        identity_ids=masks,
+        pmaps_world=pmaps,
+        confmaps=conf,
+        extrinsics=extr,
+        min_visible_pixels=4,
+        last_frame_idx=-1,
+    )
+    assert target is not None
+    assert int(target["obj_id"].item()) == 5
+    assert int(target["per_frame_mask"][-1].sum().item()) == 4
 
 
 def test_b2_has_object_query_without_current_role_embedding():

@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
-# Sweep training for newly added C2/C3 diagnostic probes.
-#   DRY_RUN=1 bash scripts/run_diag_new_sweep.sh
-#   bash scripts/run_diag_new_sweep.sh
-#   VFMS="wan vjepa2" PROBES="path_integration" bash scripts/run_diag_new_sweep.sh
+# Legacy non-streaming sweep training for C2/C3 diagnostic probes.
+#   ALLOW_NON_STREAMING=1 DRY_RUN=1 bash scripts/run_diag_new_sweep.sh
+#   ALLOW_NON_STREAMING=1 bash scripts/run_diag_new_sweep.sh
+#   ALLOW_NON_STREAMING=1 VFMS="wan vjepa2" PROBES="path_integration" bash scripts/run_diag_new_sweep.sh
 set -euo pipefail
 
 PYTHON=${PYTHON:-python}
+ALLOW_NON_STREAMING=${ALLOW_NON_STREAMING:-0}
 DEV=${DEV:-0}
 DRY_RUN=${DRY_RUN:-0}
 VFMS=${VFMS:-"wan vjepa2 cogvideox"}
 PROBES=${PROBES:-"path_integration counterfactual"}
 EXTRA=${EXTRA:-}
+
+if [[ "${ALLOW_NON_STREAMING}" != "1" ]]; then
+    cat >&2 <<'EOF'
+[err] run_diag_new_sweep.sh is a legacy non-streaming sweep.
+      Streaming is the project default. Use:
+        bash scripts/run_streaming_probe_sweep.sh
+      To intentionally run this old path, set ALLOW_NON_STREAMING=1.
+EOF
+    exit 2
+fi
 
 export PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"

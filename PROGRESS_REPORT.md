@@ -12,19 +12,67 @@
 > historical diagnostics and require rerunning before publication.
 
 > **2026-06-28 protocol change:** Streaming is now a shared setting across
-> A1/A2/B1/B2/C1/C2/C3, using prefix lengths `4,8,16,32,64`. B1 includes a
+> A1/A2/B1/B2/C1/C2/C3. The current default prefix lengths are `8,12,16,24`
+> over ScanNet++ motion-normalized temporal windows. B1 includes a
 > final-prefix-frame global feature and B1/B2 GT is expressed in that final
 > prefix frame's camera coordinates. Streaming C probes use `streaming_prefix`
 > inputs, actions relative to the prefix tail, and exact `target_isolated`
 > future targets. Treat older non-streaming numbers below as historical unless
 > explicitly rerun under the new configs.
 
-> **2026-07-01 protocol change:** Streaming B1/B2 now select one shared object
-> id per scene from the first four-frame prefix. The object must be visible in
-> frames `0,1,2`, hidden at frame `3`, and hidden at every compared prefix tail
-> such as `7,15,31,63`. Prefix `4/8/16/32/64` jobs therefore evaluate the same
-> object with increasing observed history instead of reselecting a different
-> hidden object per prefix.
+> **2026-07-01 protocol change, superseded by current common-history rule:**
+> Streaming B1/B2 now select one shared object id per ScanNet++ temporal window
+> from the first 8 observations. The object must be visible in at least three
+> history observations, sufficiently large, and away from the image border;
+> visibility at `obs7` is preferred but not required. Prefix `8/12/16/24` jobs
+> therefore evaluate the same object with increasing observed history instead of
+> reselecting a different hidden object per prefix. Hidden-object B requires the
+> same object to be hidden at tails `obs11/obs15/obs23` for prefixes `12/16/24`.
+
+> **2026-07-07 analysis addition:** Added `visible_ego_belief_v2`, a B2 sanity
+> experiment that predicts the position of an object visible in the current
+> prefix-tail frame. It uses the same B2 head and metrics, but changes target
+> selection from hidden-now to visible-now, so poor results diagnose basic
+> localization or feature alignment before hidden-object memory difficulty.
+
+> **2026-07-01 VLM probing extension:** Qwen2.5-VL / Qwen2.5-VL-3B / BAGEL now
+> support a direct layer-probing path parallel to SAE. Cached VLM activations
+> from `features/run_inscene15k_mllm.py` can feed the standard A2/B1/B2 probe
+> heads through `direct_vlm_*` configs and `scripts/run_direct_vlm_probe_sweep.sh`.
+> SAE remains a separate sparse-dictionary diagnostic rather than a replacement
+> for direct probing.
+
+> **2026-07-01 VLM protocol alignment:** Direct VLM probing now follows the same
+> cache protocol as other VFMs. `features/run_inscene15k_mllm.py` supports
+> `normal`, `shuffled`, `streaming_prefix`, `context_segment` and
+> `target_isolated`; non-streaming direct VLM configs cover A2/A3/B1/B2/C1/C2/C3,
+> and streaming direct VLM configs cover A1/A2/B1/B2/C1/C2/C3.
+
+> **2026-07-02 Default-setting change:** Streaming is now the default project
+> setting. Legacy normal/full-clip sweep scripts refuse to run unless
+> `ALLOW_NON_STREAMING=1`, and `vidfm3d/train.py` rejects `inscene15k` /
+> `inscene15k_ext` training unless the same opt-in is provided.
+
+> **2026-07-15 temporal-data correction:** Infinigen frames are independent
+> rendered camera views rather than a continuous video trajectory. All old
+> streaming/cache/run results that include Infinigen are historical only and
+> must not be used for temporal, memory, action, path-integration, or
+> counterfactual conclusions. Current temporal streaming probes are ScanNet++
+> only, use motion-normalized temporal windows, and cache shared prefixes
+> `8,12,16,24`. Hidden B1/B2 now use common history `0..7`; object selection
+> prefers visibility at prefix `8`'s tail, while prefixes `12/16/24` require
+> hidden tails `11/15/23`. C probes use shared streaming-prefix inputs, but default to
+> exact `target_isolated` target features whose frame ids are derived from the
+> same streaming windows and horizons.
+
+> **2026-07-15 C-horizon update:** The default C target horizons were shortened
+> from `4/8/16` to `1/2/4` sampled observations. Under the current
+> `motion_step=0.35, rotation_weight=0.5` ScanNet++ sampler, horizons
+> `4/8/16` corresponded roughly to median rotations of `42/55/81` degrees and
+> median raw-video gaps of `5.0/10.3/21.3` seconds, which is too hard for the
+> main feature-prediction conclusion. The new main setting uses C1 horizon
+> `[1]` and C2/C3 horizons `[1,2,4]`; longer horizons can still be run as a
+> stress-test override.
 
 ## 2026-06-14 方法更新：支持 layer-wise probing
 

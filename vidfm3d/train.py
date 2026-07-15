@@ -107,6 +107,23 @@ def _guard_probe_world_size(cfg: DictConfig) -> None:
         )
 
 
+def _guard_legacy_non_streaming(cfg: DictConfig) -> None:
+    """Require explicit opt-in for legacy full-clip InsScene experiments."""
+
+    task_name = str(cfg.get("task_name", ""))
+    if task_name not in {"inscene15k", "inscene15k_ext"}:
+        return
+    if os.environ.get("ALLOW_NON_STREAMING") == "1" or cfg.get("allow_non_streaming", False):
+        return
+    raise ValueError(
+        f"Refusing legacy non-streaming task_name={task_name!r}. "
+        "Streaming is the project default; use experiment=inscene15k_streaming/... "
+        "or scripts/run_streaming_probe_sweep.sh. If this is an intentional "
+        "historical/ablation run, set ALLOW_NON_STREAMING=1 or "
+        "allow_non_streaming=true."
+    )
+
+
 def python_eval_resolver(code: str):
     return eval(code)
 
@@ -128,6 +145,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     :return: A tuple with metrics and dict with all instantiated objects.
     """
     _guard_probe_world_size(cfg)
+    _guard_legacy_non_streaming(cfg)
 
     # set seed for random number generators in pytorch, numpy and python.random
     if cfg.get("seed"):

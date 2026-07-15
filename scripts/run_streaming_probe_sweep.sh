@@ -7,8 +7,12 @@
 # the online-history protocol.
 #
 # Examples:
-#   DRY_RUN=1 PROBES="ego_belief ego_belief_v2" PREFIX_LENGTHS="4 8 16 32 64" \
+#   DRY_RUN=1 PROBES="ego_belief ego_belief_v2" PREFIX_LENGTHS="8 12 16 24" \
 #     bash scripts/run_streaming_probe_sweep.sh
+#
+#   # B2 sanity: current-view visible object localization.
+#   DEV=0 VFM=wan PROBES="visible_ego_belief_v2" PREFIX_LENGTHS="8 12 16 24" \
+#   LAYERS="default" bash scripts/run_streaming_probe_sweep.sh
 #
 #   PYTHON=/data/baiqiao/miniconda3/envs/vidfm3d/bin/python DEV=0 \
 #   PROBES="view_consistency ego_belief action_dynamics path_integration counterfactual" \
@@ -18,13 +22,19 @@ set -euo pipefail
 
 PYTHON=${PYTHON:-python}
 VFM=${VFM:-wan}
+VFM_NAME=${VFM_NAME:-${VFM}}
 T=${T:-749}
 DEV=${DEV:-0}
 DRY_RUN=${DRY_RUN:-0}
 SPLIT=${SPLIT:-val}
 
 PROBES=${PROBES:-"streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual"}
-PREFIX_LENGTHS=${PREFIX_LENGTHS:-"4 8 16 32 64"}
+PREFIX_LENGTHS=${PREFIX_LENGTHS:-"8 12 16 24"}
+B_HIDDEN_PREFIX_LENGTHS=${B_HIDDEN_PREFIX_LENGTHS:-"8 12 16 24"}
+C_PREFIX_LENGTHS=${C_PREFIX_LENGTHS:-${PREFIX_LENGTHS}}
+C_TARGET_HORIZONS=${C_TARGET_HORIZONS:-"1 2 4"}
+STREAMING_MOTION_STEP=${STREAMING_MOTION_STEP:-0.35}
+STREAMING_ROTATION_WEIGHT=${STREAMING_ROTATION_WEIGHT:-0.5}
 LAYERS=${LAYERS:-default}
 
 DATA_ROOT=${DATA_ROOT:-${INSCENE_DATA_ROOT:?set DATA_ROOT or INSCENE_DATA_ROOT}}
@@ -41,6 +51,12 @@ EXTRA_EXTRACT=${EXTRA_EXTRACT:-}
 EXTRA_TARGET_EXTRACT=${EXTRA_TARGET_EXTRACT:-}
 EXTRA_TRAIN=${EXTRA_TRAIN:-}
 EXTRA_EVAL=${EXTRA_EVAL:-}
+MLLM=${MLLM:-auto}
+BACKEND=${BACKEND:-}
+MODEL_ID=${MODEL_ID:-}
+NUM_FRAMES=${NUM_FRAMES:-}
+RESIZE=${RESIZE:-}
+VIDEO_CHANNELS=${VIDEO_CHANNELS:-auto}
 
 export PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -93,7 +109,11 @@ safe_name() {
 
 probe_cfg() {
     local probe="$1"
-    printf 'inscene15k_streaming/%s_%s_v1' "${probe}" "${VFM}"
+    if [[ "${MLLM}" == "1" ]]; then
+        printf 'inscene15k_streaming/direct_vlm_%s_v1' "${probe}"
+    else
+        printf 'inscene15k_streaming/%s_%s_v1' "${probe}" "${VFM}"
+    fi
 }
 
 probe_needs_target_cache() {
@@ -123,12 +143,24 @@ if (( ${#layers_resolved[@]} == 0 )); then
     exit 1
 fi
 
-video_channels=$("${PYTHON}" scripts/resolve_feature_layers.py --vfm "${VFM}" --field in_channels 2>/dev/null || true)
-if [[ -z "${video_channels}" ]]; then
+if [[ "${MLLM}" == "auto" ]]; then
     case "${VFM}" in
-        cogvideox) video_channels=3072 ;;
-        vjepa2|vjepa) video_channels=1024 ;;
-        *) video_channels=1536 ;;
+        qwen2_5_vl*|bagel) MLLM=1 ;;
+        *) MLLM=0 ;;
+    esac
+fi
+if [[ "${MLLM}" == "1" && -z "${BACKEND}" ]]; then
+    case "${VFM}" in
+        qwen2_5_vl*) BACKEND=qwen2_5_vl ;;
+        bagel) BACKEND=bagel_hf ;;
+        *) BACKEND=generic_hf ;;
+    esac
+fi
+if [[ "${MLLM}" == "1" && -z "${MODEL_ID}" ]]; then
+    case "${VFM}" in
+        qwen2_5_vl_3b) MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct ;;
+        qwen2_5_vl) MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct ;;
+        bagel) MODEL_ID=ByteDance-Seed/BAGEL-7B-MoT ;;
     esac
 fi
 
@@ -146,8 +178,11 @@ if (( max_prefix < 1 )); then
 fi
 
 prefix_name="prefix_$(safe_name "${PREFIX_LENGTHS}")"
-stream_root="${STREAM_ROOT_BASE}/${VFM}_${prefix_name}"
+motion_tag="${STREAMING_MOTION_STEP//./p}"
+rotation_tag="${STREAMING_ROTATION_WEIGHT//./p}"
+stream_root="${STREAM_ROOT_BASE}/${VFM}_${prefix_name}_m${motion_tag}_r${rotation_tag}"
 hidden_prefix_list="[${PREFIX_LENGTHS// /,}]"
+hidden_train_prefix_list="[${B_HIDDEN_PREFIX_LENGTHS// /,}]"
 
 split_extra "${EXTRA_EXTRACT}" extra_extract_args
 split_extra "${EXTRA_TARGET_EXTRACT}" extra_target_extract_args
@@ -158,19 +193,82 @@ echo "[info] vfm=${VFM} probes=${PROBES}"
 echo "[info] prefix_lengths=${PREFIX_LENGTHS} layers=${layers_resolved[*]}"
 echo "[info] streaming_feat_root=${stream_root}"
 
+resolve_channels() {
+    local layer="$1"
+    if [[ "${VIDEO_CHANNELS}" != "auto" ]]; then
+        printf '%s\n' "${VIDEO_CHANNELS}"
+        return 0
+    fi
+    "${PYTHON}" - "$stream_root" "$VFM" "$layer" "$T" <<'PY'
+import glob
+import os
+import sys
+
+from safetensors.torch import load_file
+from vidfm3d.utils.feature_layers import default_feature_channels, feature_filename
+
+root, vfm, layer, timestep = sys.argv[1:5]
+fname = feature_filename(vfm, feature_layer=int(layer), feature_timestep=int(timestep))
+patterns = [
+    os.path.join(root, vfm, "*", "*", "*", "*", fname),
+    os.path.join(root, vfm, "*", "*", "*", fname),
+    os.path.join(root, vfm, "*", "*", fname),
+]
+matches = []
+for pattern in patterns:
+    matches.extend(glob.glob(pattern))
+matches = sorted(set(matches))
+if matches:
+    feat = load_file(matches[0])["feat"]
+    print(int(feat.shape[-1]))
+else:
+    print(int(default_feature_channels(vfm)))
+PY
+}
+
 if [[ "${EXTRACT_STREAMING}" == "1" ]]; then
     echo "==== extract shared streaming-prefix cache ===="
-    cmd=("${PYTHON}" -m features.run_inscene15k
-        --vfm "${VFM}"
-        --mode streaming_prefix
-        --data-root "${DATA_ROOT}"
-        --out-root "${stream_root}"
-        --t "${T}"
-        --output-layers "${layers_resolved[@]}"
-        --prefix-min-len 1
-        --prefix-max-len "${max_prefix}"
-        --prefix-lengths "${PREFIX_LENGTHS}"
-    )
+    if [[ "${MLLM}" == "1" ]]; then
+        cmd=("${PYTHON}" -m features.run_inscene15k_mllm
+            --backend "${BACKEND}"
+            --vfm-name "${VFM_NAME}"
+            --mode streaming_prefix
+            --data-root "${DATA_ROOT}"
+            --out-root "${stream_root}"
+            --output-layers "${layers_resolved[@]}"
+            --source scannetpp
+            --prefix-min-len 1
+            --prefix-max-len "${max_prefix}"
+            --prefix-lengths "${PREFIX_LENGTHS}"
+            --streaming-motion-step "${STREAMING_MOTION_STEP}"
+            --streaming-rotation-weight "${STREAMING_ROTATION_WEIGHT}"
+        )
+        if [[ -n "${MODEL_ID}" ]]; then
+            cmd+=(--model-id "${MODEL_ID}")
+        fi
+        if [[ -n "${NUM_FRAMES}" ]]; then
+            cmd+=(--num-frames "${NUM_FRAMES}")
+        fi
+        if [[ -n "${RESIZE}" ]]; then
+            read -r -a resize_args <<< "${RESIZE}"
+            cmd+=(--resize "${resize_args[@]}")
+        fi
+    else
+        cmd=("${PYTHON}" -m features.run_inscene15k
+            --vfm "${VFM}"
+            --mode streaming_prefix
+            --data-root "${DATA_ROOT}"
+            --out-root "${stream_root}"
+            --t "${T}"
+            --output-layers "${layers_resolved[@]}"
+            --source scannetpp
+            --prefix-min-len 1
+            --prefix-max-len "${max_prefix}"
+            --prefix-lengths "${PREFIX_LENGTHS}"
+            --streaming-motion-step "${STREAMING_MOTION_STEP}"
+            --streaming-rotation-weight "${STREAMING_ROTATION_WEIGHT}"
+        )
+    fi
     cmd+=("${extra_extract_args[@]}")
     run_cmd "${cmd[@]}"
 fi
@@ -187,17 +285,57 @@ if [[ "${needs_targets}" == "1" && "${EXTRACT_TARGETS}" == "1" ]]; then
         exit 1
     fi
     echo "==== extract target-isolated cache for C probes ===="
-    cmd=("${PYTHON}" -m features.run_inscene15k
-        --vfm "${VFM}"
-        --mode target_isolated
-        --data-root "${DATA_ROOT}"
-        --out-root "${TARGET_FEAT_ROOT}"
-        --t "${T}"
-        --output-layers "${layers_resolved[@]}"
-        --num-targets 0
-    )
+    if [[ "${MLLM}" == "1" ]]; then
+        cmd=("${PYTHON}" -m features.run_inscene15k_mllm
+            --backend "${BACKEND}"
+            --vfm-name "${VFM_NAME}"
+            --mode target_isolated
+            --data-root "${DATA_ROOT}"
+            --out-root "${TARGET_FEAT_ROOT}"
+            --output-layers "${layers_resolved[@]}"
+            --source scannetpp
+            --prefix-max-len "${max_prefix}"
+            --prefix-lengths "${PREFIX_LENGTHS}"
+            --streaming-motion-step "${STREAMING_MOTION_STEP}"
+            --streaming-rotation-weight "${STREAMING_ROTATION_WEIGHT}"
+            --num-targets 0
+            --target-from-streaming-windows
+            --target-prefix-lengths "${C_PREFIX_LENGTHS}"
+            --target-horizons "${C_TARGET_HORIZONS}"
+        )
+        if [[ -n "${MODEL_ID}" ]]; then
+            cmd+=(--model-id "${MODEL_ID}")
+        fi
+        if [[ -n "${RESIZE}" ]]; then
+            read -r -a resize_args <<< "${RESIZE}"
+            cmd+=(--resize "${resize_args[@]}")
+        fi
+    else
+        cmd=("${PYTHON}" -m features.run_inscene15k
+            --vfm "${VFM}"
+            --mode target_isolated
+            --data-root "${DATA_ROOT}"
+            --out-root "${TARGET_FEAT_ROOT}"
+            --t "${T}"
+            --output-layers "${layers_resolved[@]}"
+            --source scannetpp
+            --prefix-max-len "${max_prefix}"
+            --prefix-lengths "${PREFIX_LENGTHS}"
+            --streaming-motion-step "${STREAMING_MOTION_STEP}"
+            --streaming-rotation-weight "${STREAMING_ROTATION_WEIGHT}"
+            --num-targets 0
+            --target-from-streaming-windows
+            --target-prefix-lengths "${C_PREFIX_LENGTHS}"
+            --target-horizons "${C_TARGET_HORIZONS}"
+        )
+    fi
     cmd+=("${extra_target_extract_args[@]}")
     run_cmd "${cmd[@]}"
+fi
+
+if [[ "${needs_targets}" == "1" && -z "${TARGET_FEAT_ROOT}" ]]; then
+    echo "[err] C probes need TARGET_FEAT_ROOT or INSCENE_TARGET_FEAT_ROOT" >&2
+    exit 1
 fi
 
 for probe in ${PROBES}; do
@@ -208,7 +346,14 @@ for probe in ${PROBES}; do
         exit 1
     fi
 
-    for prefix_len in ${PREFIX_LENGTHS}; do
+    probe_prefix_lengths="${PREFIX_LENGTHS}"
+    if probe_uses_shared_hidden_object "${probe}"; then
+        probe_prefix_lengths="${B_HIDDEN_PREFIX_LENGTHS}"
+    elif probe_needs_target_cache "${probe}"; then
+        probe_prefix_lengths="${C_PREFIX_LENGTHS}"
+    fi
+
+    for prefix_len in ${probe_prefix_lengths}; do
         for layer in "${layers_resolved[@]}"; do
             layer_name="$(safe_name "${layer}")"
             job="${probe}_${VFM}_p${prefix_len}_layer${layer_name}"
@@ -217,6 +362,7 @@ for probe in ${PROBES}; do
             ckpt="${run_dir}/checkpoints/last.ckpt"
 
             if [[ "${TRAIN}" == "1" ]]; then
+                video_channels="$(resolve_channels "${layer}")"
                 echo "==== train ${probe} prefix=${prefix_len} layer=${layer} ===="
                 cmd=(env CUDA_VISIBLE_DEVICES="${DEV}" "${PYTHON}" vidfm3d/train.py
                     "experiment=${cfg}"
@@ -231,7 +377,7 @@ for probe in ${PROBES}; do
                     "logger.wandb.name=${run_name}"
                 )
                 if probe_uses_shared_hidden_object "${probe}"; then
-                    cmd+=("streaming_hidden_prefix_lengths=${hidden_prefix_list}")
+                    cmd+=("streaming_hidden_prefix_lengths=${hidden_train_prefix_list}")
                 fi
                 if probe_needs_target_cache "${probe}"; then
                     cmd+=("target_feat_root=${TARGET_FEAT_ROOT}")
@@ -241,6 +387,7 @@ for probe in ${PROBES}; do
             fi
 
             if [[ "${EVAL}" == "1" && "${probe}" != "streaming_depth" ]]; then
+                video_channels="$(resolve_channels "${layer}")"
                 if [[ "${DRY_RUN}" != "1" && ! -f "${ckpt}" ]]; then
                     echo "[warn] missing checkpoint, skip eval: ${ckpt}" >&2
                     continue
@@ -262,7 +409,7 @@ for probe in ${PROBES}; do
                     "test=false"
                 )
                 if probe_uses_shared_hidden_object "${probe}"; then
-                    cmd+=("streaming_hidden_prefix_lengths=${hidden_prefix_list}")
+                    cmd+=("streaming_hidden_prefix_lengths=${hidden_train_prefix_list}")
                 fi
                 if probe_needs_target_cache "${probe}"; then
                     cmd+=("target_feat_root=${TARGET_FEAT_ROOT}")

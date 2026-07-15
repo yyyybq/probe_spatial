@@ -22,8 +22,8 @@
 #   DRY_RUN=1 INSCENE_BASE=/data/InsScene-15K bash scripts/reproduce_streaming.sh
 #
 # ── Required ──────────────────────────────────────────────────────────────────
-#   INSCENE_BASE      Root of InsScene-15K.  After download:
-#                       ${INSCENE_BASE}/data/processed_infinigen/
+#   INSCENE_BASE      Root of InsScene-15K. Temporal streaming reproduction is
+#                     ScanNet++ only:
 #                       ${INSCENE_BASE}/data/processed_scannetpp_v2/
 #
 # ── Step flags ────────────────────────────────────────────────────────────────
@@ -63,7 +63,9 @@
 #                     action_dynamics → C1 Latent Dynamics
 #                     path_integration→ C2 Path Integration
 #                     counterfactual  → C3 Counterfactual Action
-#   PREFIX_LENGTHS  Space-separated prefix lengths (default: "4 8 16 32 64")
+#   PREFIX_LENGTHS  Space-separated prefix lengths (default: "8 12 16 24")
+#   C_TARGET_HORIZONS
+#                   Space-separated C target horizons (default: "1 2 4")
 #
 # ── Other ─────────────────────────────────────────────────────────────────────
 #   PARALLEL     1=run VFMs in parallel, 0=sequential (default: 0)
@@ -79,7 +81,10 @@ INSCENE_BASE="${INSCENE_BASE:?Please set INSCENE_BASE=/path/to/InsScene-15K}"
 
 VFMS="${VFMS:-wan vjepa2 cogvideox}"
 PROBES="${PROBES:-streaming_depth view_consistency ego_belief_v2 action_dynamics path_integration counterfactual}"
-PREFIX_LENGTHS="${PREFIX_LENGTHS:-4 8 16 32 64}"
+PREFIX_LENGTHS="${PREFIX_LENGTHS:-8 12 16 24}"
+C_TARGET_HORIZONS="${C_TARGET_HORIZONS:-1 2 4}"
+STREAMING_MOTION_STEP="${STREAMING_MOTION_STEP:-0.35}"
+STREAMING_ROTATION_WEIGHT="${STREAMING_ROTATION_WEIGHT:-0.5}"
 
 # Global layer default; per-model variables (LAYERS_WAN etc.) override this.
 LAYERS="${LAYERS:-default}"
@@ -219,12 +224,13 @@ step_download() {
     echo "         Output: ${INSCENE_BASE}/data/"
     echo "════════════════════════════════════════════════════════"
 
-    if [[ -d "${DATA_ROOT}/processed_infinigen" && -d "${DATA_ROOT}/processed_scannetpp_v2" ]]; then
+    if [[ -d "${DATA_ROOT}/processed_scannetpp_v2" ]]; then
         echo "[skip] Data already present at ${DATA_ROOT}"
         return
     fi
 
-    run_cmd "${PYTHON}" data/download_inscene15k.py --step all --base-dir "${INSCENE_BASE}"
+    run_cmd "${PYTHON}" data/download_inscene15k.py --step download_scannetpp --base-dir "${INSCENE_BASE}"
+    run_cmd "${PYTHON}" data/download_inscene15k.py --step extract_scannetpp --base-dir "${INSCENE_BASE}"
 }
 
 # ── Step 2: Feature extraction ────────────────────────────────────────────────
@@ -244,7 +250,10 @@ step_extract() {
 
     local prefix_name
     prefix_name="prefix_$(safe_name "${PREFIX_LENGTHS}")"
-    local stream_root="${STREAM_ROOT_BASE}/${vfm}_${prefix_name}"
+    local motion_tag rotation_tag
+    motion_tag="${STREAMING_MOTION_STEP//./p}"
+    rotation_tag="${STREAMING_ROTATION_WEIGHT//./p}"
+    local stream_root="${STREAM_ROOT_BASE}/${vfm}_${prefix_name}_m${motion_tag}_r${rotation_tag}"
     local target_root="${TARGET_ROOT_BASE}/${vfm}"
 
     local max_prefix=0
@@ -267,9 +276,12 @@ step_extract() {
         --out-root "${stream_root}" \
         --t "${T}" \
         --output-layers ${layers_str} \
+        --source scannetpp \
         --prefix-min-len 1 \
         --prefix-max-len "${max_prefix}" \
-        --prefix-lengths "$(printf '%s' "${PREFIX_LENGTHS}" | tr ' ' ',')"
+        --prefix-lengths "$(printf '%s' "${PREFIX_LENGTHS}" | tr ' ' ',')" \
+        --streaming-motion-step "${STREAMING_MOTION_STEP}" \
+        --streaming-rotation-weight "${STREAMING_ROTATION_WEIGHT}"
 
     # Extract target cache only if C probes are requested
     local needs_targets=0
@@ -294,7 +306,15 @@ step_extract() {
             --out-root "${target_root}" \
             --t "${T}" \
             --output-layers ${layers_str} \
-            --num-targets 0
+            --source scannetpp \
+            --prefix-max-len "${max_prefix}" \
+            --prefix-lengths "$(printf '%s' "${PREFIX_LENGTHS}" | tr ' ' ',')" \
+            --streaming-motion-step "${STREAMING_MOTION_STEP}" \
+            --streaming-rotation-weight "${STREAMING_ROTATION_WEIGHT}" \
+            --num-targets 0 \
+            --target-from-streaming-windows \
+            --target-prefix-lengths "$(printf '%s' "${PREFIX_LENGTHS}" | tr ' ' ',')" \
+            --target-horizons "$(printf '%s' "${C_TARGET_HORIZONS}" | tr ' ' ',')"
     fi
 }
 
@@ -309,7 +329,10 @@ step_train_eval() {
 
     local prefix_name
     prefix_name="prefix_$(safe_name "${PREFIX_LENGTHS}")"
-    local stream_root="${STREAM_ROOT_BASE}/${vfm}_${prefix_name}"
+    local motion_tag rotation_tag
+    motion_tag="${STREAMING_MOTION_STEP//./p}"
+    rotation_tag="${STREAMING_ROTATION_WEIGHT//./p}"
+    local stream_root="${STREAM_ROOT_BASE}/${vfm}_${prefix_name}_m${motion_tag}_r${rotation_tag}"
     local target_root="${TARGET_ROOT_BASE}/${vfm}"
     local hidden_prefix_list="[$(printf '%s' "${PREFIX_LENGTHS}" | tr ' ' ',')]"
 
@@ -438,6 +461,9 @@ echo " INSCENE_BASE   : ${INSCENE_BASE}"
 echo " VFMS           : ${VFMS}"
 echo " PROBES         : ${PROBES}"
 echo " PREFIX_LENGTHS : ${PREFIX_LENGTHS}"
+echo " C_TARGET_HORIZONS: ${C_TARGET_HORIZONS}"
+echo " MOTION_STEP    : ${STREAMING_MOTION_STEP}"
+echo " ROTATION_WEIGHT: ${STREAMING_ROTATION_WEIGHT}"
 echo " LAYERS         : ${LAYERS}"
 for vfm in ${VFMS}; do
     upper="$(printf '%s' "${vfm}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"

@@ -27,16 +27,19 @@ layer sweeps distinct `job_name`/`paths.run_folder_name` values.
 
 ## 2. Required caches
 
-- `normal`: frozen VFM features used by non-causal/full-clip probes.
+- `normal`: frozen VFM features used by non-causal/full-clip probes. This is a
+  legacy mode and is no longer the default project setting.
 - `shuffled`: the same frame identities encoded in shuffled temporal context;
   required by A3.
 - `context_segment`: causal input segments forwarded as videos without future
   target frames; required by C1/C2/C3 inputs.
 - `target_isolated`: exact future target-frame features from an independent
-  forward; required by C1/C2/C3 targets.
+  forward.  Streaming C probes default to this mode to avoid target-frame
+  leakage; target frame ids are derived from the same streaming windows and
+  horizons as the C samples.
 - `streaming_prefix`: each observed prefix is forwarded independently. This is
   now the shared online-history cache for streaming A1/A2/B1/B2/C1/C2/C3.
-  The default sweep uses exact prefix lengths `4,8,16,32,64`; training keeps one
+  The default sweep uses exact prefix lengths `8,12,16,24`; training keeps one
   fixed `prefix_len` per run to avoid variable-length batches.
 
 Wan defaults to layer 20 at timestep 749, CogVideoX to layer 20 at timestep 749,
@@ -85,19 +88,29 @@ condition beyond the input feature sequence.
 
 For streaming probes, `InsScene15KDataset(streaming_prefix=True)` expands each
 scene into online prefix samples. A/B probes consume the prefix itself. C probes
-load the observed input from the `streaming_prefix` cache `[I_0..I_t]`, encode
-actions from the prefix tail `I_t` to future target frames, and load future
-supervision from `target_isolated`. The streaming C2/C3 default horizons are
-`[1,4,8,16]`, so `prefix_len=64` remains feasible for 81-frame Wan clips.
+load observed input from the current streaming prefix, encode actions from that
+prefix tail to future sampled observations, and by default load supervision
+from exact `target_isolated` features. Streaming prefix length is orthogonal to
+probe type, so C jobs run for each requested prefix length. The streaming C2/C3
+default horizons are `[1,2,4]`.
 
 ## 4.1 Current streaming code path audit
 
 This was rechecked against the current implementation after introducing the
 shared streaming interface:
 
-1. `features/run_inscene15k.py --mode streaming_prefix --prefix-lengths
-   "4,8,16,32,64"` forwards each requested prefix independently and writes
-   `prefix_<tail>/feature...sft` plus `prefix_index.npy`.
+**Temporal data validity update.** Infinigen frames are independent rendered
+views, not a continuous video trajectory.  Any old streaming/cache/run that
+included Infinigen is marked historical and must not be used for temporal,
+memory, action, path-integration, or counterfactual conclusions.  Current
+temporal streaming experiments are ScanNet++ only.
+
+1. `features/run_inscene15k.py --mode streaming_prefix --source scannetpp
+   --prefix-lengths "8,12,16,24"` builds motion-normalized ScanNet++ temporal
+   windows, forwards each requested prefix independently, and writes
+   `window_<id>/prefix_<tail>/feature...sft` plus `prefix_index.npy`. The
+   default observation spacing is `motion_step=0.35` with
+   `rotation_weight=0.5`.
 2. `scripts/run_streaming_probe_sweep.sh` extracts that cache once and trains
    separate fixed-shape jobs for each `(probe, prefix_len, layer)`. Mixed prefix
    lengths are not collated in the same batch.
@@ -105,9 +118,13 @@ shared streaming interface:
    `prefix_min_len=prefix_max_len=prefix_len`; the dataset therefore returns
    exactly the selected prefix.
 4. Streaming B1/B2 use `streaming_shared_hidden_obj=True`: the object id is
-   selected once per scene from the first four-frame prefix. It must be visible
-   in frames `[0,1,2]`, hidden at frame `3`, and hidden at every configured
-   prefix tail such as `[7,15,31,63]`. Prefix jobs then reuse that raw object id.
+   selected once per ScanNet++ temporal window from the common history
+   `[0..7]`. It must be visible in at least three history frames, have a large
+   non-border query frame. Selection prefers observation `7` visibility but
+   falls back when no obs7-visible candidate exists. Hidden B jobs use prefixes
+   `8/12/16/24`; prefix `8` is the visible-current baseline when the selected
+   object is visible at obs7, while prefixes `12/16/24` require the object to be
+   hidden at observation tails `11/15/23`.
 5. Streaming B1/B2 geometry is rebased with `ref_idx=len(prefix)-1`, and
    `compute_object_target_for_id(..., last_frame_idx=-1)` expresses the shared
    object's target in the current prefix-final camera coordinates. Only masks
@@ -117,12 +134,21 @@ shared streaming interface:
 7. Streaming B2 receives one object query plus all patch tokens from the prefix.
    No camera pose and no explicit current-frame role token are supplied.
 8. Streaming C1/C2/C3 go through `_getitem_feature_action_diag`: input features
-   are loaded from the prefix cache; target features are loaded from
-   `target_isolated`; actions are encoded from the prefix tail to each future
+   are loaded from the shared streaming prefix cache, while target features
+   default to exact `target_isolated` cache entries. The target frame ids are
+   computed from the same streaming window and future observation horizons for
+   each prefix length. With prefixes `8/12/16/24` and horizons `1/2/4`, the
+   target cache covers observation positions `8/9/11/12/13/15/16/17/19/24/25/27`
+   as needed.
+   `streaming_target_from_prefix=True` remains only as an explicit
+   debug/control setting because it forwards a longer clip that includes the
    target frame.
 9. Non-streaming C1 still uses `context_segment` for input and
    `target_isolated` for target. Non-streaming C2/C3 use the same fast path but
    load `context_segment` inputs ending at their action-reference frame.
+10. Legacy non-streaming sweep scripts and `task_name in {inscene15k,
+    inscene15k_ext}` training are guarded. They require
+    `ALLOW_NON_STREAMING=1` or `allow_non_streaming=true`.
 
 ## 5. Probe-specific supervision
 
@@ -139,6 +165,10 @@ shared streaming interface:
 
 ### A3 abnormal temporal context
 
+- Current status: legacy non-streaming control only. There is no
+  `inscene15k_streaming/abnormal_*` config and `run_streaming_probe_sweep.sh`
+  does not include A3 by default. Treat A3 as outside the current shared
+  streaming-prefix sweep until a streaming shuffled-prefix cache is added.
 - Each item loads paired normal and shuffled-context caches. Missing shuffled
   caches invalidate the item rather than using zero as an easy cue.
 - Normal and shuffled examples are concatenated with balanced labels 0/1.
@@ -153,10 +183,12 @@ shared streaming interface:
   the final frame. Selection favors the most qualifying past frames, then pixel
   count. Samples without a candidate are invalid.
 - In streaming configs, the candidate is not reselected per prefix. One raw
-  object id is selected from prefix `4`: visible in frames `[0,1,2]`, hidden at
-  frame `3`, and hidden at every configured prefix tail. The same object id is
-  reused for prefix `4,8,16,32,64`; the target reference camera still changes
-  with the current prefix tail.
+  object id is selected from the common history prefix `8`: visible in at least
+  three history observations, sufficiently large and away from the image
+  border. Selection prefers objects visible at observation `7`, but this is not
+  a hard requirement. The same object id is reused while the target reference
+  camera changes with the current prefix tail; it must be hidden at observation
+  tails `11/15/23` for prefixes `12/16/24`.
 - Condition: GT object masks in qualifying past frames plus one global-pooled
   final-frame feature. Invisible object frames contribute no object token and no
   per-frame global substitute.
@@ -194,6 +226,26 @@ shared streaming interface:
 - No `B2-last` class, config, script or dispatch branch exists. The only current
   B2 is the all-frame definition above.
 
+### B2 visible-object sanity check
+
+- Configs: `inscene15k_streaming/visible_ego_belief_v2_wan_v1` and
+  `inscene15k_streaming/direct_vlm_visible_ego_belief_v2_v1`.
+- Purpose: test whether the same B2 head can localize an object that is visible
+  in the current prefix-tail view before attributing hidden-object failures to
+  memory or occlusion reasoning.
+- Candidate: selected per prefix from objects with at least
+  `hidden_obj_min_visible_pixels` valid pixels in the current tail frame. The
+  current implementation uses raw instance ids, skips non-positive ids to avoid
+  background regions, and favors the largest current-view visible object.
+- Target: same polar representation as B2, expressed in the current prefix-tail
+  camera frame.
+- Condition: same B2 input signature, `belief_query_feat` plus all prefix patch
+  tokens. Unlike hidden B2, the query mask may come from the current visible
+  tail frame because the experiment is explicitly a visible localization sanity
+  check.
+- Command:
+  `DEV=0 VFM=wan PROBES="visible_ego_belief_v2" PREFIX_LENGTHS="8 12 16 24" LAYERS="default" bash scripts/run_streaming_probe_sweep.sh`.
+
 ### C1 action-conditioned prediction
 
 - Input is loaded from a `context_segment` cache ending at the last input frame,
@@ -218,8 +270,7 @@ shared streaming interface:
   supervise every horizon.
 - In streaming configs, the action-reference frame is the current prefix tail
   and the input is the corresponding `streaming_prefix` feature. Default
-  horizons are
-  `[1,4,8,16]`.
+  horizons are `[1,2,4]`.
 - A stacked GRU recurrently updates state and predicts one pooled target feature
   per step. Valid horizons use MSE plus cosine distance.
 - Evaluation retrieves poses through target features and reports global
@@ -231,7 +282,7 @@ shared streaming interface:
   Each action maps that frame directly to one horizon. Horizons with missing
   context/target rows or reference-target overlap below 0.05 are invalid.
 - In streaming configs, the input is again the prefix cache ending at the
-  current tail, with default horizons `[1,4,8,16]`.
+  current tail, with default horizons `[1,2,4]`.
 - A Transformer jointly reads context plus alternative action tokens and predicts
   one pooled target per intervention. Loss is MSE plus cosine distance.
 - Evaluation reports global retrieval, correct-target cosine, intervention hit
@@ -244,6 +295,24 @@ shared streaming interface:
 - Base loss is reconstruction MSE plus weighted L1. Optional overlap and ego
   MLP readouts consume frame-mean sparse codes, detached by default.
 - This is not a capacity-matched substitute for the direct probes.
+
+### Direct VLM layer probes
+
+- Qwen2.5-VL/BAGEL caches from `features/run_inscene15k_mllm.py` are saved as
+  `(S,H,W,C)` visual-token grids and can be consumed by the ordinary A/B/C
+  probe heads without an SAE.
+- `direct_vlm_*` configs keep this path separate from `sae_*` configs. The
+  scientific question is whether a lightweight readout can decode spatial
+  labels directly from one frozen VLM layer.
+- `scripts/run_direct_vlm_probe_sweep.sh` wraps the existing layer-sweep script
+  for non-streaming A2/A3/B1/B2/C1/C2/C3. A3 uses `shuffled` caches; C probes
+  use causal `context_segment` inputs and exact `target_isolated` targets.
+- `scripts/run_streaming_probe_sweep.sh` now treats `qwen2_5_vl*` and `bagel`
+  as MLLM backends and selects `inscene15k_streaming/direct_vlm_*` configs.
+  Streaming VLM prefixes are independently forwarded as `[I_0, ..., I_t]`.
+- The sweep scripts infer `video_channels` from each cached `.sft` file before
+  training, which matters because Qwen `-1` visual-merger features and
+  non-negative vision-block features can have different channel dimensions.
 
 ## 6. Optimization, validation and output
 
@@ -306,9 +375,10 @@ These are not silently fixed because several change the scientific task.
 9. **Legacy absolute paths (migration).** Main diagnostic YAMLs use environment
     roots, but old launch/resume/evaluation scripts still contain
     `/nas/baiqiao` or `/data/baiqiao` defaults. They are not portable entrypoints.
-10. **A3 strength coverage (experimental).** Current caches represent one full
-    permutation seed. Multiple seeds and partial/local shuffle strengths remain
-    required by the protocol.
+10. **A3 streaming gap (experimental).** A3 remains a legacy non-streaming
+    shuffled-cache control. It is not yet orthogonal to streaming prefix length.
+    A streaming version would need shuffled-prefix caches with the same
+    ScanNet++ motion windows and prefix list as A1/A2/B1/B2/C1/C2/C3.
 11. **Cross-probe capacity matching (experimental).** Decoder selection now
     covers B1/B2 only. A2/A3/C1/C2/C3 retain different task-specific nonlinear
     heads and do not yet have one unified parameter-matched linear/shallow suite.

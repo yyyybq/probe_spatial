@@ -6,7 +6,7 @@ This repository extends [VidFM3D](https://github.com/zxhuang1698/VidFM3D) with a
 |--------|-------|---------|
 | **A. Global Spatial Perception** | A1 depth/camera/identity (VidFM3D baseline) | Does the VFM perceive a coherent 3D scene? |
 | **A. Global Spatial Perception** | **A2 view consistency** | Can it tell whether two clips share a viewing region? |
-| **A. Global Spatial Perception** | **A3 abnormal detection** | Can it detect temporally shuffled frames? |
+| **A. Global Spatial Perception** | **A3 abnormal detection** | Can it detect temporally shuffled frames? Legacy non-streaming control; not in the default streaming sweep yet. |
 | **B. Ego-Centric Belief** | **B1 hidden-object localization** | Does it remember where objects went off-screen? |
 | **B. Ego-Centric Belief** | **B2 object-query localization** | Can an object appearance query recover the object's current location? |
 | **C. Action-Conditioned Prediction** | **C1 latent dynamics** | Can it predict a future isolated feature given a camera motion? |
@@ -42,57 +42,51 @@ mkdir -p ${DATASET_ROOT}
 # 4. Download InsScene-15K data outside the git checkout
 python data/download_inscene15k.py --step all --base-dir ${DATASET_ROOT}
 
-# 5. Extract VFM features outside the git checkout
-# One VFM shown; repeat for cogvideox / vjepa2.
+# 5. Extract streaming VFM features outside the git checkout.
+# Streaming temporal probes now use ScanNet++ only.  Infinigen frames are
+# independent rendered views, not a video trajectory.
 INSCENE_DATA=${DATASET_ROOT}
-python -m features.run_inscene15k --vfm wan \
-    --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT \
-    --t 749 --output-layers 20
-python -m features.run_inscene15k --vfm wan --mode shuffled \
-    --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_SHUFFLED \
-    --t 749 --output-layers 20
-python -m features.run_inscene15k --vfm wan --mode context_segment \
-    --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_CONTEXT \
-    --t 749 --output-layers 20 --context-len 76
-python -m features.run_inscene15k --vfm wan --mode target_isolated \
-    --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_TARGET \
-    --t 749 --output-layers 20 --num-targets 0
 python -m features.run_inscene15k --vfm wan --mode streaming_prefix \
     --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_STREAMING \
-    --t 749 --output-layers 20 --prefix-lengths "4,8,16,32,64" \
-    --prefix-max-len 64
+    --source scannetpp --t 749 --output-layers 20 \
+    --prefix-lengths "8,12,16,24" --prefix-max-len 24
 
 # Layer sweeps: pass multiple layers, then train with feature_layer=<L>.
 # Current defaults are Wan/CogVideoX layer20 at t=749, V-JEPA2 layer23,
 # and MLLM/VLM layer -1 caches.
 export INSCENE_DATA_ROOT=${INSCENE_DATA}/data
-export INSCENE_FEAT_ROOT=${INSCENE_DATA}/FEAT
-export INSCENE_SHUFFLED_FEAT_ROOT=${INSCENE_DATA}/FEAT_SHUFFLED
-export INSCENE_CONTEXT_FEAT_ROOT=${INSCENE_DATA}/FEAT_CONTEXT
-export INSCENE_TARGET_FEAT_ROOT=${INSCENE_DATA}/FEAT_TARGET
 export INSCENE_STREAMING_FEAT_ROOT=${INSCENE_DATA}/FEAT_STREAMING
+export INSCENE_TARGET_FEAT_ROOT=${INSCENE_DATA}/FEAT_TARGET
 
-# 6. Train diagnostic probes for Wan on GPU 0
-bash scripts/run_diag_sweep.sh wan 0
-VFMS="wan" bash scripts/run_diag_new_sweep.sh
+# 6. Train streaming diagnostic probes for Wan on GPU 0
+DEV=0 VFM=wan \
+PROBES="streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual" \
+PREFIX_LENGTHS="8 12 16 24" LAYERS="default" \
+    bash scripts/run_streaming_probe_sweep.sh
 
 # 7. Test & evaluate
-bash scripts/run_diag_eval_sweep.sh   # writes comparison_val.csv
+python scripts/summarize_streaming_prefix_sweep.py \
+    --runs-root logs/inscene15k_streaming/runs \
+    --output streaming_prefix_sweep.csv
 ```
 
-> **Note**: current configs resolve dataset/cache roots from environment
+> **Note**: streaming is the default experimental setting. Legacy normal/full-clip
+> scripts now require `ALLOW_NON_STREAMING=1` and should only be used for old
+> ablations or historical comparison.
+>
+> **Temporal validity note**: old streaming caches/runs that include Infinigen
+> are not valid evidence for temporal, memory, action, path-integration, or
+> counterfactual conclusions.  Infinigen's 100 frames are independent views.
+> New temporal experiments default to ScanNet++ only. See
+> [TEMPORAL_DATA_VALIDITY.md](TEMPORAL_DATA_VALIDITY.md).
+>
+> Current configs resolve dataset/cache roots from environment
 > variables first. Set the relevant roots before launching jobs, or pass Hydra
 > overrides explicitly:
 > ```bash
-> python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1 \
->     root_vfm=/data/InsScene-15K/FEAT \
->     context_feat_root=/data/InsScene-15K/FEAT_CONTEXT \
->     target_feat_root=/data/InsScene-15K/FEAT_TARGET
+> python vidfm3d/train.py experiment=inscene15k_streaming/action_dynamics_wan_v1 \
+>     streaming_feat_root=/data/InsScene-15K/FEAT_STREAMING
 > ```
 
 On a shared cluster, the dataset also honors `INSCENE_DATA_ROOT`,
@@ -103,9 +97,9 @@ See `EXPERIMENT_PROTOCOL.md` and `TRAINING_LOGIC_AUDIT.md` for the current
 causal-cache protocol and task-by-task input contracts.
 > See `PROBE_SPATIAL_GUIDE.md` §8.1.1 for layer-wise extraction, probing, and
 > `scripts/summarize_layer_sweep.py` best-layer/last-layer reports.
-> End-to-end layer sweeps use:
+> Legacy non-streaming layer sweeps require explicit opt-in:
 > ```bash
-> VFM=wan PROBE=view_consistency LAYERS="0 5 10 15 20 25 29" \
+> ALLOW_NON_STREAMING=1 VFM=wan PROBE=view_consistency LAYERS="0 5 10 15 20 25 29" \
 >   bash scripts/run_feature_layer_probe_sweep.sh
 > ```
 
@@ -126,9 +120,6 @@ cd ${PROJECT_ROOT}
 mkdir -p ${DATASET_ROOT}
 
 export INSCENE_DATA_ROOT=${DATASET_ROOT}/data
-export INSCENE_FEAT_ROOT=${DATASET_ROOT}/FEAT
-export INSCENE_SHUFFLED_FEAT_ROOT=${DATASET_ROOT}/FEAT_SHUFFLED
-export INSCENE_CONTEXT_FEAT_ROOT=${DATASET_ROOT}/FEAT_CONTEXT
 export INSCENE_TARGET_FEAT_ROOT=${DATASET_ROOT}/FEAT_TARGET
 export INSCENE_STREAMING_FEAT_ROOT=${DATASET_ROOT}/FEAT_STREAMING
 ```
@@ -152,44 +143,31 @@ To extract all feature caches first and then run many probing experiments:
 cd ${PROJECT_ROOT}
 export DATASET_ROOT=/data/probe_spatial_data/InsScene-15K
 export INSCENE_DATA_ROOT=${DATASET_ROOT}/data
-export INSCENE_FEAT_ROOT=${DATASET_ROOT}/FEAT
-export INSCENE_SHUFFLED_FEAT_ROOT=${DATASET_ROOT}/FEAT_SHUFFLED
-export INSCENE_CONTEXT_FEAT_ROOT=${DATASET_ROOT}/FEAT_CONTEXT
-export INSCENE_TARGET_FEAT_ROOT=${DATASET_ROOT}/FEAT_TARGET
 export INSCENE_STREAMING_FEAT_ROOT=${DATASET_ROOT}/FEAT_STREAMING
+export INSCENE_TARGET_FEAT_ROOT=${DATASET_ROOT}/FEAT_TARGET
 
 python data/download_inscene15k.py --step all --base-dir ${DATASET_ROOT}
 
 VFM=wan
 MODEL_ID=Wan-AI/Wan2.1-T2V-1.3B-Diffusers
 python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
-    --data-root ${INSCENE_DATA_ROOT} --out-root ${INSCENE_FEAT_ROOT} \
-    --t 749 --output-layers 20
-python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
-    --mode shuffled --data-root ${INSCENE_DATA_ROOT} \
-    --out-root ${INSCENE_SHUFFLED_FEAT_ROOT} --t 749 --output-layers 20
-python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
-    --mode context_segment --data-root ${INSCENE_DATA_ROOT} \
-    --out-root ${INSCENE_CONTEXT_FEAT_ROOT} --t 749 --output-layers 20 \
-    --context-len 76
+    --mode streaming_prefix --data-root ${INSCENE_DATA_ROOT} \
+    --out-root ${INSCENE_STREAMING_FEAT_ROOT} --t 749 --output-layers 20 \
+    --source scannetpp --prefix-lengths "8,12,16,24" --prefix-max-len 24
 python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
     --mode target_isolated --data-root ${INSCENE_DATA_ROOT} \
     --out-root ${INSCENE_TARGET_FEAT_ROOT} --t 749 --output-layers 20 \
-    --num-targets 0
-python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
-    --mode streaming_prefix --data-root ${INSCENE_DATA_ROOT} \
-    --out-root ${INSCENE_STREAMING_FEAT_ROOT} --t 749 --output-layers 20 \
-    --prefix-lengths "4,8,16,32,64" --prefix-max-len 64
+    --source scannetpp --prefix-lengths "8,12,16,24" --prefix-max-len 24 \
+    --target-from-streaming-windows --target-prefix-lengths "8,12,16,24" \
+    --target-horizons "1,2,4"
 ```
 
 After extraction, train from the fixed feature dataset:
 
 ```bash
 cd ${PROJECT_ROOT}
-VFMS="wan" bash scripts/run_diag_new_sweep.sh
-
 PROBES="streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual" \
-PREFIX_LENGTHS="4 8 16 32 64" LAYERS="default" \
+PREFIX_LENGTHS="8 12 16 24" LAYERS="default" \
 EXTRACT_STREAMING=0 EXTRACT_TARGETS=0 \
     bash scripts/run_streaming_probe_sweep.sh
 ```
@@ -257,25 +235,24 @@ conda install "mkl<2024.1" "intel-openmp<2024.1" -c conda-forge -y
 InsScene-15K ([HuggingFace: lifuguan/InsScene-15K](https://huggingface.co/datasets/lifuguan/InsScene-15K)) combines **Infinigen** synthetic scenes and **ScanNet++** real-world scenes.
 
 ```bash
-# Download + extract in one step (~60 GB)
-python data/download_inscene15k.py --step all --base-dir /data/InsScene-15K
+# Current temporal experiments are ScanNet++ only.
+python data/download_inscene15k.py --step download_scannetpp --base-dir /data/InsScene-15K
+python data/download_inscene15k.py --step extract_scannetpp  --base-dir /data/InsScene-15K
 
-# Or separately
-python data/download_inscene15k.py --step download --base-dir /data/InsScene-15K
-python data/download_inscene15k.py --step extract  --base-dir /data/InsScene-15K
+# Infinigen download/extraction is legacy/debug only and is not used for
+# temporal streaming conclusions.
 ```
 
 Expected structure after extraction:
 ```
 /data/InsScene-15K/
   data/
-    processed_infinigen/      # Infinigen synthetic scenes
     processed_scannetpp_v2/   # ScanNet++ real-world scenes
-  FEAT/                       # filled by feature extraction (step 4)
-  FEAT_SHUFFLED/              # filled by feature extraction --mode shuffled (A3)
-  FEAT_CONTEXT/               # filled by feature extraction --mode context_segment (C1/C2/C3 inputs)
-  FEAT_STREAMING/             # filled by feature extraction --mode streaming_prefix (streaming A/B/C)
+  FEAT_STREAMING/             # default streaming_prefix features
   FEAT_TARGET/                # filled by feature extraction --mode target_isolated (C1/C2/C3 targets)
+  FEAT/                       # legacy normal features, only with ALLOW_NON_STREAMING=1
+  FEAT_SHUFFLED/              # legacy A3 shuffled features
+  FEAT_CONTEXT/               # legacy non-streaming C context_segment features
 ```
 
 ### CO3Dv2 / DL3DV (original VidFM3D datasets)
@@ -292,94 +269,100 @@ Features are pre-extracted once and cached as `.sft` files. The extractor is res
 
 | Mode | Output dir | Used by |
 |------|-----------|---------|
-| `normal` (default) | `FEAT/` | Non-streaming A1/A2/B1/B2 and A3 normal branch |
-| `shuffled` | `FEAT_SHUFFLED/` | A3 (temporally shuffled clips) |
-| `context_segment` | `FEAT_CONTEXT/` | C1/C2/C3 causal inputs, with no future target frames in the VFM forward |
-| `streaming_prefix` | `FEAT_STREAMING/` | Streaming A1/A2/B1/B2/C1/C2/C3 inputs at selected prefix lengths |
+| `streaming_prefix` | `FEAT_STREAMING/` | Default A1/A2/B1/B2/C1/C2/C3 inputs at selected prefix lengths |
 | `target_isolated` | `FEAT_TARGET/` | C1/C2/C3 isolated target features, with exact frame ids |
+| `normal` | `FEAT/` | Legacy non-streaming probes only; not the default setting |
+| `shuffled` | `FEAT_SHUFFLED/` | Legacy A3 non-streaming branch |
+| `context_segment` | `FEAT_CONTEXT/` | Legacy non-streaming C1/C2/C3 causal inputs |
 
 ```bash
 INSCENE_DATA=/data/InsScene-15K
 VFM=wan
 MODEL_ID=Wan-AI/Wan2.1-T2V-1.3B-Diffusers
 
-# Normal features (required for all probes)
-python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
-    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT \
-    --t 749 --output-layers 20
-
-# Shuffled features (A3 only)
-python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
-    --mode shuffled \
-    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_SHUFFLED \
-    --t 749 --output-layers 20
-
-# Causal context features (C1/C2/C3 inputs)
-python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
-    --mode context_segment \
-    --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_CONTEXT \
-    --t 749 --output-layers 20 --context-len 76
-
-# Streaming-prefix features (shared by streaming A1/A2/B1/B2/C1/C2/C3)
+# Streaming-prefix features (default; shared by A1/A2/B1/B2/C1/C2/C3)
 python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
     --mode streaming_prefix \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_STREAMING \
-    --t 749 --output-layers 20 --prefix-lengths "4,8,16,32,64" \
-    --prefix-max-len 64
+    --source scannetpp \
+    --t 749 --output-layers 20 --prefix-lengths "8,12,16,24" \
+    --prefix-max-len 24
 
-# Target-isolated features (C1/C2/C3 targets)
+# Isolated target features for C1/C2/C3. These are selected from the same
+# ScanNet++ streaming windows, but each target frame is forwarded alone.
 python -m features.run_inscene15k --vfm ${VFM} --model-id ${MODEL_ID} \
     --mode target_isolated \
     --data-root ${INSCENE_DATA}/data --out-root ${INSCENE_DATA}/FEAT_TARGET \
-    --t 749 --output-layers 20 --num-targets 0
+    --source scannetpp \
+    --t 749 --output-layers 20 --prefix-lengths "8,12,16,24" \
+    --prefix-max-len 24 --target-from-streaming-windows \
+    --target-prefix-lengths "8,12,16,24" --target-horizons "1,2,4"
 ```
 
-C1/C2/C3 intentionally do not reuse `normal` features for their inputs or
-targets. Input features come from causal `context_segment` forwards ending at
-the last observed frame; target supervision comes from exact `target_isolated`
-rows. This prevents future-frame leakage through clip-contextualized VFM
-features.
+Streaming prefixes are built from ScanNet++ motion-normalized temporal windows.
+The default four cached prefixes are common-history `8`, then `8+4`, `8+8`,
+and `8+16` observations.  Long ScanNet++ videos are cut into a capped number of
+windows per scene so one recording does not dominate the dataset. The default
+observation step is `--streaming-motion-step 0.35` with
+`--streaming-rotation-weight 0.5`, which gives visible camera motion without
+jumping as far as the earlier `0.5` step.
 
-Streaming C1/C2/C3 use the same anti-leakage rule with a different input cache:
-the observed history is a `streaming_prefix` forward `[I_0..I_t]`, each action
-is encoded relative to the current prefix tail `I_t`, and future targets still
-come from exact `target_isolated` rows. The prefix tail is only the reference
-frame for the action vector; it is not an extra condition. Training sweeps one
-fixed `prefix_len` per job, usually `4,8,16,32,64`, so batches remain
-fixed-shape while the experiment measures how performance changes as online
-history grows.
+C1/C2/C3 use the same shared streaming-prefix video cache for their input, but
+their prediction targets default to a separate `target_isolated` cache.  This
+prevents the target feature from being produced by a VFM forward pass that has
+already seen the input history plus the target frame.  The target frame ids are
+computed from the same ScanNet++ motion-normalized window, prefix length, and
+future horizons used by the C dataset samples.  Streaming prefix length is
+orthogonal to probe type: C probes run for each requested prefix
+`8/12/16/24`, not only for prefix `8`.
 
 Streaming C-series data flow:
 
 ```text
-video frames:        I_0  I_1  ...  I_t  |  I_{t+h1}  I_{t+h2}  ...
-                     \______________/       \_______/  \_______/
-                         past only            target    target
+sampled observations: I_0 ... I_7 | I_8 | I_9 | I_11
+                      \_________/   target target target
+                      common history
 
-input feature:       VFM([I_0, ..., I_t])
-                     -> FEAT_STREAMING/prefix_t/...sft
+input feature:        VFM([I_0, ..., I_7])
+                      -> FEAT_STREAMING/.../prefix_000007/...sft
 
-action condition:    relative camera motion from I_t to I_{t+h}
+action condition:     relative camera motion from I_7 to each target
 
-target feature:      VFM([I_{t+h}])
-                     -> FEAT_TARGET/frame_{t+h}/...sft
+target feature:       VFM([I_8]) / VFM([I_9]) / VFM([I_11])
+                      -> FEAT_TARGET/.../feature_*.sft + target_indices.npy
 
-probe training:      probe(input_feature, action) predicts target_feature
+probe training:       probe(input_feature, action) predicts target_feature
 ```
 
-So yes: in C1/C2/C3 streaming experiments, the input video contains only past
-observed frames. The future target frame is extracted separately as an isolated
-single-frame feature, and never appears in the VFM forward that produced the
-input feature.
+For C, the default target cache covers the union of
+`prefix_len + horizon` positions for every C prefix and horizon. With
+`prefix_len in {8,12,16,24}` and `horizon in {1,2,4}`, isolated targets are
+drawn from observation positions:
 
-Streaming B1/B2 use the same prefix lengths but fix the object identity across
-the sweep. The selected object must be visible in one of frames `[0,1,2]`,
-hidden at frame `3`, and hidden at every compared prefix tail, e.g.
-`[7,15,31,63]` for prefix lengths `4,8,16,32,64`. Each prefix job reuses that
-same raw object id, returns only its masks within the current prefix, and
-expresses the target in the current prefix-tail camera frame. This makes the
-B streaming curve test "more observed history for the same object" rather than
-"a different best hidden object at each prefix length."
+```text
+prefix 8  -> obs 8, 9, 11
+prefix 12 -> obs 12, 13, 15
+prefix 16 -> obs 16, 17, 19
+prefix 24 -> obs 24, 25, 27
+```
+
+Streaming B1/B2 use common-history hidden-object selection.  The object is
+selected once per ScanNet++ temporal window from frames `[0..7]`; it must be
+visible in at least three history frames, have at least 1024 valid pixels in its
+best query frame, and avoid the image border by at least 16 pixels. Selection
+prefers objects visible at the common-history tail `obs7`, but falls back to a
+history-visible object if no such candidate exists. Hidden B1/B2 train/evaluate
+on prefixes `8/12/16/24`: prefix `8` is the visible-current baseline when the
+chosen object is visible at `obs7`, while prefixes `12/16/24` require the same
+object to be hidden at observation tails `11/15/23`. The same raw object id and
+query history are reused across the prefix sweep.
+
+There is also a B2 visible-object sanity probe, `visible_ego_belief_v2`. It
+uses the same B2 head and metrics, but selects an object visible in the current
+prefix-tail frame and expresses its position in that same tail camera frame.
+The object query may therefore be pooled from the current visible view. This is
+intended as a lower-bound check: if visible-object localization fails, the
+hidden-object B2 result should not be interpreted as purely a memory problem.
 
 Switch `--vfm cogvideox --model-id THUDM/CogVideoX-5b-I2V` or
 `--vfm vjepa2` (uses `features/vjepa2/vjepa2_feature.py`) for other VFMs.
@@ -423,113 +406,112 @@ python -m features.run_inscene15k_mllm --backend qwen2_5_vl \
     --output-layers -1 0 8 16 24 31
 ```
 
-Layer-wise probe training uses the same experiment YAML and only overrides the
-feature filename / run name:
+Layer-wise streaming probe training uses `run_streaming_probe_sweep.sh` and
+sweeps both `prefix_len` and `feature_layer`:
 
 ```bash
-DRY_RUN=1 VFM=wan PROBE=ego_belief LAYERS="0 5 10 15 20 25 29" \
-    bash scripts/run_feature_layer_probe_sweep.sh
-
-VFM=vjepa2 PROBE=action_dynamics LAYERS="0 5 11 17 23" DEV=1 \
-    bash scripts/run_feature_layer_probe_sweep.sh
+DRY_RUN=1 VFM=wan PROBES="ego_belief action_dynamics" \
+PREFIX_LENGTHS="8 12 16 24" LAYERS="0 5 10 15 20 25 29" \
+    bash scripts/run_streaming_probe_sweep.sh
 ```
 
-The script extracts required feature modes for the selected probe, trains one
-probe per layer, evaluates checkpoints, and summarizes the layer-wise curve. For
-C1/C2/C3, extract the same layer list for both `context_segment` and
-`target_isolated`. To summarize existing evaluated runs manually:
+The old `run_feature_layer_probe_sweep.sh` is now guarded and requires
+`ALLOW_NON_STREAMING=1`.
+
+Direct VLM probing is parallel to the SAE path. By default it uses the same
+streaming setting as other models and feeds each selected VLM layer directly
+into the ordinary diagnostic probe heads:
 
 ```bash
-python scripts/summarize_layer_sweep.py \
-    --vfm wan --probe ego_belief \
-    --pattern "inscene15k_ext_ego_belief_wan_layer*" \
-    --output layer_sweep_ego_belief_wan.csv
+INSCENE_STREAMING_FEAT_ROOT=/data/InsScene-15K/FEAT_STREAMING_MLLM \
+INSCENE_TARGET_FEAT_ROOT=/data/InsScene-15K/FEAT_TARGET_MLLM \
+VFMS="qwen2_5_vl qwen2_5_vl_3b bagel" \
+PROBES="streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual" \
+PREFIX_LENGTHS="8 12 16 24" \
+LAYERS="-1 8 16 24 31" \
+    bash scripts/run_direct_vlm_probe_sweep.sh
 ```
+
+For Qwen, layer `-1` is the visual-merger output; non-negative layers are
+vision-tower block outputs. The sweep script reads an existing `.sft` cache to
+infer `video_channels` per layer, so direct probes can handle layers whose
+channel dimension differs from the `-1` cache. Legacy non-streaming direct VLM
+requires `STREAMING=0 ALLOW_NON_STREAMING=1`.
 
 ---
 
 ## Training
 
-### Diagnostic probes (A2 / A3 / B1 / B2 / C1 / C2 / C3) — this work
+### Diagnostic probes (A1 / A2 / B1 / B2 / C1 / C2 / C3) — default streaming
 
-**Train the original diagnostic sweep for one VFM on a single GPU:**
-```bash
-bash scripts/run_diag_sweep.sh wan     0   # GPU 0
-bash scripts/run_diag_sweep.sh vjepa2  1   # GPU 1
-bash scripts/run_diag_sweep.sh cogvideox 2 # GPU 2
-```
-
-**Train the newer C2/C3 probes:**
-```bash
-# Sequential
-VFMS="wan vjepa2 cogvideox" bash scripts/run_diag_new_sweep.sh
-
-# Parallel across GPUs
-PYTHON=/path/to/python GPUS="0 1 2 3 4 5" bash scripts/run_diag_new_parallel.sh
-```
-
-**Train the shared streaming-prefix sweep:**
+**Train the default shared streaming-prefix sweep:**
 ```bash
 INSCENE_STREAMING_FEAT_ROOT=/data/InsScene-15K/FEAT_STREAMING \
 INSCENE_TARGET_FEAT_ROOT=/data/InsScene-15K/FEAT_TARGET \
 PROBES="streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual" \
-PREFIX_LENGTHS="4 8 16 32 64" LAYERS="default" \
+PREFIX_LENGTHS="8 12 16 24" LAYERS="default" \
     bash scripts/run_streaming_probe_sweep.sh
 ```
 
 `scripts/run_streaming_probe_sweep.sh` first extracts one shared
 `streaming_prefix` cache for the requested prefix lengths, then trains one run
 per `(probe, prefix_len, layer)`. C probes additionally require
-`target_isolated` caches; by default the script extracts every target frame
-with `--num-targets 0`.
+`target_isolated` caches. By default the script extracts only the exact
+streaming C target frame ids, using `--target-from-streaming-windows`,
+`--target-prefix-lengths "${C_PREFIX_LENGTHS}"`, and
+`--target-horizons "${C_TARGET_HORIZONS}"`.
+
+The same streaming interface works for direct VLM features:
+
+```bash
+INSCENE_STREAMING_FEAT_ROOT=/data/InsScene-15K/FEAT_STREAMING_MLLM \
+INSCENE_TARGET_FEAT_ROOT=/data/InsScene-15K/FEAT_TARGET_MLLM \
+VFM=qwen2_5_vl \
+PROBES="streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual" \
+PREFIX_LENGTHS="8 12 16 24" LAYERS="-1 8 16 24 31" \
+    bash scripts/run_streaming_probe_sweep.sh
+```
+
+For VLM streaming, each `prefix_len` is forwarded as the real image prefix
+`[I_0, ..., I_t]`; target frames for C probes are forwarded separately as
+single-frame target-isolated caches.
+
+Legacy non-streaming sweep scripts (`run_diag_sweep.sh`,
+`run_diag_new_sweep.sh`, `run_diag_new_parallel.sh`,
+`run_feature_layer_probe_sweep.sh`) now refuse to run unless
+`ALLOW_NON_STREAMING=1` is set.
 
 **Train a single probe:**
 ```bash
-# A2 view consistency
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
-    experiment=inscene15k_ext/view_consistency_wan_v1
+# One streaming probe, one or more prefix lengths.
+DEV=0 VFM=wan PROBES="ego_belief" PREFIX_LENGTHS="8 12 16 24" \
+LAYERS="default" bash scripts/run_streaming_probe_sweep.sh
 
-# A3 abnormal detection
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
-    experiment=inscene15k_ext/abnormal_wan_v1
+# B2 sanity: object is visible in the current prefix-tail view.
+DEV=0 VFM=wan PROBES="visible_ego_belief_v2" PREFIX_LENGTHS="8 12 16 24" \
+LAYERS="default" bash scripts/run_streaming_probe_sweep.sh
 
-# B1 hidden-object localization
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
-    experiment=inscene15k_ext/ego_belief_wan_v1
-
-# B2 object-query localization
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
-    experiment=inscene15k_ext/ego_belief_v2_wan_v1
-
-# C1 latent dynamics
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
-    experiment=inscene15k_ext/action_dynamics_wan_v1
-
-# C2 path integration
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
-    experiment=inscene15k_ext/path_integration_wan_v1
-
-# C3 counterfactual action
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
-    experiment=inscene15k_ext/counterfactual_wan_v1
+# C probes also need target-isolated caches; the script extracts them by default.
+DEV=0 VFM=wan PROBES="action_dynamics" PREFIX_LENGTHS="8 12 16 24" \
+LAYERS="default" bash scripts/run_streaming_probe_sweep.sh
 ```
 
 Training runs for 50 epochs (≈2–4 hours per probe on 1× L40S), auto-resumes from `last.ckpt`.
 
-**Control experiments** (scrambled features as baseline):
+**Legacy control experiments** (non-streaming scrambled features as baseline):
 ```bash
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
+ALLOW_NON_STREAMING=1 CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py \
     experiment=inscene15k_ext/action_dynamics_wan_ctrl
 ```
 
-### A1 Baseline Probe (depth / camera / identity) — original VidFM3D
+### A1 Baseline Probe (depth / camera / identity) — original VidFM3D legacy
 
 ```bash
 # Wan2.1
-CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py experiment=inscene15k/wan_probe_v3
+ALLOW_NON_STREAMING=1 CUDA_VISIBLE_DEVICES=0 python vidfm3d/train.py experiment=inscene15k/wan_probe_v3
 
 # V-JEPA2
-CUDA_VISIBLE_DEVICES=1 python vidfm3d/train.py experiment=inscene15k/vjepa2_probe_v3
+ALLOW_NON_STREAMING=1 CUDA_VISIBLE_DEVICES=1 python vidfm3d/train.py experiment=inscene15k/vjepa2_probe_v3
 ```
 
 Trains for 100 epochs, checkpointed every 5 epochs.
@@ -540,10 +522,9 @@ If your data is not at the default path, set the environment roots before
 launching Hydra:
 ```bash
 INSCENE_DATA_ROOT=/your/InsScene-15K/data \
-INSCENE_FEAT_ROOT=/your/InsScene-15K/FEAT \
-INSCENE_CONTEXT_FEAT_ROOT=/your/InsScene-15K/FEAT_CONTEXT \
+INSCENE_STREAMING_FEAT_ROOT=/your/InsScene-15K/FEAT_STREAMING \
 INSCENE_TARGET_FEAT_ROOT=/your/InsScene-15K/FEAT_TARGET \
-python vidfm3d/train.py experiment=inscene15k_ext/action_dynamics_wan_v1
+bash scripts/run_streaming_probe_sweep.sh
 ```
 
 ---
@@ -642,10 +623,10 @@ probe_spatial/
 │   └── utils/
 │       └── spatial_diag.py          # Geometry helpers (overlap, polar, pose)
 ├── scripts/
-│   ├── run_diag_sweep.sh            # Train A2/A3/B1/C1 for one VFM
-│   ├── run_diag_new_sweep.sh        # Train C2/C3 sequentially
-│   ├── run_diag_new_parallel.sh     # Train C2/C3 in parallel
-│   ├── run_streaming_probe_sweep.sh # Shared streaming-prefix cache/train/eval sweep
+│   ├── run_streaming_probe_sweep.sh # Default streaming-prefix cache/train/eval sweep
+│   ├── run_diag_sweep.sh            # Legacy non-streaming sweep; requires ALLOW_NON_STREAMING=1
+│   ├── run_diag_new_sweep.sh        # Legacy non-streaming C2/C3; requires ALLOW_NON_STREAMING=1
+│   ├── run_diag_new_parallel.sh     # Legacy non-streaming C2/C3; requires ALLOW_NON_STREAMING=1
 │   ├── package_inscene_feature_dataset.sh # Package external feature caches for HF
 │   └── run_diag_eval_sweep.sh       # Eval all runs, write CSV
 └── eval_pertask_v3.py               # A1 evaluation script

@@ -25,6 +25,7 @@ PRIMARY_METRIC = {
     "abnormal": ("pair_acc", "max"),
     "ego_belief": ("mean_az_err_deg", "min"),
     "ego_belief_v2": ("mean_ang_err_deg", "min"),
+    "visible_ego_belief_v2": ("mean_ang_err_deg", "min"),
     "action_dynamics": ("global_R@1", "max"),
     "path_integration": ("global_R@1", "max"),
     "counterfactual": ("intervention_validity", "max"),

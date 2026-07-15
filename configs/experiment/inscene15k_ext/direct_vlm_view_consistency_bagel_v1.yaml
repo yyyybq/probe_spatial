@@ -1,0 +1,55 @@
+# @package _global_
+# Direct A2 probe on BAGEL visual-token activations, no SAE.
+
+defaults:
+  - override /model: probe_ext
+  - override /callbacks: v3_checkpoint
+
+seed: 42
+tags: ["train", "inscene15k_ext", "bagel", "direct_vlm", "view_consistency"]
+
+task_name: inscene15k_ext
+job_name: direct_vlm_view_consistency_bagel_v1
+autoresume: true
+
+paths:
+  run_folder_name: ${task_name}_${job_name}
+
+feat_postfix: _layer-1
+feature_layer: null
+feature_timestep: 749
+vfm_name: bagel
+video_channels: 3584
+vlm_feat_root: ${oc.env:INSCENE_MLLM_FEAT_ROOT}
+
+data:
+  data_module:
+    train_datasets:
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${vlm_feat_root}', sources=['processed_scannetpp_v2'], split='train', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512, window_size=200, include_pmaps=True, diag_overlap=True)
+    validation_datasets:
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${vlm_feat_root}', sources=['processed_scannetpp_v2'], split='val', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=4, min_view_interval=5, context_len=76, query_idx_divisor=4, target_h=288, target_w=512, window_size=200, include_pmaps=True, diag_overlap=True)
+    batch_size_per_device: 4
+    batch_size_per_device_val: 4
+    num_workers: 8
+    num_workers_val: 4
+
+logger:
+  wandb:
+    name: ${task_name}_${job_name}
+    group: ${task_name}
+
+model:
+  probe_type: view_consistency
+  probe:
+    _target_: vidfm3d.models.components.probe_view_consistency.ViewConsistencyProbe
+    in_channels: ${video_channels}
+    hidden_dim: 512
+    proj_dim: 256
+    dropout: 0.1
+
+trainer:
+  devices: [0]
+  strategy: auto
+  max_epochs: 50
+  precision: bf16-mixed
+  plugins: []

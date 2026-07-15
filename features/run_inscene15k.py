@@ -8,7 +8,7 @@ Usage:
       --out-root ${INSCENE_FEAT_ROOT} \
       --model-id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
       --t 749 --output-layers 20 \
-      --source all
+      --source scannetpp
 
 Scenes are collected the same way InsScene15KDataset does, and for each one:
   1. Select 81 evenly-spaced frames from the available frames.
@@ -38,6 +38,10 @@ from PIL import Image
 
 try:
     from vidfm3d.utils.feature_layers import parse_layers_arg
+    from vidfm3d.utils.temporal_sampling import (
+        sort_frame_names,
+        temporal_windows_from_poses,
+    )
 except Exception:
     _FEATURE_LAYERS_PATH = Path(__file__).resolve().parents[1] / "vidfm3d" / "utils" / "feature_layers.py"
     _SPEC = importlib.util.spec_from_file_location("feature_layers", _FEATURE_LAYERS_PATH)
@@ -46,6 +50,14 @@ except Exception:
     sys.modules[_SPEC.name] = feature_layers
     _SPEC.loader.exec_module(feature_layers)
     parse_layers_arg = feature_layers.parse_layers_arg
+    _TEMPORAL_PATH = Path(__file__).resolve().parents[1] / "vidfm3d" / "utils" / "temporal_sampling.py"
+    _TEMPORAL_SPEC = importlib.util.spec_from_file_location("temporal_sampling", _TEMPORAL_PATH)
+    temporal_sampling = importlib.util.module_from_spec(_TEMPORAL_SPEC)
+    assert _TEMPORAL_SPEC.loader is not None
+    sys.modules[_TEMPORAL_SPEC.name] = temporal_sampling
+    _TEMPORAL_SPEC.loader.exec_module(temporal_sampling)
+    sort_frame_names = temporal_sampling.sort_frame_names
+    temporal_windows_from_poses = temporal_sampling.temporal_windows_from_poses
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +78,7 @@ def collect_infinigen_scenes(source_path):
     for scene_dir in sorted(glob(os.path.join(source_path, "scene_*"))):
         frames_dir = os.path.join(scene_dir, "frames", "Image", "camera_0")
         if os.path.isdir(frames_dir):
-            imgs = sorted(f for f in os.listdir(frames_dir) if f.endswith(".png"))
+            imgs = sort_frame_names(f for f in os.listdir(frames_dir) if f.endswith(".png"))
             if len(imgs) >= 5:
                 scenes.append({
                     "source": "infinigen",
@@ -82,7 +94,7 @@ def collect_infinigen_scenes(source_path):
                 continue
             frames_dir = os.path.join(sub_dir, "frames", "Image", "camera_0")
             if os.path.isdir(frames_dir):
-                imgs = sorted(f for f in os.listdir(frames_dir) if f.endswith(".png"))
+                imgs = sort_frame_names(f for f in os.listdir(frames_dir) if f.endswith(".png"))
                 if len(imgs) >= 5:
                     scenes.append({
                         "source": "infinigen",
@@ -108,19 +120,27 @@ def collect_scannetpp_scenes(source_path):
             continue
         img_dir = os.path.join(scene_dir, "images")
         mask_dir = os.path.join(scene_dir, "refined_ins_ids")
-        if not os.path.isdir(img_dir) or not os.path.isdir(mask_dir):
+        meta_path = os.path.join(scene_dir, "scene_iphone_metadata.npz")
+        if not os.path.isdir(img_dir) or not os.path.isdir(mask_dir) or not os.path.exists(meta_path):
             continue
         mask_files = set(os.listdir(mask_dir))
-        imgs = sorted(
-            f for f in os.listdir(img_dir)
-            if f.endswith(".jpg") and f"{f}.npy" in mask_files
-        )
+        image_files = set(f for f in os.listdir(img_dir) if f.endswith(".jpg"))
+        meta = np.load(meta_path)
+        meta_images = [str(f) for f in meta["images"].tolist()]
+        imgs = []
+        pose_indices = []
+        for meta_idx, fname in enumerate(meta_images):
+            if fname in image_files and f"{fname}.npy" in mask_files:
+                imgs.append(fname)
+                pose_indices.append(meta_idx)
         if len(imgs) >= 5:
             scenes.append({
                 "source": "scannetpp",
                 "scene_dir": scene_dir,
                 "img_dir": img_dir,
                 "img_files": imgs,
+                "pose_indices": pose_indices,
+                "poses_c2w": meta["trajectories"][pose_indices].astype(np.float32),
                 "ext": "jpg",
             })
     return scenes
@@ -190,7 +210,118 @@ def streaming_prefix_records(
 
 
 def prefix_dir_name(record):
+    if "window_id" in record:
+        return f"window_{int(record['window_id']):04d}/prefix_{int(record['tail']):06d}"
     return f"prefix_{int(record['tail']):06d}"
+
+
+def streaming_prefix_records_for_scene(scene, args):
+    """Build streaming-prefix records for one scene.
+
+    ScanNet++ defaults to motion-normalized temporal windows.  Legacy contiguous
+    indexing is still available through ``--temporal-sampling none``.
+    """
+    num_frames = len(scene["img_files"])
+    max_record_len = max(args.prefix_lengths or [args.prefix_max_len])
+    max_record_len = min(int(max_record_len), int(args.prefix_max_len), int(args.num_frames), num_frames)
+    if (
+        args.mode == "streaming_prefix"
+        and args.temporal_sampling == "motion_uniform"
+        and scene.get("source") == "scannetpp"
+        and "poses_c2w" in scene
+    ):
+        windows = temporal_windows_from_poses(
+            scene["poses_c2w"],
+            observations_per_window=max_record_len,
+            motion_step=args.streaming_motion_step,
+            rotation_weight=args.streaming_rotation_weight,
+            window_stride=args.streaming_window_stride,
+            max_windows_per_scene=args.streaming_max_windows_per_scene,
+        )
+        records = []
+        for window in windows:
+            indices = list(window["indices"])
+            lengths = args.prefix_lengths or list(range(args.prefix_min_len, len(indices) + 1, args.prefix_stride))
+            for length in lengths:
+                length = int(length)
+                if length < args.prefix_min_len or length > len(indices):
+                    continue
+                records.append({
+                    "tail": length - 1,
+                    "indices": indices[:length],
+                    "window_indices": indices,
+                    "window_id": int(window["window_id"]),
+                    "obs_start": int(window["obs_start"]),
+                    "valid_length": length,
+                    "sampling": window["sampling"],
+                    "motion_step": float(window["motion_step"]),
+                    "rotation_weight": float(window["rotation_weight"]),
+                })
+        return records
+
+    return streaming_prefix_records(
+        num_frames,
+        min_len=args.prefix_min_len,
+        max_len=args.prefix_max_len,
+        stride=args.prefix_stride,
+        model_max_len=args.num_frames,
+        lengths=args.prefix_lengths,
+    )
+
+
+def target_indices_for_scene(scene, args):
+    """Return exact local frame ids for target_isolated extraction.
+
+    In streaming C probes, the input prefix comes from a motion-normalized
+    ScanNet++ window and the target frame is selected by prefix length +
+    future horizon inside that same window.  The target cache still stores
+    scene-local indices so InsScene15KDataset can exact-match target_indices.npy.
+    """
+    if getattr(args, "target_from_streaming_windows", False):
+        prefixes = args.target_prefix_lengths or [8]
+        horizons = args.target_horizons or [1, 2, 4]
+        required_obs = max(
+            [max(args.prefix_lengths or [0])]
+            + [int(prefix) + int(horizon) for prefix in prefixes for horizon in horizons]
+        )
+        num_frames = len(scene["img_files"])
+        required_obs = min(int(required_obs), num_frames)
+        if (
+            args.temporal_sampling == "motion_uniform"
+            and scene.get("source") == "scannetpp"
+            and "poses_c2w" in scene
+        ):
+            windows = temporal_windows_from_poses(
+                scene["poses_c2w"],
+                observations_per_window=required_obs,
+                motion_step=args.streaming_motion_step,
+                rotation_weight=args.streaming_rotation_weight,
+                window_stride=args.streaming_window_stride,
+                max_windows_per_scene=args.streaming_max_windows_per_scene,
+            )
+        else:
+            windows = [{
+                "window_id": 0,
+                "indices": list(range(required_obs)),
+            }]
+
+        target_ids = set()
+        for window in windows:
+            indices = [int(i) for i in window["indices"]]
+            for prefix_len in prefixes:
+                tail = int(prefix_len) - 1
+                if tail < 0 or tail >= len(indices):
+                    continue
+                for horizon in horizons:
+                    pos = tail + int(horizon)
+                    if 0 <= pos < len(indices):
+                        target_ids.add(int(indices[pos]))
+        return sorted(target_ids)
+
+    if args.num_targets == 0:
+        return list(range(len(scene["img_files"])))
+    count = max(2, min(int(args.num_targets), len(scene["img_files"])))
+    return np.linspace(0, len(scene["img_files"]) - 1, count).round().astype(int).tolist()
 
 
 def context_segment_records(num_frames, context_len=76, stride=1, min_tail=1):
@@ -242,9 +373,9 @@ def main():
     )
     parser.add_argument("--data-root", required=True, help="InsScene-15K data root")
     parser.add_argument("--out-root", required=True, help="Output root for features")
-    parser.add_argument("--source", default="all",
+    parser.add_argument("--source", default="scannetpp",
                         choices=["all", "infinigen", "scannetpp"],
-                        help="Which data source to process")
+                        help="Which data source to process. Temporal streaming defaults to ScanNet++ only.")
     parser.add_argument("--vfm", default="wan",
                         choices=["wan", "cogvideox", "vjepa", "vjepa2", "dino", "aether", "opensora", "f3r"],
                         help="Which VFM to extract features from")
@@ -279,17 +410,17 @@ def main():
                         help="V-JEPA partition mode")
     # ---------------- Spatial Diagnostic Suite extraction modes ----------------
     parser.add_argument(
-        "--mode", default="normal",
+        "--mode", default="streaming_prefix",
         choices=["normal", "shuffled", "target_isolated", "streaming_prefix", "context_segment", "streaming_target"],
         help=(
-            "normal: standard clip forward (default).\n"
+            "streaming_prefix: independently forward prefixes [I_0, ..., I_t] "
+            "and save them under prefix_<tail> (default project setting).\n"
+            "normal: legacy standard clip forward.\n"
             "shuffled: shuffle frame order before VFM forward (for A3 abnormal probe). "
             "Output features are re-ordered to match the original frame order so that "
             "shuffled[i] = feature of frame i extracted under scrambled temporal context.\n"
             "target_isolated: extract clip-isolated features for M target frames "
             "(replicate each target frame to fill the clip; for C1 action-dynamics probe).\n"
-            "streaming_prefix: independently forward prefixes [I_0, ..., I_t] and save "
-            "them under prefix_<tail>; short prefixes are padded by repeating I_t.\n"
             "context_segment: independently forward sliding causal input segments "
             "[I_start, ..., I_tail] and save them under context_<start>_<tail>.\n"
             "streaming_target: for each prefix_len p, extract isolated features for frames "
@@ -301,6 +432,12 @@ def main():
                         help="Seed used to permute frame order in --mode shuffled.")
     parser.add_argument("--num-targets", type=int, default=8,
                         help="Target frames per scene in target_isolated mode; 0 means every frame.")
+    parser.add_argument("--target-from-streaming-windows", action="store_true",
+                        help="In target_isolated mode, extract only target frames used by streaming C probes.")
+    parser.add_argument("--target-prefix-lengths", default="8,12,16,24",
+                        help="Input prefix lengths for streaming C target extraction, e.g. '8'.")
+    parser.add_argument("--target-horizons", default="1,2,4",
+                        help="Future observation offsets for streaming C target extraction.")
     parser.add_argument("--no-cache-checksum", action="store_true",
                         help="Skip SHA-256 in cache sidecars (faster, less robust).")
     parser.add_argument("--allow-legacy-cache", action="store_true",
@@ -309,23 +446,55 @@ def main():
                         help="Frame stride between streaming-prefix tails.")
     parser.add_argument("--prefix-min-len", type=int, default=1,
                         help="Minimum streaming-prefix length.")
-    parser.add_argument("--prefix-max-len", type=int, default=81,
+    parser.add_argument("--prefix-max-len", type=int, default=24,
                         help="Maximum streaming-prefix length before model padding.")
-    parser.add_argument("--prefix-lengths", default=None,
-                        help="Exact streaming prefix lengths to cache, e.g. '4,8,16,32,64'.")
+    parser.add_argument("--prefix-lengths", default="8,12,16,24",
+                        help="Exact streaming prefix lengths to cache, e.g. '8,12,16,24'.")
+    parser.add_argument(
+        "--temporal-sampling",
+        default="motion_uniform",
+        choices=["motion_uniform", "none"],
+        help="For ScanNet++ streaming prefixes, sample observation windows uniformly in camera motion.",
+    )
+    parser.add_argument("--streaming-motion-step", type=float, default=0.35,
+                        help="Approximate camera-motion distance between sampled observations.")
+    parser.add_argument("--streaming-rotation-weight", type=float, default=0.5,
+                        help="Meters-equivalent weight for one radian of camera rotation.")
+    parser.add_argument("--streaming-window-stride", type=int, default=8,
+                        help="Stride in sampled observation steps between temporal windows.")
+    parser.add_argument("--streaming-max-windows-per-scene", type=int, default=4,
+                        help="Cap temporal windows per ScanNet++ scene; <=0 keeps all windows.")
     parser.add_argument("--context-len", type=int, default=76,
                         help="Maximum causal input segment length for context_segment mode.")
     parser.add_argument("--context-stride", type=int, default=1,
                         help="Tail-frame stride for context_segment mode.")
-    parser.add_argument("--target-horizons", default="1,4,8,16",
-                        help="Comma-separated frame offsets from tail for streaming_target mode (default: 1,4,8,16).")
     parser.add_argument("--opensora-config", default="features/opensora/configs/diffusion/inference/640px.py",
                         help="Open-Sora inference config path (only used when --vfm opensora).")
     parser.add_argument("--dino-batch-size", type=int, default=64,
                         help="Per-device batch size for DINO feature extraction.")
     args = parser.parse_args()
     args.prefix_lengths = parse_int_list(args.prefix_lengths)
-    args.target_horizons = sorted({int(h) for h in args.target_horizons.replace(',', ' ').split() if int(h) > 0})
+    args.target_prefix_lengths = parse_int_list(args.target_prefix_lengths) or [8, 12, 16, 24]
+    args.target_horizons = parse_int_list(args.target_horizons) or [1, 2, 4]
+    if (
+        args.mode in {"normal", "shuffled", "context_segment", "streaming_target"}
+        and os.environ.get("ALLOW_NON_STREAMING") != "1"
+    ):
+        raise SystemExit(
+            f"--mode {args.mode} is a legacy non-streaming extraction path. "
+            "Streaming is the default; use --mode streaming_prefix, or set "
+            "ALLOW_NON_STREAMING=1 for intentional legacy extraction."
+        )
+    if (
+        args.mode in {"streaming_prefix", "target_isolated", "context_segment", "streaming_target"}
+        and args.source != "scannetpp"
+        and os.environ.get("ALLOW_INFINIGEN_TEMPORAL") != "1"
+    ):
+        raise SystemExit(
+            "Temporal streaming/target extraction is ScanNet++ only. "
+            "Use --source scannetpp, or set ALLOW_INFINIGEN_TEMPORAL=1 only for "
+            "explicit legacy/debug reproduction."
+        )
 
     # Per-VFM defaults
     VFM_DEFAULTS = {
@@ -428,6 +597,18 @@ def main():
         except Exception:
             return False
 
+    def target_index_complete(out_dir, expected_indices):
+        if not expected_indices:
+            return True
+        path = os.path.join(out_dir, "target_indices.npy")
+        if not os.path.exists(path):
+            return False
+        try:
+            cached = np.load(path).astype(np.int64).tolist()
+        except Exception:
+            return False
+        return cached == [int(v) for v in expected_indices]
+
     # Check how many are already done
     done = 0
     for s in scenes:
@@ -451,14 +632,7 @@ def main():
                         break
         elif args.mode in ("streaming_prefix", "context_segment"):
             records = (
-                streaming_prefix_records(
-                    len(s["img_files"]),
-                    min_len=args.prefix_min_len,
-                    max_len=args.prefix_max_len,
-                    stride=args.prefix_stride,
-                    model_max_len=args.num_frames,
-                    lengths=args.prefix_lengths,
-                )
+                streaming_prefix_records_for_scene(s, args)
                 if args.mode == "streaming_prefix"
                 else context_segment_records(
                     len(s["img_files"]),
@@ -483,6 +657,17 @@ def main():
                 if not prefix_exists:
                     all_exist = False
                     break
+        elif args.mode == "target_isolated":
+            expected_targets = target_indices_for_scene(s, args)
+            layer_complete = (
+                cache_complete(os.path.join(out_dir, out_fname(0)))
+                if args.vfm == "vjepa"
+                else all(
+                    cache_complete(os.path.join(out_dir, out_fname(l)))
+                    for l in args.output_layers
+                )
+            )
+            all_exist = target_index_complete(out_dir, expected_targets) and layer_complete
         elif args.vfm == "vjepa":
             all_exist = cache_complete(os.path.join(out_dir, out_fname(0)))
         else:
@@ -663,14 +848,7 @@ def main():
                 continue
         elif args.mode in ("streaming_prefix", "context_segment"):
             records = (
-                streaming_prefix_records(
-                    len(s["img_files"]),
-                    min_len=args.prefix_min_len,
-                    max_len=args.prefix_max_len,
-                    stride=args.prefix_stride,
-                    model_max_len=args.num_frames,
-                    lengths=args.prefix_lengths,
-                )
+                streaming_prefix_records_for_scene(s, args)
                 if args.mode == "streaming_prefix"
                 else context_segment_records(
                     len(s["img_files"]),
@@ -697,6 +875,21 @@ def main():
                     break
             if scene_complete:
                 continue
+        elif args.mode == "target_isolated":
+            expected_targets = target_indices_for_scene(s, args)
+            if not expected_targets:
+                log.warning(f"{s['source']}/{name}: no streaming C target frames selected; skip target_isolated")
+                continue
+            target_ok = target_index_complete(out_dir, expected_targets)
+            if args.vfm == "vjepa":
+                missing_layers = [] if target_ok and cache_complete(os.path.join(out_dir, out_fname(0))) else [0]
+            else:
+                missing_layers = [
+                    l for l in args.output_layers
+                    if not (target_ok and cache_complete(os.path.join(out_dir, out_fname(l))))
+                ]
+            if not missing_layers:
+                continue
         elif args.vfm == "vjepa":
             if cache_complete(os.path.join(out_dir, out_fname(0))):
                 continue
@@ -713,14 +906,7 @@ def main():
             if args.mode in ("streaming_prefix", "context_segment"):
                 os.makedirs(out_dir, exist_ok=True)
                 records = (
-                    streaming_prefix_records(
-                        len(s["img_files"]),
-                        min_len=args.prefix_min_len,
-                        max_len=args.prefix_max_len,
-                        stride=args.prefix_stride,
-                        model_max_len=args.num_frames,
-                        lengths=args.prefix_lengths,
-                    )
+                    streaming_prefix_records_for_scene(s, args)
                     if args.mode == "streaming_prefix"
                     else context_segment_records(
                         len(s["img_files"]),
@@ -890,7 +1076,7 @@ def main():
             elif args.mode == "streaming_target":
                 if args.prefix_lengths is None:
                     raise ValueError("--prefix-lengths required for streaming_target mode")
-                horizons = args.target_horizons or [1, 4, 8, 16]
+                horizons = args.target_horizons or [1, 2, 4]
                 num_scene_frames = len(s["img_files"])
                 os.makedirs(out_dir, exist_ok=True)
                 processed_prefixes = 0
@@ -1008,15 +1194,7 @@ def main():
                 flat_order = [fi for ci in chunk_perm for fi in chunks[ci]]
                 frames_input = [frames[fi] for fi in flat_order]
             elif args.mode == "target_isolated":
-                # M target frame indices spread across the original sequence
-                if args.num_targets == 0:
-                    target_local_idx = list(range(len(s["img_files"])))
-                else:
-                    M = max(2, min(args.num_targets, len(s["img_files"])))
-                    target_local_idx = np.linspace(
-                        0, len(s["img_files"]) - 1, M
-                    ).round().astype(int).tolist()
-                target_global = target_local_idx  # already global within the scene
+                target_global = target_indices_for_scene(s, args)
                 frames_input = None  # filled per-target inside the per-VFM block
             else:
                 frames_input = frames
@@ -1162,11 +1340,12 @@ def main():
             processed += 1
             remaining = len(scenes) - done - processed - failed
             avg = total_time / processed
+            sampled_count = len(target_global) if args.mode == "target_isolated" else len(indices)
             eta = str(timedelta(seconds=int(avg * remaining)))
             log.info(
                 f"[{done + processed + failed}/{len(scenes)}] "
                 f"{s['source']}/{name}: {elapsed:.1f}s "
-                f"({len(s['img_files'])} frames, sampled {len(indices)}) "
+                f"({len(s['img_files'])} frames, sampled {sampled_count}) "
                 f"ETA: {eta}"
             )
 

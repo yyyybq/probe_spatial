@@ -29,6 +29,10 @@ from vidfm3d.utils.feature_layers import (
     default_feature_hw,
     feature_filename,
 )
+from vidfm3d.utils.temporal_sampling import (
+    sort_frame_names,
+    temporal_windows_from_poses,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,16 @@ def depth_to_pointmap(depth, intrinsic, extrinsic):
     return pts_world
 
 
+def camera_to_world_to_extrinsic(T: torch.Tensor) -> torch.Tensor:
+    """Convert a 4x4 camera-to-world pose into a 3x4 world-to-camera extrinsic."""
+    T = T.float()
+    R_c2w = T[:3, :3]
+    c = T[:3, 3]
+    R_w2c = R_c2w.T
+    t_w2c = -R_w2c @ c
+    return torch.cat([R_w2c, t_w2c[:, None]], dim=1)
+
+
 class InsScene15KDataset(EasyDataset):
     """Dataset for training identity mask probe on InsScene-15K data."""
 
@@ -101,15 +115,26 @@ class InsScene15KDataset(EasyDataset):
         prefix_lengths: list = None,
         streaming_feat_root: str = None,
         streaming_prefix_dir_fmt: str = "prefix_{tail:06d}",
+        temporal_sampling: str = "motion_uniform",
+        streaming_motion_step: float = 0.35,
+        streaming_rotation_weight: float = 0.5,
+        streaming_window_stride: int = 8,
+        streaming_max_windows_per_scene: int = 4,
+        streaming_window_obs_len: int = None,
         context_feat_root: str = None,
         context_segment_dir_fmt: str = "context_{start:06d}_{tail:06d}",
         # ---------- Spatial Diagnostic Suite toggles ----------
         diag_overlap: bool = False,        # A2: compute (S,S) overlap matrix
         diag_hidden_obj: bool = False,     # B1: pick hidden object + polar target
+        diag_visible_obj: bool = False,    # B2 sanity: pick current-view visible object
         hidden_obj_min_visible_pixels: int = 200,
         streaming_shared_hidden_obj: bool = False,
-        streaming_hidden_seed_prefix_len: int = 4,
+        streaming_hidden_seed_prefix_len: int = 8,
         streaming_hidden_prefix_lengths: list = None,
+        streaming_hidden_min_history_visible_frames: int = 3,
+        streaming_hidden_min_query_pixels: int = 1024,
+        streaming_hidden_min_border_px: int = 16,
+        streaming_hidden_strict_post_history: bool = False,
         diag_action: bool = False,         # C1: load target_feat + emit action
         diag_abnormal: bool = False,       # A3: load shuffled vfm features
         diag_path_integration: bool = False,  # C2: recurrent multi-action feature prediction
@@ -118,6 +143,7 @@ class InsScene15KDataset(EasyDataset):
         shuffled_feat_root: str = None,    # root for A3 shuffled features
         action_horizons: list = None,      # frame offsets from action-reference frame, e.g. [1, 10, 30]
         counterfactual_min_overlap: float = 0.05,
+        streaming_target_from_prefix: bool = False,
         scramble_feat: bool = False,       # Control: replace VFM feat with randn (same shape)
         allow_missing_vfm: bool = False,   # Debug only: use dummy zeros if a normal VFM feature is missing
         no_obj_mask: bool = False,         # Ablation: replace obj mask with all-ones (global pool)
@@ -127,9 +153,9 @@ class InsScene15KDataset(EasyDataset):
     ):
         """
         Args:
-            root: Path to InsScene-15K data root (containing processed_infinigen/, processed_scannetpp_v2/).
+            root: Path to InsScene-15K data root (containing processed_scannetpp_v2/).
             root_vfm: Path to pre-extracted VFM features (optional, for full pipeline).
-            sources: List of data sources to use. Default: ["processed_infinigen", "processed_scannetpp_v2"].
+            sources: List of data sources to use. Default: ["processed_scannetpp_v2"].
             split: "train" or "val".
             vfm_name: VFM backbone name.
             target_h, target_w: Target resolution to resize images and masks to.
@@ -147,7 +173,7 @@ class InsScene15KDataset(EasyDataset):
         shuffled_feat_root = os.environ.get("INSCENE_SHUFFLED_FEAT_ROOT", shuffled_feat_root)
         context_feat_root = os.environ.get("INSCENE_CONTEXT_FEAT_ROOT", context_feat_root)
         if sources is None:
-            sources = ["processed_infinigen", "processed_scannetpp_v2"]
+            sources = ["processed_scannetpp_v2"]
 
         self.root = root
         self.root_vfm = root_vfm
@@ -184,6 +210,12 @@ class InsScene15KDataset(EasyDataset):
         )
         self.streaming_feat_root = streaming_feat_root
         self.streaming_prefix_dir_fmt = streaming_prefix_dir_fmt
+        self.temporal_sampling = temporal_sampling
+        self.streaming_motion_step = float(streaming_motion_step)
+        self.streaming_rotation_weight = float(streaming_rotation_weight)
+        self.streaming_window_stride = int(streaming_window_stride)
+        self.streaming_max_windows_per_scene = int(streaming_max_windows_per_scene)
+        self.streaming_window_obs_len = int(streaming_window_obs_len) if streaming_window_obs_len is not None else None
         self.context_feat_root = context_feat_root
         self.context_segment_dir_fmt = context_segment_dir_fmt
         self._streaming_prefix_meta_cache = {}
@@ -193,6 +225,7 @@ class InsScene15KDataset(EasyDataset):
         # Diagnostic suite flags
         self.diag_overlap = diag_overlap
         self.diag_hidden_obj = diag_hidden_obj
+        self.diag_visible_obj = diag_visible_obj
         self.hidden_obj_min_visible_pixels = int(hidden_obj_min_visible_pixels)
         self.streaming_shared_hidden_obj = bool(streaming_shared_hidden_obj)
         self.streaming_hidden_seed_prefix_len = int(streaming_hidden_seed_prefix_len)
@@ -202,6 +235,10 @@ class InsScene15KDataset(EasyDataset):
             sorted({int(v) for v in streaming_hidden_prefix_lengths if int(v) > 0})
             if streaming_hidden_prefix_lengths is not None else None
         )
+        self.streaming_hidden_min_history_visible_frames = int(streaming_hidden_min_history_visible_frames)
+        self.streaming_hidden_min_query_pixels = int(streaming_hidden_min_query_pixels)
+        self.streaming_hidden_min_border_px = int(streaming_hidden_min_border_px)
+        self.streaming_hidden_strict_post_history = bool(streaming_hidden_strict_post_history)
         self.diag_action = diag_action
         self.diag_abnormal = diag_abnormal
         self.diag_path_integration = diag_path_integration
@@ -210,13 +247,21 @@ class InsScene15KDataset(EasyDataset):
         self.shuffled_feat_root = shuffled_feat_root
         self.action_horizons = sorted({int(h) for h in (action_horizons or []) if int(h) > 0})
         self.counterfactual_min_overlap = counterfactual_min_overlap
+        self.streaming_target_from_prefix = bool(streaming_target_from_prefix)
         self.scramble_feat = scramble_feat
         self.allow_missing_vfm = allow_missing_vfm
         self.no_obj_mask = no_obj_mask
         self.pose_only = pose_only or unconditional_baseline
         # A2/B1/C1 all need extrinsics normalized via pointmap-based scale
         # (invert_pose_ref_and_scale requires pointmaps).
-        if (diag_overlap or diag_hidden_obj or diag_action or diag_path_integration or diag_counterfactual) and not include_pmaps:
+        if (
+            diag_overlap
+            or diag_hidden_obj
+            or diag_visible_obj
+            or diag_action
+            or diag_path_integration
+            or diag_counterfactual
+        ) and not include_pmaps:
             self.include_pmaps = True
         self.kwargs = kwargs
 
@@ -261,8 +306,9 @@ class InsScene15KDataset(EasyDataset):
             selected = indices[:split_idx] if split == "train" else indices[split_idx:]
             self.scenes = [self.scenes[i] for i in selected]
 
-        # Expand scenes with windowing for long videos. Streaming prefix is its
-        # own indexing scheme: each sample is exactly [0, ..., tail].
+        # Expand scenes with windowing for long videos. Streaming prefix uses
+        # shared ScanNet++ temporal windows by default; each probe sees prefixes
+        # cut from the same motion-normalized observation sequence.
         if getattr(self, "streaming_prefix", False):
             self._expand_scenes_with_streaming_prefix()
         elif self.window_size > 0:
@@ -274,8 +320,50 @@ class InsScene15KDataset(EasyDataset):
             f"streaming_prefix={self.streaming_prefix})"
         )
 
+    def _streaming_window_obs_len(self):
+        if self.streaming_window_obs_len is not None:
+            return int(self.streaming_window_obs_len)
+        candidates = []
+        if self.prefix_lengths:
+            candidates.extend(self.prefix_lengths)
+        if self.prefix_max_len is not None:
+            candidates.append(int(self.prefix_max_len))
+        if self._use_shared_streaming_hidden_obj():
+            candidates.extend(self._streaming_hidden_prefix_lengths())
+        future_horizons = self._streaming_future_horizons(default=[])
+        if future_horizons:
+            max_future = max(int(h) for h in future_horizons)
+            bases = list(candidates) if candidates else [int(self.prefix_min_len)]
+            candidates.extend(int(base) + max_future for base in bases)
+        if candidates:
+            return max(int(v) for v in candidates)
+        return int(self.prefix_min_len)
+
+    def _temporal_windows_for_scene(self, scene):
+        if (
+            self.temporal_sampling == "motion_uniform"
+            and scene.get("source") == "scannetpp"
+            and "poses_c2w" in scene
+        ):
+            return temporal_windows_from_poses(
+                scene["poses_c2w"],
+                observations_per_window=self._streaming_window_obs_len(),
+                motion_step=self.streaming_motion_step,
+                rotation_weight=self.streaming_rotation_weight,
+                window_stride=self.streaming_window_stride,
+                max_windows_per_scene=self.streaming_max_windows_per_scene,
+            )
+        nf = int(scene["num_frames"])
+        window_len = min(self._streaming_window_obs_len(), nf)
+        return [{
+            "window_id": 0,
+            "obs_start": 0,
+            "indices": list(range(window_len)),
+            "sampling": "contiguous",
+        }]
+
     def _expand_scenes_with_streaming_prefix(self):
-        """Expand each scene into online prefix samples H_t = [I_0, ..., I_t]."""
+        """Expand each scene into online prefix samples cut from temporal windows."""
         expanded = []
         max_future = max(self._streaming_future_horizons(default=[]), default=0)
         required_hidden_len = (
@@ -283,31 +371,39 @@ class InsScene15KDataset(EasyDataset):
             if self._use_shared_streaming_hidden_obj() else 0
         )
         for scene in self.scenes:
-            nf = int(scene["num_frames"])
-            if required_hidden_len and nf < required_hidden_len:
-                continue
-            max_len = nf - max_future
-            if self.prefix_max_len is not None:
-                max_len = min(max_len, self.prefix_max_len)
-            if max_len < self.prefix_min_len:
-                continue
-            if self.prefix_lengths:
-                lengths = [
-                    length for length in self.prefix_lengths
-                    if self.prefix_min_len <= length <= max_len
-                ]
-            else:
-                lengths = range(self.prefix_min_len, max_len + 1, self.prefix_stride)
-            for length in lengths:
-                tail = length - 1
-                prefix_scene = dict(scene)
-                prefix_scene["streaming_tail"] = tail
-                prefix_scene["streaming_indices"] = list(range(length))
-                expanded.append(prefix_scene)
+            windows = self._temporal_windows_for_scene(scene)
+            for window in windows:
+                window_indices = [int(i) for i in window["indices"]]
+                if required_hidden_len and len(window_indices) < required_hidden_len:
+                    continue
+                max_len = len(window_indices) - max_future
+                if self.prefix_max_len is not None:
+                    max_len = min(max_len, self.prefix_max_len)
+                if max_len < self.prefix_min_len:
+                    continue
+                if self.prefix_lengths:
+                    lengths = [
+                        length for length in self.prefix_lengths
+                        if self.prefix_min_len <= length <= max_len
+                    ]
+                else:
+                    lengths = range(self.prefix_min_len, max_len + 1, self.prefix_stride)
+                for length in lengths:
+                    tail = length - 1
+                    prefix_scene = dict(scene)
+                    prefix_scene["streaming_tail"] = tail
+                    prefix_scene["streaming_tail_raw"] = int(window_indices[tail])
+                    prefix_scene["streaming_indices"] = window_indices[:length]
+                    prefix_scene["streaming_window_indices"] = window_indices
+                    prefix_scene["streaming_window_id"] = int(window.get("window_id", 0))
+                    prefix_scene["streaming_obs_start"] = int(window.get("obs_start", 0))
+                    prefix_scene["streaming_sampling"] = window.get("sampling", self.temporal_sampling)
+                    expanded.append(prefix_scene)
         logger.info(
             f"Streaming prefix expansion: {len(self.scenes)} scenes -> {len(expanded)} samples "
             f"(min_len={self.prefix_min_len}, max_len={self.prefix_max_len}, "
             f"stride={self.prefix_stride}, lengths={self.prefix_lengths}, "
+            f"temporal_sampling={self.temporal_sampling}, window_obs_len={self._streaming_window_obs_len()}, "
             f"max_future={max_future})"
         )
         self.scenes = expanded
@@ -329,15 +425,25 @@ class InsScene15KDataset(EasyDataset):
         return [int(self.prefix_min_len)]
 
     def _streaming_hidden_seed_visible_indices(self):
-        # For seed_prefix_len=4, the object must be visible in frames [0,1,2]
-        # and hidden at frame 3.
-        seed_len = max(int(self.streaming_hidden_seed_prefix_len), 2)
-        return list(range(seed_len - 1))
+        # Common-history B probes select from the full seed history.  For the
+        # default seed_prefix_len=8, candidates may be visible in frames [0..7]
+        # and are required hidden after history in the compared tails.
+        seed_len = max(int(self.streaming_hidden_seed_prefix_len), 1)
+        return list(range(seed_len))
 
     def _streaming_hidden_tail_indices(self):
-        tails = {max(int(length) - 1, 0) for length in self._streaming_hidden_prefix_lengths()}
-        tails.add(max(int(self.streaming_hidden_seed_prefix_len) - 1, 0))
+        seed_len = max(int(self.streaming_hidden_seed_prefix_len), 1)
+        tails = {
+            max(int(length) - 1, 0)
+            for length in self._streaming_hidden_prefix_lengths()
+            if max(int(length) - 1, 0) >= seed_len
+        }
         return sorted(tails)
+
+    def _streaming_preferred_visible_tail_indices(self):
+        seed_tail = max(int(self.streaming_hidden_seed_prefix_len), 1) - 1
+        lengths = set(int(length) for length in self._streaming_hidden_prefix_lengths())
+        return [seed_tail] if int(self.streaming_hidden_seed_prefix_len) in lengths else []
 
     def _streaming_future_horizons(self, default=None):
         """Future frame offsets predicted from the current streaming tail."""
@@ -389,7 +495,7 @@ class InsScene15KDataset(EasyDataset):
         if not all(os.path.isdir(d) for d in [img_dir, mask_dir, cam_dir]):
             return False
 
-        img_files = sorted(
+        img_files = sort_frame_names(
             [f for f in os.listdir(img_dir) if f.endswith(".png")]
         )
         if len(img_files) < self.num_views:
@@ -445,19 +551,22 @@ class InsScene15KDataset(EasyDataset):
             ):
                 continue
 
-            # Count frames that have both image and mask
-            img_files = sorted(
-                [f for f in os.listdir(img_dir) if f.endswith(".jpg")]
-            )
+            # Keep ScanNet++ in metadata/video order.  Frame names are already
+            # zero-padded, but using metadata order also gives direct pose rows.
+            img_files = set(f for f in os.listdir(img_dir) if f.endswith(".jpg"))
             mask_files = set(os.listdir(mask_dir))
-            valid_frames = [
-                f
-                for f in img_files
-                if f"{f}.npy" in mask_files
-            ]
+            meta = np.load(meta_path)
+            meta_images = [str(f) for f in meta["images"].tolist()]
+            valid_frames = []
+            valid_pose_indices = []
+            for meta_idx, frame_name in enumerate(meta_images):
+                if frame_name in img_files and f"{frame_name}.npy" in mask_files:
+                    valid_frames.append(frame_name)
+                    valid_pose_indices.append(meta_idx)
 
             if len(valid_frames) < self.num_views:
                 continue
+            poses_c2w = meta["trajectories"][valid_pose_indices].astype(np.float32)
 
             self.scenes.append(
                 {
@@ -465,6 +574,8 @@ class InsScene15KDataset(EasyDataset):
                     "scene_dir": scene_dir,
                     "num_frames": len(valid_frames),
                     "valid_frames": valid_frames,
+                    "valid_pose_indices": valid_pose_indices,
+                    "poses_c2w": poses_c2w,
                 }
             )
 
@@ -566,7 +677,7 @@ class InsScene15KDataset(EasyDataset):
             K = torch.from_numpy(cam["K"].astype(np.float32))
             T = torch.from_numpy(cam["T"].astype(np.float32))
             intrinsics.append(K)
-            extrinsics.append(T[:3, :4])
+            extrinsics.append(camera_to_world_to_extrinsic(T))
 
         return (
             torch.stack(images),      # (S, 3, H, W)
@@ -586,7 +697,7 @@ class InsScene15KDataset(EasyDataset):
 
         valid_frames = scene_info["valid_frames"]
         meta = np.load(meta_path)
-        all_images_list = list(meta["images"])
+        valid_pose_indices = scene_info.get("valid_pose_indices")
 
         images = []
         masks = []
@@ -622,18 +733,16 @@ class InsScene15KDataset(EasyDataset):
                 )
             depthmaps.append(torch.from_numpy(depth))
 
-            # Find this frame's index in the metadata
-            try:
-                meta_idx = all_images_list.index(frame_name)
-            except ValueError:
-                meta_idx = all_images_list.index(
-                    os.path.splitext(frame_name)[0]
-                ) if os.path.splitext(frame_name)[0] in all_images_list else 0
+            meta_idx = (
+                int(valid_pose_indices[idx])
+                if valid_pose_indices is not None
+                else [str(f) for f in meta["images"].tolist()].index(frame_name)
+            )
 
             K = torch.from_numpy(meta["intrinsics"][meta_idx].astype(np.float32))
             T = torch.from_numpy(meta["trajectories"][meta_idx].astype(np.float32))
             intrinsics.append(K)
-            extrinsics.append(T[:3, :4])
+            extrinsics.append(camera_to_world_to_extrinsic(T))
 
         return (
             torch.stack(images),      # (S, 3, H, W)
@@ -650,7 +759,7 @@ class InsScene15KDataset(EasyDataset):
             frames_dir = os.path.join(scene_info["scene_dir"], "frames")
             img_dir = os.path.join(frames_dir, "Image", "camera_0")
             mask_dir = os.path.join(frames_dir, "ObjectSegmentation", "camera_0")
-            img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".png")])
+            img_files = sort_frame_names([f for f in os.listdir(img_dir) if f.endswith(".png")])
             for idx in sel_indices:
                 idx = min(int(idx.item()), len(img_files) - 1)
                 img_name = img_files[idx]
@@ -687,7 +796,7 @@ class InsScene15KDataset(EasyDataset):
             img_dir = os.path.join(frames_dir, "Image", "camera_0")
             cam_dir = os.path.join(frames_dir, "camview", "camera_0")
             depth_dir = os.path.join(frames_dir, "Depth", "camera_0")
-            img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".png")])
+            img_files = sort_frame_names([f for f in os.listdir(img_dir) if f.endswith(".png")])
 
             for idx in sel_indices:
                 idx = min(int(idx.item()), len(img_files) - 1)
@@ -709,7 +818,7 @@ class InsScene15KDataset(EasyDataset):
                 cam = np.load(cam_path)
                 intrinsics.append(torch.from_numpy(cam["K"].astype(np.float32)))
                 T = torch.from_numpy(cam["T"].astype(np.float32))
-                extrinsics.append(T[:3, :4])
+                extrinsics.append(camera_to_world_to_extrinsic(T))
 
         elif scene_info["source"] == "scannetpp":
             scene_dir = scene_info["scene_dir"]
@@ -717,7 +826,7 @@ class InsScene15KDataset(EasyDataset):
             meta_path = os.path.join(scene_dir, "scene_iphone_metadata.npz")
             valid_frames = scene_info["valid_frames"]
             meta = np.load(meta_path)
-            all_images_list = list(meta["images"])
+            valid_pose_indices = scene_info.get("valid_pose_indices")
 
             for idx in sel_indices:
                 idx = min(int(idx.item()), len(valid_frames) - 1)
@@ -730,14 +839,14 @@ class InsScene15KDataset(EasyDataset):
                     depth = np.zeros((self.target_h, self.target_w), dtype=np.float32)
                 depthmaps.append(torch.from_numpy(depth))
 
-                try:
-                    meta_idx = all_images_list.index(frame_name)
-                except ValueError:
-                    stem = os.path.splitext(frame_name)[0]
-                    meta_idx = all_images_list.index(stem) if stem in all_images_list else 0
+                meta_idx = (
+                    int(valid_pose_indices[idx])
+                    if valid_pose_indices is not None
+                    else [str(f) for f in meta["images"].tolist()].index(frame_name)
+                )
                 intrinsics.append(torch.from_numpy(meta["intrinsics"][meta_idx].astype(np.float32)))
                 T = torch.from_numpy(meta["trajectories"][meta_idx].astype(np.float32))
-                extrinsics.append(T[:3, :4])
+                extrinsics.append(camera_to_world_to_extrinsic(T))
         else:
             raise ValueError(f"Unknown source: {scene_info['source']}")
 
@@ -871,9 +980,18 @@ class InsScene15KDataset(EasyDataset):
         )
 
     def _streaming_prefix_dir_name(self, scene_info) -> str:
+        if "streaming_window_id" in scene_info and "{window" not in self.streaming_prefix_dir_fmt:
+            return os.path.join(
+                f"window_{int(scene_info['streaming_window_id']):04d}",
+                self.streaming_prefix_dir_fmt.format(
+                    tail=int(scene_info["streaming_tail"]),
+                    length=len(scene_info["streaming_indices"]),
+                ),
+            )
         return self.streaming_prefix_dir_fmt.format(
             tail=int(scene_info["streaming_tail"]),
             length=len(scene_info["streaming_indices"]),
+            window=int(scene_info.get("streaming_window_id", 0)),
         )
 
     def _streaming_prefix_scene_dir(self, scene_info) -> str | None:
@@ -894,7 +1012,7 @@ class InsScene15KDataset(EasyDataset):
 
         meta_path = os.path.join(scene_dir, "prefix_index.npy")
         if meta_path not in self._streaming_prefix_meta_cache:
-            records_by_tail = {}
+            records_by_key = {}
             if os.path.exists(meta_path):
                 try:
                     records = np.load(meta_path, allow_pickle=True).tolist()
@@ -902,12 +1020,17 @@ class InsScene15KDataset(EasyDataset):
                         records = records.values()
                     for record in records:
                         if isinstance(record, dict) and "tail" in record:
-                            records_by_tail[int(record["tail"])] = record
+                            window_id = int(record.get("window_id", -1))
+                            records_by_key[(window_id, int(record["tail"]))] = record
+                            if window_id < 0:
+                                records_by_key[int(record["tail"])] = record
                 except Exception as e:
                     logger.warning(f"Failed to read streaming prefix metadata {meta_path}: {e}")
-            self._streaming_prefix_meta_cache[meta_path] = records_by_tail
+            self._streaming_prefix_meta_cache[meta_path] = records_by_key
 
-        return self._streaming_prefix_meta_cache[meta_path].get(
+        records = self._streaming_prefix_meta_cache[meta_path]
+        window_id = int(scene_info.get("streaming_window_id", -1))
+        return records.get((window_id, int(scene_info["streaming_tail"]))) or records.get(
             int(scene_info["streaming_tail"])
         )
 
@@ -995,28 +1118,55 @@ class InsScene15KDataset(EasyDataset):
         """Return the scene-level object id shared by all B streaming prefixes."""
         lengths = tuple(self._streaming_hidden_prefix_lengths())
         seed_len = int(self.streaming_hidden_seed_prefix_len)
+        window_indices = tuple(
+            int(i) for i in scene_info.get(
+                "streaming_window_indices",
+                list(range(max(max(lengths), seed_len))),
+            )
+        )
         key = (
             scene_info["source"],
             scene_info["scene_dir"],
+            int(scene_info.get("streaming_window_id", 0)),
+            window_indices,
             lengths,
             seed_len,
             self.hidden_obj_min_visible_pixels,
+            self.streaming_hidden_min_history_visible_frames,
+            self.streaming_hidden_min_query_pixels,
+            self.streaming_hidden_min_border_px,
+            self.streaming_hidden_strict_post_history,
+            tuple(self._streaming_preferred_visible_tail_indices()),
         )
         if key in self._streaming_hidden_obj_cache:
             cached = self._streaming_hidden_obj_cache[key]
             return None if cached is None else int(cached)
 
-        from vidfm3d.utils.spatial_diag import select_streaming_hidden_object_id
+        from vidfm3d.utils.spatial_diag import select_common_history_hidden_object_id
 
         required_len = max(max(lengths), seed_len)
-        sel = torch.arange(required_len, dtype=torch.long)
-        masks = self._load_identity_masks_scene(scene_info, sel)
-        masks = self._resize_masks_to_target(masks)
-        obj_id = select_streaming_hidden_object_id(
+        sel = torch.as_tensor(window_indices[:required_len], dtype=torch.long)
+        if scene_info["source"] == "infinigen":
+            _images, masks, depthmaps, intrinsics, _extrinsics = self._load_infinigen_scene(scene_info, sel)
+        elif scene_info["source"] == "scannetpp":
+            _images, masks, depthmaps, intrinsics, _extrinsics = self._load_scannetpp_scene(scene_info, sel)
+        else:
+            raise ValueError(f"Unknown source: {scene_info['source']}")
+        _images, masks, depthmaps, _intrinsics = self._resize_to_target(
+            _images, masks, depthmaps, intrinsics
+        )
+        confmaps = (depthmaps > 0).float()
+        obj_id = select_common_history_hidden_object_id(
             masks,
-            seed_visible_indices=self._streaming_hidden_seed_visible_indices(),
+            confmaps=confmaps,
+            history_len=seed_len,
             hidden_tail_indices=self._streaming_hidden_tail_indices(),
+            preferred_visible_indices=self._streaming_preferred_visible_tail_indices(),
             min_visible_pixels=self.hidden_obj_min_visible_pixels,
+            min_history_visible_frames=self.streaming_hidden_min_history_visible_frames,
+            min_query_pixels=self.streaming_hidden_min_query_pixels,
+            min_border_px=self.streaming_hidden_min_border_px,
+            strict_post_history=self.streaming_hidden_strict_post_history,
         )
         self._streaming_hidden_obj_cache[key] = obj_id
         return None if obj_id is None else int(obj_id)
@@ -1303,6 +1453,40 @@ class InsScene15KDataset(EasyDataset):
 
         return vfm_feat, vfm_idx
 
+    def _load_streaming_target_feats_from_prefix(self, scene_info, target_global_indices):
+        """Load future target features from cached streaming prefixes.
+
+        The target is the tail token of a longer prefix in the same temporal
+        window.  This is kept only as an explicit leakage-prone/debug control;
+        C probes default to isolated target features because the longer prefix
+        forward has seen the target image.
+        """
+        window_indices = scene_info.get("streaming_window_indices")
+        if not window_indices:
+            return [None for _ in target_global_indices]
+        raw_to_pos = {int(raw): pos for pos, raw in enumerate(window_indices)}
+        feats = []
+        for target_idx in target_global_indices:
+            target_idx = int(target_idx)
+            pos = raw_to_pos.get(target_idx)
+            if pos is None:
+                feats.append(None)
+                continue
+            target_scene = dict(scene_info)
+            target_scene["streaming_tail"] = int(pos)
+            target_scene["streaming_tail_raw"] = int(target_idx)
+            target_scene["streaming_indices"] = [int(i) for i in window_indices[: pos + 1]]
+            try:
+                target_prefix, _ = self._load_streaming_prefix_feat(
+                    target_scene,
+                    torch.as_tensor(target_scene["streaming_indices"], dtype=torch.long),
+                )
+            except FileNotFoundError:
+                feats.append(None)
+                continue
+            feats.append(target_prefix[-1])
+        return feats
+
     def _getitem_feature_action_diag(self, scene_info, num_frames, sel_global):
         """Fast path for C1/C2/C3 probes that do not consume RGB, masks, or identity IDs."""
         from vidfm3d.utils.spatial_diag import (
@@ -1361,11 +1545,22 @@ class InsScene15KDataset(EasyDataset):
             if not input_valid:
                 input_feat = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
 
-        loaded_target_feats = self._load_target_feats(
-            scene_info,
-            [int(target_idx.item()) for target_idx in target_global],
-            num_frames,
+        target_global_list = [int(target_idx.item()) for target_idx in target_global]
+        loaded_target_feats = (
+            self._load_streaming_target_feats_from_prefix(scene_info, target_global_list)
+            if getattr(self, "streaming_prefix", False) and self.streaming_target_from_prefix
+            else [None for _ in target_global_list]
         )
+        if any(target_feat is None for target_feat in loaded_target_feats):
+            fallback_target_feats = self._load_target_feats(
+                scene_info,
+                target_global_list,
+                num_frames,
+            )
+            loaded_target_feats = [
+                target_feat if target_feat is not None else fallback
+                for target_feat, fallback in zip(loaded_target_feats, fallback_target_feats)
+            ]
         target_feats = []
         target_valid = []
         for target_feat in loaded_target_feats:
@@ -1502,13 +1697,31 @@ class InsScene15KDataset(EasyDataset):
             if (
                 future_horizons
                 and (self.diag_action or self.diag_path_integration or self.diag_counterfactual)
-                and not (self.diag_overlap or self.diag_hidden_obj or self.diag_abnormal)
+                and not (
+                    self.diag_overlap
+                    or self.diag_hidden_obj
+                    or self.diag_visible_obj
+                    or self.diag_abnormal
+                )
             ):
                 tail = int(scene_info["streaming_tail"])
-                sel_global = torch.as_tensor(
-                    [tail] + [tail + int(h) for h in future_horizons],
-                    dtype=torch.long,
-                )
+                window_indices = scene_info.get("streaming_window_indices")
+                if window_indices is not None:
+                    target_positions = [tail + int(h) for h in future_horizons]
+                    if any(pos >= len(window_indices) for pos in target_positions):
+                        raise IndexError(
+                            f"Streaming future target outside window: tail={tail}, "
+                            f"horizons={future_horizons}, window_len={len(window_indices)}"
+                        )
+                    raw_indices = [int(window_indices[tail])] + [
+                        int(window_indices[pos]) for pos in target_positions
+                    ]
+                    sel_global = torch.as_tensor(raw_indices, dtype=torch.long)
+                else:
+                    sel_global = torch.as_tensor(
+                        [tail] + [tail + int(h) for h in future_horizons],
+                        dtype=torch.long,
+                    )
             else:
                 sel_global = prefix_global
         else:
@@ -1565,7 +1778,12 @@ class InsScene15KDataset(EasyDataset):
 
         if (
             (self.diag_action or self.diag_path_integration or self.diag_counterfactual)
-            and not (self.diag_overlap or self.diag_hidden_obj or self.diag_abnormal)
+            and not (
+                self.diag_overlap
+                or self.diag_hidden_obj
+                or self.diag_visible_obj
+                or self.diag_abnormal
+            )
             and (self.streaming_prefix or not self.diag_action)
         ):
             return self._getitem_feature_action_diag(scene_info, num_frames, sel_global)
@@ -1734,6 +1952,7 @@ class InsScene15KDataset(EasyDataset):
         if (
             self.diag_overlap
             or self.diag_hidden_obj
+            or self.diag_visible_obj
             or self.diag_action
             or self.diag_path_integration
             or self.diag_counterfactual
@@ -1741,6 +1960,7 @@ class InsScene15KDataset(EasyDataset):
             from vidfm3d.utils.spatial_diag import (
                 compute_overlap_ratio,
                 compute_hidden_object_target,
+                compute_visible_object_target,
                 compute_object_target_for_id,
                 encode_relative_pose,
             )
@@ -1752,9 +1972,18 @@ class InsScene15KDataset(EasyDataset):
                 pointmaps_scaled, intrinsics, extrinsics, valid_mask
             )                                                            # (S, S)
 
-        if self.diag_hidden_obj:
-            assert pointmaps_scaled is not None, "diag_hidden_obj requires include_pmaps=True"
-            if self._use_shared_streaming_hidden_obj():
+        if self.diag_hidden_obj or self.diag_visible_obj:
+            assert pointmaps_scaled is not None, "diag_hidden_obj/diag_visible_obj requires include_pmaps=True"
+            if self.diag_visible_obj:
+                target = compute_visible_object_target(
+                    identity_ids=raw_identity_ids,
+                    pmaps_world=pointmaps_scaled,
+                    confmaps=confmaps,
+                    extrinsics=extrinsics,
+                    min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    last_frame_idx=-1,
+                )
+            elif self._use_shared_streaming_hidden_obj():
                 obj_id = self._shared_streaming_hidden_obj_id(scene_info)
                 target = None if obj_id is None else compute_object_target_for_id(
                     obj_id=obj_id,
@@ -1778,7 +2007,9 @@ class InsScene15KDataset(EasyDataset):
             S, H, W = masks.shape
             # ------------------------------------------------------------------ B2 query token
             # For B2 we emit a 1D appearance signature of the chosen object,
-            # masked-pooled from the past frame with the most visible pixels.
+            # masked-pooled from the prefix frame with the most visible pixels.
+            # Hidden-object targets have the current frame masked out; visible
+            # sanity targets may therefore choose the current prefix tail.
             # The mask itself and camera pose are not passed to B2. The pooled
             # backbone feature can still carry spatial/positional information.
             vfm_feat_cur = output["vfm_feat"]   # (S, H_f, W_f, C) -- post scramble/pose_only
@@ -1797,10 +2028,13 @@ class InsScene15KDataset(EasyDataset):
                 per_frame_mask = target["per_frame_mask"].cpu()
                 output["hidden_obj_id"] = target["obj_id"].cpu()
 
-                # B2: build the object query token BEFORE any mask ablation,
-                # using the past frame with the most masked pixels.
+                # B2: build the object query token BEFORE any mask ablation.
+                # Hidden-object targets use the prefix frame with the most
+                # masked pixels; visible sanity targets are deliberately tied
+                # to the current tail frame so the query and label describe
+                # the same current-view object instance.
                 pix_per_frame = per_frame_mask.flatten(1).sum(dim=1)      # (S,)
-                best_frame = int(pix_per_frame.argmax().item())
+                best_frame = S - 1 if self.diag_visible_obj else int(pix_per_frame.argmax().item())
                 H_f, W_f = vfm_feat_cur.shape[1], vfm_feat_cur.shape[2]
                 m_best = per_frame_mask[best_frame].unsqueeze(0).unsqueeze(0).float()
                 m_feat = torch.nn.functional.interpolate(

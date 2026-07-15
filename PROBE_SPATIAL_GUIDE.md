@@ -11,9 +11,11 @@
 > `README.md` for commands, `EXPERIMENT_PROTOCOL.md` for frozen experimental
 > decisions, and `TRAINING_LOGIC_AUDIT.md` for the line-by-line training logic.
 > Current code supports A1/A2/B1/B2/C1/C2/C3 streaming with prefix lengths
-> `4,8,16,32,64`; B1/B2 receive no camera pose, B1 uses object masks plus final
+> `8,12,16,24`; B1/B2 receive no camera pose, B1 uses object masks plus final
 > global feature, B2 uses object query plus prefix patch tokens, and C probes
 > use `streaming_prefix` inputs with exact `target_isolated` future targets.
+> Streaming is the default. Legacy normal/full-clip scripts and configs require
+> `ALLOW_NON_STREAMING=1`.
 
 ---
 
@@ -108,13 +110,12 @@ probe_spatial/
 ## 3. Data
 
 ### 3.1 The dataset: `InsScene-15K`
-- **Sources**: Infinigen (synthetic, perfect GT) + ScanNet++ v2 (real). Both
-  provide RGB, depth, instance masks, intrinsics, and extrinsics per frame.
-- **On disk**:
+- **Current temporal source**: ScanNet++ v2 only. Infinigen rendered views are
+  retained only as historical/non-temporal debugging data and must not be used
+  for temporal streaming conclusions.
+- **On disk for current runs**:
   ```
   ${INSCENE_DATA_ROOT}/
-      processed_infinigen/scene_XXX/<hash>/frames/Image/camera_0/*.png
-      processed_infinigen/scene_XXX/<hash>/{Depth,ObjectSegmentation,camview}/...
       processed_scannetpp_v2/<scene_id>/{images,depth,refined_ins_ids,metadata.npz}
   ```
 - **Window sampling**: long videos are split into overlapping windows of
@@ -217,7 +218,7 @@ python scripts/summarize_layer_sweep.py \
 The summary reports the layer-wise CSV, `best_layer`, the registered default
 layer score, and the last-layer score when a static last layer is known.
 
-### 4.1 Three modes
+### 4.1 Cache modes
 
 ```bash
 python -m features.run_inscene15k --vfm wan --mode <MODE> ...
@@ -225,10 +226,11 @@ python -m features.run_inscene15k --vfm wan --mode <MODE> ...
 
 | `--mode` | Output dir suffix | Used by | Frame schedule |
 |---|---|---|---|
-| `normal` (default) | `wan/`        | A1, A2, B1 and other non-causal probes | the actual 81 frames in order |
-| `shuffled`         | `wan_shuffled/` | A3 | frames are permuted (per-scene RNG, seed=42) before being passed to the VFM. We then **un-permute** the output, so `shuf[i]` = the feature of frame `i` *as seen under scrambled context*. This is the entire trick that makes A3 nontrivial — VFM features are clip-contextualized, so the only way to expose temporal-coherence info is to recompute them. |
-| `context_segment`  | `wan_context/` | C1/C2/C3 inputs | Each cached input segment is forwarded as `[I_start, ..., I_tail]` without future target frames and saved under `context_<start>_<tail>`. Short segments are padded by repeating the tail frame. |
+| `streaming_prefix` (default) | `wan_streaming/` | A1/A2/B1/B2/C1/C2/C3 | each selected prefix `[I_0, ..., I_t]` is forwarded independently and saved under `prefix_<tail>` |
 | `target_isolated`  | `wan_target/` | C1/C2/C3 targets | Each cached target frame is replicated to fill the VFM clip; we keep the center-frame feature only. Output: `(M, H_f, W_f, C)` plus `target_indices.npy = (M,)`. Cache every frame with `--num-targets 0` unless you intentionally want sparse valid samples. |
+| `normal` | `wan/` | legacy non-streaming probes | the actual 81 frames in order; requires `ALLOW_NON_STREAMING=1` |
+| `shuffled` | `wan_shuffled/` | legacy A3 | frames are permuted before the VFM forward, then un-permuted in cache; requires `ALLOW_NON_STREAMING=1` |
+| `context_segment` | `wan_context/` | legacy non-streaming C inputs | causal segments `[I_start, ..., I_tail]`; requires `ALLOW_NON_STREAMING=1` |
 
 > Why we cannot simply re-use the `normal` features:
 > 1. Diffusion-VFM features are **clip-contextualized** (cross-frame attention).
@@ -440,56 +442,55 @@ another cached layer without editing YAML.
 ## 8. Running things — the canonical sequence
 
 ### 8.1 One-time: extract features
-For each VFM you want to compare, extract all three modes:
+For each VFM you want to compare, extract the default streaming cache and exact
+target cache:
 ```bash
-# A1/A2/B1 inputs + C1 input frames
-python -m features.run_inscene15k --vfm wan --mode normal \
+# A1/A2/B1/B2/C1/C2/C3 inputs
+python -m features.run_inscene15k --vfm wan --mode streaming_prefix \
     --data-root ${INSCENE_DATA_ROOT} \
-    --out-root  ${INSCENE_FEAT_ROOT}
-# A3
-python -m features.run_inscene15k --vfm wan --mode shuffled \
-    --out-root ${INSCENE_SHUFFLED_FEAT_ROOT}
-# C1/C2/C3 input contexts
-python -m features.run_inscene15k --vfm wan --mode context_segment \
-    --out-root ${INSCENE_CONTEXT_FEAT_ROOT} --context-len 76
+    --out-root  ${INSCENE_STREAMING_FEAT_ROOT} \
+    --source scannetpp \
+    --prefix-lengths "8,12,16,24" --prefix-max-len 24
 # C1/C2/C3 targets
 python -m features.run_inscene15k --vfm wan --mode target_isolated \
-    --out-root ${INSCENE_TARGET_FEAT_ROOT} --num-targets 0
+    --data-root ${INSCENE_DATA_ROOT} \
+    --out-root ${INSCENE_TARGET_FEAT_ROOT} \
+    --source scannetpp --prefix-lengths "8,12,16,24" --prefix-max-len 24 \
+    --target-from-streaming-windows \
+    --target-prefix-lengths "8,12,16,24" --target-horizons "1,2,4" \
+    --num-targets 0
 ```
 Switch `--vfm cogvideox` / `--vfm vjepa2` for the other VFMs.
 
-### 8.1.1 Layer-wise feature sweeps
+### 8.1.1 Layer-wise streaming feature sweeps
 
 To probe where spatial information is strongest, extract multiple layers into
-the same cache.  Existing default behavior is unchanged when `--output-layers`
-is omitted.
+the same streaming cache.
 
 ```bash
-# Wan/CogVideoX: produces feature_t749_layer{L}.sft
-python -m features.run_inscene15k --vfm wan --mode normal \
+# Wan/CogVideoX streaming prefixes: produces prefix_<tail>/feature_t749_layer{L}.sft
+python -m features.run_inscene15k --vfm wan --mode streaming_prefix \
   --data-root ${INSCENE_DATA_ROOT} \
-  --out-root ${INSCENE_FEAT_ROOT} \
-  --t 749 --output-layers 4 8 12 16 20 24 28
+  --out-root ${INSCENE_STREAMING_FEAT_ROOT} \
+  --t 749 --output-layers 4 8 12 16 20 24 28 \
+  --source scannetpp --prefix-lengths "8,12,16,24" --prefix-max-len 24
 
-# V-JEPA2 / VLM-style filenames: produces feature_layer{L}.sft
-python -m features.run_inscene15k --vfm vjepa2 --mode normal \
+# V-JEPA2 / VLM-style filenames: produces prefix_<tail>/feature_layer{L}.sft
+python -m features.run_inscene15k --vfm vjepa2 --mode streaming_prefix \
   --data-root ${INSCENE_DATA_ROOT} \
-  --out-root ${INSCENE_FEAT_ROOT} \
-  --output-layers 3 7 11 15 19 23
+  --out-root ${INSCENE_STREAMING_FEAT_ROOT} \
+  --output-layers 3 7 11 15 19 23 \
+  --source scannetpp --prefix-lengths "8,12,16,24" --prefix-max-len 24
 ```
 
-For A3, extract the same layer list for `--mode shuffled`. For C1/C2/C3,
-extract the same layer list for both `--mode context_segment` and
-`--mode target_isolated`, because inputs and targets intentionally come from
-separate VFM forwards.
+For C1/C2/C3, also extract the same layer list for `--mode target_isolated`,
+because targets intentionally come from separate VFM forwards.
 
-Training a probe on layer `L` is a Hydra override:
+Training a streaming probe on layer `L` is a script override:
 
 ```bash
-python vidfm3d/train.py experiment=inscene15k_ext/view_consistency_wan_v1 \
-  feature_layer=12 feature_timestep=749 \
-  model.probe.in_channels=1536 \
-  job_name=view_consistency_wan_layer12
+VFM=wan PROBES="view_consistency" PREFIX_LENGTHS="8 12 16 24" \
+LAYERS="12" bash scripts/run_streaming_probe_sweep.sh
 ```
 
 For V-JEPA2 use `feature_layer=12` and `model.probe.in_channels=1024`; for
@@ -508,39 +509,39 @@ python scripts/summarize_layer_sweep.py \
   --output layer_sweep_view_consistency_wan.csv
 ```
 
-Or run the whole pipeline with one script. It extracts the feature modes needed
-by the selected probe, trains one probe per layer, evaluates all checkpoints,
-and writes the summary CSV:
+Or run the whole streaming pipeline with one script. It extracts the streaming
+feature modes needed by the selected probe and trains one run per
+`(probe,prefix_len,layer)`:
 
 ```bash
-VFM=wan PROBE=view_consistency LAYERS="0 5 10 15 20 25 29" \
+VFM=wan PROBES="view_consistency" PREFIX_LENGTHS="8 12 16 24" \
+LAYERS="0 5 10 15 20 25 29" \
   EXTRA_TRAIN="logger.wandb.offline=true" \
-  bash scripts/run_feature_layer_probe_sweep.sh
+  bash scripts/run_streaming_probe_sweep.sh
 ```
 
-Mode selection is automatic: A2/B1/B2 use normal caches, A3 adds shuffled
-caches, and C1/C2/C3 add target-isolated caches. For VLM/UMM experiments whose
-config name is not `{probe}_{vfm}_v1`, pass `CFG` explicitly:
+The legacy non-streaming layer sweep now requires `ALLOW_NON_STREAMING=1`.
+For historical VLM/SAE experiments whose config name is not `{probe}_{vfm}_v1`,
+pass `CFG` explicitly and opt in:
 
 ```bash
 CFG=inscene15k_ext/sae_qwen2_5vl_v1 \
 VFM=qwen2_5_vl PROBE=sae SUMMARY_PROBE=sae_spatial \
 LAYERS="-1 8 16 24" \
-bash scripts/run_feature_layer_probe_sweep.sh
+ALLOW_NON_STREAMING=1 bash scripts/run_feature_layer_probe_sweep.sh
 ```
 
 ### 8.2 Train a single probe
 ```bash
-python vidfm3d/train.py experiment=inscene15k_ext/view_consistency_wan_v1
+VFM=wan PROBES="view_consistency" PREFIX_LENGTHS="8 12 16 24" \
+bash scripts/run_streaming_probe_sweep.sh
 # resumes automatically from logs/<run>/checkpoints/last.ckpt if present
 # (also restores the wandb run id when present)
 ```
 
-### 8.3 Train all 4 probes for one VFM
+### 8.3 Legacy non-streaming probes
 ```bash
-bash scripts/run_diag_sweep.sh wan 0     # GPU=0
-bash scripts/run_diag_sweep.sh cogvideox 0
-bash scripts/run_diag_sweep.sh vjepa2 0
+ALLOW_NON_STREAMING=1 bash scripts/run_diag_sweep.sh wan 0
 ```
 
 ### 8.4 Per-sample evaluation + cross-VFM table
@@ -752,10 +753,67 @@ New default channel hints were added for debug / missing-feature fallbacks:
 
 ```text
 qwen2_5_vl: 3584
+qwen2_5_vl_3b: 2048
 bagel:      3584
 ```
 
-### 14.4 SAE spatial probe
+### 14.4 Direct VLM probes
+
+Direct VLM probing is the non-SAE path. It reuses the standard diagnostic heads
+on cached VLM layer features:
+
+```text
+VLM layer feat: (S, H, W, C) -> A/B/C probe heads
+```
+
+Configs:
+
+```text
+configs/experiment/inscene15k_ext/direct_vlm_view_consistency_qwen2_5_vl_v1.yaml
+configs/experiment/inscene15k_ext/direct_vlm_ego_belief_qwen2_5_vl_v1.yaml
+configs/experiment/inscene15k_ext/direct_vlm_ego_belief_v2_qwen2_5_vl_v1.yaml
+configs/experiment/inscene15k_ext/direct_vlm_abnormal_v1.yaml
+configs/experiment/inscene15k_ext/direct_vlm_action_dynamics_v1.yaml
+configs/experiment/inscene15k_ext/direct_vlm_path_integration_v1.yaml
+configs/experiment/inscene15k_ext/direct_vlm_counterfactual_v1.yaml
+configs/experiment/inscene15k_streaming/direct_vlm_<probe>_v1.yaml
+```
+
+The same pattern exists for `qwen2_5_vl_3b` and `bagel`.
+
+Example layer sweep:
+
+```bash
+INSCENE_MLLM_FEAT_ROOT=/data/InsScene-15K/FEAT_MLLM \
+INSCENE_SHUFFLED_FEAT_ROOT=/data/InsScene-15K/FEAT_SHUFFLED_MLLM \
+INSCENE_TARGET_FEAT_ROOT=/data/InsScene-15K/FEAT_TARGET_MLLM \
+INSCENE_CONTEXT_FEAT_ROOT=/data/InsScene-15K/FEAT_CONTEXT_MLLM \
+VFMS="qwen2_5_vl qwen2_5_vl_3b bagel" \
+PROBES="view_consistency abnormal ego_belief ego_belief_v2 action_dynamics path_integration counterfactual" \
+LAYERS="-1 8 16 24 31" \
+  bash scripts/run_direct_vlm_probe_sweep.sh
+```
+
+Streaming VLM probes use the same shared streaming script:
+
+```bash
+INSCENE_STREAMING_FEAT_ROOT=/data/InsScene-15K/FEAT_STREAMING_MLLM \
+INSCENE_TARGET_FEAT_ROOT=/data/InsScene-15K/FEAT_TARGET_MLLM \
+VFM=qwen2_5_vl PREFIX_LENGTHS="8 12 16 24" LAYERS="-1 8 16 24 31" \
+  bash scripts/run_streaming_probe_sweep.sh
+```
+
+`features/run_inscene15k_mllm.py` supports `normal`, `shuffled`,
+`streaming_prefix`, `context_segment` and `target_isolated`. VLM
+`streaming_prefix` forwards the true prefix length without padding; VLM
+`target_isolated` forwards each target frame alone.
+
+For Qwen, layer `-1` is the visual-merger output and non-negative layers are
+vision-tower block outputs. The sweep script infers `video_channels` from the
+cached `.sft` file before launching each training job, because these two
+activation families may have different channel dimensions.
+
+### 14.5 SAE spatial probe
 
 New file:
 
@@ -795,7 +853,7 @@ sae_ego_el_err_deg
 sae_ego_logd_err
 ```
 
-### 14.5 Training configs
+### 14.6 SAE training configs
 
 New experiment configs:
 
@@ -816,7 +874,7 @@ Example training:
   experiment=inscene15k_ext/sae_bagel_v1
 ```
 
-### 14.6 How to interpret this extension
+### 14.7 How to interpret this extension
 
 The SAE extension is not a replacement for A2/A3/B1/B2/C1/C2/C3. It is a
 complementary representation diagnostic:
@@ -835,7 +893,7 @@ Useful comparisons:
 3. Real features vs scrambled/random controls: whether the spatial readout is
    supported by model activations rather than dataset bias.
 
-### 14.7 Validation already performed
+### 14.8 Validation already performed
 
 The following checks were run after implementation:
 

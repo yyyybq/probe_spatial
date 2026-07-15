@@ -1,0 +1,60 @@
+# @package _global_
+# C1: Action-conditioned target prediction under streaming prefix on direct VLM features.
+
+defaults:
+  - override /model: probe_ext
+  - override /callbacks: v3_checkpoint
+
+seed: 42
+tags: ["train", "inscene15k_streaming", "direct_vlm", "streaming_prefix", "action_dynamics"]
+
+task_name: inscene15k_streaming
+job_name: direct_vlm_action_dynamics_v1
+autoresume: true
+
+paths:
+  run_folder_name: ${task_name}_${job_name}
+
+feat_postfix: _layer-1
+feature_layer: null
+feature_timestep: 749
+vfm_name: qwen2_5_vl
+video_channels: 3584
+prefix_len: 8
+streaming_feat_root: ${oc.env:INSCENE_STREAMING_FEAT_ROOT}
+target_feat_root: ${oc.env:INSCENE_TARGET_FEAT_ROOT,}
+action_horizons: [1]
+
+data:
+  data_module:
+    train_datasets:
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'], split='train', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=${prefix_len}, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=False, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_action=True, target_feat_root='${target_feat_root}', action_horizons=${action_horizons})
+    validation_datasets:
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}', streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'], split='val', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}', feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len}, min_view_interval=5, context_len=${prefix_len}, query_idx_divisor=None, target_h=288, target_w=512, window_size=0, include_pmaps=False, streaming_prefix=True, prefix_min_len=${prefix_len}, prefix_max_len=${prefix_len}, prefix_stride=1, diag_action=True, target_feat_root='${target_feat_root}', action_horizons=${action_horizons})
+    batch_size_per_device: 4
+    batch_size_per_device_val: 4
+    num_workers: 8
+    num_workers_val: 4
+
+logger:
+  wandb:
+    name: ${task_name}_${job_name}
+    group: ${task_name}
+
+model:
+  probe_type: action_dynamics
+  probe:
+    _target_: vidfm3d.models.components.probe_action_dynamics.ActionDynamicsProbe
+    in_channels: ${video_channels}
+    action_dim: 9
+    hidden_dim: 512
+    num_layers: 2
+    num_heads: 8
+    max_seq_len: 64
+
+trainer:
+  devices: [0]
+  strategy: auto
+  max_epochs: 50
+  precision: bf16-mixed
+  plugins: []

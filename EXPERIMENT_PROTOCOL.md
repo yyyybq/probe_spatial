@@ -5,7 +5,9 @@
 - Split by scene with `configs/splits/inscene15k_v1.json`; do not tune on test.
 - Run at least seeds 41, 42 and 43. Select layers and hyperparameters on val,
   then evaluate the selected frozen setting once on test.
-- Report aggregate and Infinigen/ScanNet++ metrics with scene-bootstrap 95% CIs.
+- Temporal streaming conclusions use ScanNet++ only. Old streaming runs that
+  included Infinigen are historical because Infinigen frames are independent
+  rendered views, not video trajectories.
 - B1 is conditioned on past object masks plus final-view global feature. B2 is
   conditioned on an object query. Neither receives camera pose or an explicit
   last/current-frame role flag.
@@ -18,19 +20,30 @@
   In streaming runs, "final observation" means the last frame of the selected
   prefix.
 - Streaming B1/B2 reuse one object id across the whole prefix sweep. The object
-  is selected from the first four-frame prefix: it must be visible in one of
-  frames `0,1,2`, hidden at frame `3`, and hidden at every compared prefix tail
-  such as `7,15,31,63`. Each prefix sample returns only that object's masks
-  inside the current prefix and expresses the target in the current prefix-tail
-  camera frame.
+  is selected from the common history `obs0..obs7`: it must be visible in at
+  least three history observations, large enough, and away from the image
+  border. Selection prefers visibility at `obs7`, but this is not a hard
+  requirement. Hidden-object B jobs use prefixes `8/12/16/24`; the same object
+  must be hidden at tails `obs11/obs15/obs23` for prefixes `12/16/24`.
+  Each prefix sample returns only that object's masks inside the current prefix
+  and expresses the target in the current prefix-tail camera frame.
+- `visible_ego_belief_v2` is a B2 sanity experiment, not the main hidden-object
+  B2 setting. It reuses the B2 head but selects an object visible in the current
+  prefix-tail frame; use it to check whether basic current-view object
+  localization is learnable before interpreting hidden-object B2 failures.
 - C1/C2/C3 target features must come from exact `target_isolated` rows. Their
   non-streaming inputs come from causal `context_segment` forwards; their
   streaming inputs come from independently forwarded `streaming_prefix` caches.
   Do not feed these probes features sliced from the normal full-clip cache.
 - Streaming is a shared setting across A1/A2/B1/B2/C1/C2/C3. The default prefix
-  lengths are `4,8,16,32,64`, trained as separate fixed-shape jobs. For C probes,
+  lengths are `8,12,16,24`, trained as separate fixed-shape jobs. For C probes,
   actions are defined relative to the current prefix tail `I_t`; that frame is
-  the action reference, not an additional condition.
+  the action reference, not an additional condition. A3 remains a legacy
+  non-streaming shuffled-cache control until a streaming shuffled-prefix cache
+  is implemented.
+- Streaming is the default experimental setting. Legacy normal/full-clip
+  extraction and `inscene15k_ext`/original `inscene15k` training require
+  explicit opt-in via `ALLOW_NON_STREAMING=1` or `allow_non_streaming=true`.
 - ScanNet++ caches must be extracted after the valid-frame indexing fix; older
   caches used all JPGs while the dataset indexed only image+mask pairs.
 
@@ -41,6 +54,10 @@
 - B1/B2: object-conditioned random-feature and unconditional controls.
 - C1: no-action, shuffled-action and last-observation-copy controls.
 - Every probe: a parameter-matched shallow/linear head where applicable.
+- VLM direct probes and VLM SAE probes are separate baselines. Direct probes use
+  cached Qwen/BAGEL layer features as `vfm_feat` for A2/B1/B2 heads; SAE probes
+  first learn sparse codes and evaluate spatial readouts on those codes. Do not
+  report SAE readouts as a replacement for direct layer probing.
 
 ## B1/B2 readout capacity
 
