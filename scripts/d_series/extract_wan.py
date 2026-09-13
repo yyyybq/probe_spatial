@@ -38,17 +38,20 @@ def load_images(scene_root: Path, row, names):
     return frames
 
 
-def generator(key: str, device="cpu"):
-    return torch.Generator(device=device).manual_seed(stable_seed(42, key))
+def set_sample_seed(key: str):
+    seed = stable_seed(42, key)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    return seed
 
 
 def encode(model, frames, key):
     if not frames or len(frames) > 81:
         raise ValueError("Wan input must contain 1..81 frames")
     padded = frames + [frames[-1]] * (81 - len(frames))
+    set_sample_seed(key)
     raw = model.forward(
         video=padded, prompt="", t=749, output_layer_indices=[20], ensemble_size=1,
-        noise_generator=generator(key),
     )[20]
     if raw.shape[0] != 1 or raw.shape[1] != 21 * 30 * 52:
         raise ValueError(f"unexpected Wan feature shape: {tuple(raw.shape)}")
@@ -87,7 +90,7 @@ def main():
         "prompt": "", "target_or_future_text_used": False,
         "timestep_argument": 749, "timestep_semantics": "scheduler_timesteps_index",
         "resolved_scheduler_timestep": actual_timestep, "scheduler": "UniPCMultistepScheduler",
-        "flow_shift": 3.0, "noise_seed_scheme": "sha256(42|space_and_sample_id)_uint32",
+        "flow_shift": 3.0, "noise_seed_scheme": "sha256(42|space_and_sample_id)_uint32_global_rng_reset_before_forward",
     } | code_provenance([
         Path(__file__), REPO_ROOT / "scripts/d_series/feature_store.py",
         REPO_ROOT / "features/wan/wan_feature.py", REPO_ROOT / "features/noise_seed.py",
