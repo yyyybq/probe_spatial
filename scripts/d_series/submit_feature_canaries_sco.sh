@@ -28,7 +28,7 @@ sco acp jobs create \
   --storage-mount=019ec9f9-6d12-7d49-aad4-864b15c9eb06:/mnt/umm \
   --training-framework=pytorch \
   --worker-nodes=1 \
-  --worker-spec=N4lS.Iq.I80.3 \
+  --worker-spec=N4lS.Iq.I80.4 \
   --command="${command}" | tee "${REPORT}/launcher/sco_submit.log"
 grep -oE 'pt-[a-z0-9]+' "${REPORT}/launcher/sco_submit.log" | awk '!seen[$0]++' > "${REPORT}/launcher/job_ids.txt"
 job_id=$(head -1 "${REPORT}/launcher/job_ids.txt")
