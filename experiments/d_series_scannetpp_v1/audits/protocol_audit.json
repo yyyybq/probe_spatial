@@ -7,6 +7,17 @@
     "train_h4": 2445
   },
   "feature_status": {},
+  "frozen_file_hashes": {
+    "dev_scenes.txt": "075034c01e198d6c990d6098f129cfba9828e1c80c8af4a20e09de7edf22bcb3",
+    "exclusion_ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "manifest_summary.json": "1a8ef4dbe40d69903b3514360d8fa7ddcff29ccabc5ef11255bdcb9e3adfd8fe",
+    "motion_bin_thresholds.json": "34c703d6ee448f2f85f13d5626a84cb590499b4a157c894d99b8f4d322106a7a",
+    "sample_manifest.jsonl": "781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9",
+    "scene_historical_use.csv": "b23a9399b471571cc7e053f531f3888585c04131acc1aac57b14d4f93ed82d85",
+    "scene_list.txt": "b509145c32d7789423554142d541722c04a1388f8d910b0a2addb9bb19978f9a",
+    "test_scenes.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "train_scenes.txt": "4a51a43bd76da1e62079d3d6849554d2215c3582423da5cf8e6ed4a0c9d145e1"
+  },
   "manifest_sha256": "781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9",
   "protocol": "d_series_scannetpp_v1",
   "sample_identity_unique": true,

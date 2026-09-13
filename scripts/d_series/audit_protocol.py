@@ -31,6 +31,14 @@ def main():
     data = args.experiment_root / "data"; manifest = data / "sample_manifest.jsonl"
     rows = [json.loads(line) for line in manifest.open()]
     if sha(manifest) != MANIFEST_SHA256: raise RuntimeError("manifest hash mismatch")
+    frozen_hashes = {}
+    for line in (data / "hashes.sha256").read_text().splitlines():
+        expected, name = line.split(maxsplit=1)
+        path = data / name
+        actual = sha(path)
+        if actual != expected:
+            raise RuntimeError(f"frozen data hash mismatch for {path}: {actual} != {expected}")
+        frozen_hashes[name] = actual
     ids = [r["sample_id"] for r in rows]
     if len(ids) != len(set(ids)): raise RuntimeError("duplicate sample identity")
     split_scenes = {split: set((data / f"{split}_scenes.txt").read_text().split()) for split in ("train", "dev", "test")}
@@ -40,6 +48,7 @@ def main():
     report = {
         "schema_version": 1, "protocol": "d_series_scannetpp_v1", "manifest_sha256": MANIFEST_SHA256,
         "sample_identity_unique": True, "scene_disjoint": True, "test_empty": True,
+        "frozen_file_hashes": frozen_hashes,
         "counts": {f"{split}_h{horizon}": count for (split, horizon), count in sorted(counts.items())},
         "feature_status": {}, "checkpoint_status": {},
     }

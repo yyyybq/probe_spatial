@@ -21,7 +21,7 @@ from safetensors.torch import load_file
 from torch.utils.data import DataLoader, Dataset
 
 from scripts.d_series.feature_store import MANIFEST_SHA256, code_provenance, feature_paths, load_verified
-from scripts.d_series.run_d1 import D1Dataset, REVISIONS, sha256
+from scripts.d_series.run_d1 import D1Dataset, ISOLATED_TARGET_TOKEN, REVISIONS, sha256
 from vidfm3d.models.components.probe_layout_readout import ExternalPooledPredictor, PooledDepthReadout, parameter_count
 from vidfm3d.utils.layout_metrics import coarse_layout_mae, depth_metrics, detail_gradient_mae, latent_diagnostics, metric_depth_to_camera_pointmap, scene_macro
 
@@ -134,7 +134,8 @@ def evaluate(models, readout, depth_dataset, pred_dataset, rows, prior, stats, s
                     "condition": condition, "seed": seed, "split": row["split"], "manifest_sha256": MANIFEST_SHA256,
                     "sample_id": row["sample_id"], "parent_sample_id": row["parent_sample_id"], "scene_id": row["scene_id"],
                     "window_id": row["window_id"], "horizon": row["horizon"], "target_raw_frame_id": row["target_raw_frame_id"],
-                    "target_observation_index": row["target_observation_index"], "target_temporal_token": None,
+                    "target_observation_index": row["target_observation_index"],
+                    "target_temporal_token": ISOLATED_TARGET_TOKEN[pred_dataset.model],
                     "raw_frame_delta": row["raw_frame_delta"],
                     "translation_m": row["translation_m"], "rotation_deg": row["rotation_deg"],
                     "directed_depth_overlap": row["directed_depth_overlap"], "target_layout_scale_m": float(scale),
@@ -149,6 +150,7 @@ def main():
     p.add_argument("--model", choices=sorted(REVISIONS), required=True)
     p.add_argument("--seed", type=int, choices=[0, 1, 2], required=True)
     p.add_argument("--manifest", type=Path, default=Path("experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl"))
+    p.add_argument("--motion-thresholds", type=Path, default=Path("experiments/d_series_scannetpp_v1/data/motion_bin_thresholds.json"))
     p.add_argument("--scene-root", type=Path, required=True); p.add_argument("--feature-root", type=Path, required=True)
     p.add_argument("--d1-checkpoint", type=Path, required=True); p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--batch-size", type=int, default=32); p.add_argument("--max-epochs", type=int, default=40)
@@ -177,6 +179,10 @@ def main():
                         pin_memory=device.type == "cuda")
     tmean, tstd, mmean, mstd = [v.to(device) for v in stats]
     thresholds = motion_bin_thresholds(train_rows)
+    frozen_thresholds = json.loads(args.motion_thresholds.read_text())
+    expected_thresholds = {int(key): value for key, value in frozen_thresholds["thresholds"].items()}
+    if frozen_thresholds.get("fit_split") != "train" or thresholds != expected_thresholds:
+        raise ValueError("train-derived motion bins do not match the frozen threshold file")
     shuffle = shuffled_motion_map(train_rows, dev_rows, thresholds)
     best, remaining, states, history = float("inf"), args.patience, None, []
     source_run = args.output_dir.name
@@ -215,7 +221,8 @@ def main():
                "motion_predictor_parameters": parameter_count(models["motion"]),
                "context_only_parameters": parameter_count(models["context_only"]), "best_epoch": best_epoch,
                "dev_scene_macro_mae": best, "n_dev": len(dev_rows), "n_dev_scenes": len({r['scene_id'] for r in dev_rows}),
-               "motion_shuffle_seed": 42, "motion_bin_thresholds": thresholds, "history": history} | code_provenance([
+               "motion_shuffle_seed": 42, "motion_bin_thresholds": thresholds,
+               "motion_thresholds_sha256": sha256(args.motion_thresholds), "history": history} | code_provenance([
                    Path(__file__), REPO_ROOT / "scripts/d_series/run_d1.py",
                    REPO_ROOT / "vidfm3d/models/components/probe_layout_readout.py",
                    REPO_ROOT / "vidfm3d/utils/layout_metrics.py",

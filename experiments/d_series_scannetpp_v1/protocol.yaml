@@ -8,6 +8,7 @@ parent:
   sha256: 20976fc86abfdc96d40446a0fe15fc32af699369309c540f9a352e868ce89f91
 data:
   source: scannetpp_via_inscene15k_processed_scannetpp_v2
+  upstream_release_identifier: unresolved_missing_package_receipt
   manifest: data/sample_manifest.jsonl
   manifest_sha256: 781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
   obs_len: 28
@@ -70,6 +71,8 @@ motion:
   units: {translation: meters, rotation: dimensionless_matrix}
   shuffle_seed: 42
   shuffle_matching: same_horizon_and_train_translation_magnitude_bin
+  analysis_bins: data/motion_bin_thresholds.json
+  analysis_bin_fit: train_only_per_horizon_tertiles
 wan:
   timestep_argument: 749
   timestep_semantics: scheduler_timesteps_index_not_raw_noise_timestep

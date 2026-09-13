@@ -208,6 +208,18 @@ def build(args):
             })
 
     counts = Counter((r["split"], r["horizon"]) for r in records)
+    motion_thresholds = {}
+    for horizon in (2, 4):
+        motion_thresholds[str(horizon)] = {}
+        horizon_train = [row for row in records if row["split"] == "train" and row["horizon"] == horizon]
+        for field in ("translation_m", "rotation_deg", "directed_depth_overlap"):
+            motion_thresholds[str(horizon)][field] = np.quantile(
+                [row[field] for row in horizon_train], [1 / 3, 2 / 3]
+            ).tolist()
+    motion_threshold_path = out / "motion_bin_thresholds.json"
+    motion_threshold_path.write_text(json.dumps({
+        "fit_split": "train", "grouping": "per_horizon_tertiles", "thresholds": motion_thresholds,
+    }, indent=2, sort_keys=True) + "\n")
     summary = {
         "schema_version": 1,
         "protocol": PROTOCOL,
@@ -232,7 +244,7 @@ def build(args):
 
     frozen = [
         manifest, ledger, history, out / "scene_list.txt", out / "train_scenes.txt",
-        out / "dev_scenes.txt", out / "test_scenes.txt", out / "manifest_summary.json",
+        out / "dev_scenes.txt", out / "test_scenes.txt", out / "manifest_summary.json", motion_threshold_path,
     ]
     (out / "hashes.sha256").write_text("".join(f"{sha256(p)}  {p.name}\n" for p in frozen))
     print(json.dumps(summary, indent=2, sort_keys=True))

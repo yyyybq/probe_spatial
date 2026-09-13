@@ -192,16 +192,11 @@ def _paired_rows(records, condition, comparator, metric="mae"):
 
 
 def _motion_thresholds():
-    manifest = REPO_ROOT / "experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl"
-    rows = [json.loads(line) for line in manifest.open()]
-    fields = ("translation_m", "rotation_deg", "directed_depth_overlap")
-    output = {}
-    for horizon in (2, 4):
-        output[horizon] = {}
-        train = [row for row in rows if row["split"] == "train" and row["horizon"] == horizon]
-        for field in fields:
-            output[horizon][field] = np.quantile([row[field] for row in train], [1 / 3, 2 / 3]).tolist()
-    return output
+    path = REPO_ROOT / "experiments/d_series_scannetpp_v1/data/motion_bin_thresholds.json"
+    document = json.loads(path.read_text())
+    if document.get("fit_split") != "train" or document.get("grouping") != "per_horizon_tertiles":
+        raise RuntimeError(f"invalid frozen motion threshold receipt: {path}")
+    return {int(key): value for key, value in document["thresholds"].items()}
 
 
 def _with_motion_bins(records):

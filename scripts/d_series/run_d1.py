@@ -40,6 +40,7 @@ REVISIONS = {
     "wan21_t2v_1p3b": "0fad780a534b6463e45facd96134c9f345acfa5b",
     "dinov2_vitl14": "47b73eefe95e8d44ec3623f8890bd894b6ea2d6c",
 }
+ISOLATED_TARGET_TOKEN = {"vjepa2_vitl256": 16, "wan21_t2v_1p3b": 10, "dinov2_vitl14": 0}
 
 
 @lru_cache(maxsize=32)
@@ -169,7 +170,8 @@ def evaluate(readout, dataset, rows, prior, device, seed, source_run):
                     "sample_id": row["sample_id"], "parent_sample_id": row["parent_sample_id"],
                     "scene_id": row["scene_id"], "window_id": row["window_id"],
                     "horizon": row["horizon"], "target_raw_frame_id": row["target_raw_frame_id"],
-                    "target_observation_index": row["target_observation_index"], "target_temporal_token": None,
+                    "target_observation_index": row["target_observation_index"],
+                    "target_temporal_token": ISOLATED_TARGET_TOKEN[dataset.model] if dataset.reference == "isolated_target" else row["target_observation_index"] // 2,
                     "raw_frame_delta": row["raw_frame_delta"], "translation_m": row["translation_m"],
                     "rotation_deg": row["rotation_deg"], "directed_depth_overlap": row["directed_depth_overlap"],
                     "target_layout_scale_m": float(scale), "source_run": source_run, **metric,
