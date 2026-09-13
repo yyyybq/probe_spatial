@@ -53,13 +53,14 @@ def sha256(path: Path):
 
 
 class D1Dataset(Dataset):
-    def __init__(self, rows, scene_root, feature_root, model, reference, branch):
+    def __init__(self, rows, scene_root, feature_root, model, reference, branch, report_branch=None):
         self.rows = rows
         self.scene_root = scene_root
         self.feature_root = feature_root
         self.model = model
         self.reference = reference
         self.branch = branch
+        self.report_branch = report_branch or branch
 
     def __len__(self): return len(self.rows)
 
@@ -163,11 +164,14 @@ def evaluate(readout, dataset, rows, prior, device, seed, source_run):
                 records.append({
                     "schema_version": 1, "experiment": "D1", "protocol": "d_series_scannetpp_v1",
                     "evaluation_status": "development_only", "model": dataset.model,
-                    "reference": dataset.reference, "branch": dataset.branch, "condition": condition,
+                    "reference": dataset.reference, "branch": dataset.report_branch, "condition": condition,
                     "seed": seed, "split": row["split"], "manifest_sha256": MANIFEST_SHA256,
                     "sample_id": row["sample_id"], "parent_sample_id": row["parent_sample_id"],
                     "scene_id": row["scene_id"], "window_id": row["window_id"],
                     "horizon": row["horizon"], "target_raw_frame_id": row["target_raw_frame_id"],
+                    "target_observation_index": row["target_observation_index"], "target_temporal_token": None,
+                    "raw_frame_delta": row["raw_frame_delta"], "translation_m": row["translation_m"],
+                    "rotation_deg": row["rotation_deg"], "directed_depth_overlap": row["directed_depth_overlap"],
                     "target_layout_scale_m": float(scale), "source_run": source_run, **metric,
                 })
     return records
@@ -205,8 +209,8 @@ def main():
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train = D1Dataset(train_rows, args.scene_root, args.feature_root, args.model, args.reference, branch)
-    dev = D1Dataset(dev_rows, args.scene_root, args.feature_root, args.model, args.reference, branch)
+    train = D1Dataset(train_rows, args.scene_root, args.feature_root, args.model, args.reference, branch, args.branch)
+    dev = D1Dataset(dev_rows, args.scene_root, args.feature_root, args.model, args.reference, branch, args.branch)
     example = train.feature(train_rows[0]["sample_id"])
     channels = example.shape[-1]
     if args.branch == "spatial": readout = SpatialDepthReadout(channels)

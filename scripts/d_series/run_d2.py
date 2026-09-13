@@ -50,15 +50,29 @@ def train_stats(dataset):
     return targets.mean(0), targets.std(0, unbiased=False).clamp_min(1e-6), motions.mean(0), motions.std(0, unbiased=False).clamp_min(1e-6)
 
 
-def shuffled_motion_map(train_rows, dev_rows):
+MOTION_FIELDS = ("translation_m", "rotation_deg", "directed_depth_overlap")
+
+
+def motion_bin_thresholds(train_rows):
     thresholds = {}
     for horizon in (2, 4):
-        values = np.array([row["translation_m"] for row in train_rows if row["horizon"] == horizon])
-        thresholds[horizon] = np.quantile(values, [1/3, 2/3]).tolist()
+        thresholds[horizon] = {}
+        horizon_rows = [row for row in train_rows if row["horizon"] == horizon]
+        for field in MOTION_FIELDS:
+            values = np.asarray([row[field] for row in horizon_rows], dtype=np.float64)
+            thresholds[horizon][field] = np.quantile(values, [1 / 3, 2 / 3]).tolist()
+    return thresholds
+
+
+def bin_index(value, cuts):
+    return int(value > cuts[0]) + int(value > cuts[1])
+
+
+def shuffled_motion_map(train_rows, dev_rows, thresholds):
     groups = {}
     for row in dev_rows:
-        a, b = thresholds[row["horizon"]]
-        key = (row["horizon"], int(row["translation_m"] > a) + int(row["translation_m"] > b))
+        cuts = thresholds[row["horizon"]]["translation_m"]
+        key = (row["horizon"], bin_index(row["translation_m"], cuts))
         groups.setdefault(key, []).append(row)
     result = {}
     rng = random.Random(42)
@@ -70,7 +84,7 @@ def shuffled_motion_map(train_rows, dev_rows):
         else:
             shift = rng.randrange(1, len(ordered))
             for i, row in enumerate(ordered): result[row["sample_id"]] = ordered[(i + shift) % len(ordered)]
-    return result, thresholds
+    return result
 
 
 def predictor_latent(model, context, motion, tmean, tstd, mmean, mstd):
@@ -78,7 +92,7 @@ def predictor_latent(model, context, motion, tmean, tstd, mmean, mstd):
     return normalized * tstd + tmean
 
 
-def evaluate(models, readout, depth_dataset, pred_dataset, rows, prior, stats, shuffle, device, seed, source_run):
+def evaluate(models, readout, depth_dataset, pred_dataset, rows, prior, stats, shuffle, thresholds, device, seed, source_run):
     tmean, tstd, mmean, mstd = [value.to(device) for value in stats]
     for module in [*models.values(), readout]: module.eval()
     records = []
@@ -120,8 +134,11 @@ def evaluate(models, readout, depth_dataset, pred_dataset, rows, prior, stats, s
                     "condition": condition, "seed": seed, "split": row["split"], "manifest_sha256": MANIFEST_SHA256,
                     "sample_id": row["sample_id"], "parent_sample_id": row["parent_sample_id"], "scene_id": row["scene_id"],
                     "window_id": row["window_id"], "horizon": row["horizon"], "target_raw_frame_id": row["target_raw_frame_id"],
+                    "target_observation_index": row["target_observation_index"], "target_temporal_token": None,
+                    "raw_frame_delta": row["raw_frame_delta"],
                     "translation_m": row["translation_m"], "rotation_deg": row["rotation_deg"],
                     "directed_depth_overlap": row["directed_depth_overlap"], "target_layout_scale_m": float(scale),
+                    **{f"{field}_bin": bin_index(row[field], thresholds[row["horizon"]][field]) for field in MOTION_FIELDS},
                     "source_run": source_run, **metric, **diag,
                 })
     return records
@@ -159,7 +176,8 @@ def main():
     loader = DataLoader(train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
                         pin_memory=device.type == "cuda")
     tmean, tstd, mmean, mstd = [v.to(device) for v in stats]
-    shuffle, thresholds = shuffled_motion_map(train_rows, dev_rows)
+    thresholds = motion_bin_thresholds(train_rows)
+    shuffle = shuffled_motion_map(train_rows, dev_rows, thresholds)
     best, remaining, states, history = float("inf"), args.patience, None, []
     source_run = args.output_dir.name
     for epoch in range(args.max_epochs):
@@ -171,7 +189,7 @@ def main():
                 loss = torch.nn.functional.mse_loss(model(context, (motion - mmean) / mstd), target)
                 optimizers[name].zero_grad(set_to_none=True); loss.backward(); optimizers[name].step()
         records = evaluate(models, readout, D1Dataset(dev_rows, args.scene_root, args.feature_root, args.model, "isolated_target", "pooled"),
-                           dev, dev_rows, prior, stats, shuffle, device, args.seed, source_run)
+                           dev, dev_rows, prior, stats, shuffle, thresholds, device, args.seed, source_run)
         score = scene_macro((r for r in records if r["condition"] == "true_motion"), "mae")
         history.append({"epoch": epoch, "dev_scene_macro_mae": score}); print(json.dumps(history[-1]), flush=True)
         if score < best - 1e-6:
@@ -182,7 +200,7 @@ def main():
             if remaining == 0: break
     for name in models: models[name].load_state_dict(states[name])
     depth_dataset = D1Dataset(dev_rows, args.scene_root, args.feature_root, args.model, "isolated_target", "pooled")
-    records = evaluate(models, readout, depth_dataset, dev, dev_rows, prior, stats, shuffle, device, args.seed, source_run)
+    records = evaluate(models, readout, depth_dataset, dev, dev_rows, prior, stats, shuffle, thresholds, device, args.seed, source_run)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     torch.save({"state_dict": states, "target_mean": stats[0], "target_std": stats[1], "motion_mean": stats[2],
                 "motion_std": stats[3], "motion_bin_thresholds": thresholds}, args.output_dir / "checkpoint.pt")
@@ -191,6 +209,9 @@ def main():
     receipt = {"schema_version": 1, "experiment": "D2", "status": "complete_development_evaluation",
                "source_run": source_run, "model": args.model, "model_revision": REVISIONS[args.model], "seed": args.seed,
                "manifest_sha256": MANIFEST_SHA256, "d1_checkpoint": str(args.d1_checkpoint.resolve()),
+               "d1_checkpoint_sha256": sha256(args.d1_checkpoint),
+               "train_scenes_sha256": sha256(args.manifest.parent / "train_scenes.txt"),
+               "dev_scenes_sha256": sha256(args.manifest.parent / "dev_scenes.txt"), "test_scenes": 0,
                "motion_predictor_parameters": parameter_count(models["motion"]),
                "context_only_parameters": parameter_count(models["context_only"]), "best_epoch": best_epoch,
                "dev_scene_macro_mae": best, "n_dev": len(dev_rows), "n_dev_scenes": len({r['scene_id'] for r in dev_rows}),

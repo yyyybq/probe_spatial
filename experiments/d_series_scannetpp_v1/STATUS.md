@@ -2,6 +2,8 @@
 
 The dataset and protocol are frozen, but formal feature extraction/training/evaluation has not yet produced a complete result matrix. No main-table number exists in this directory yet. This file is intentionally explicit so submitted/running work cannot be mistaken for completed evidence.
 
+Latest scheduler observation (2026-09-13 08:36:31 UTC): GPU canary job `pt-d51znvcm` (`dseries_feature_canary_20260913_0824_r2`) is `STARTING`, with zero running worker replicas and no start time. It is submitted but not yet running or complete. The preceding submission was rejected before job creation because the requested three-GPU work spec did not exist. Machine-readable events are in `job_ledger.jsonl`.
+
 Completed gates:
 
 - canonical manifest derivation and hash verification;

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
+import statistics
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -39,6 +41,10 @@ REQUIRED = {
 }
 
 
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def load_records(run_root: Path):
     records, sources = [], []
     for path in sorted(run_root.rglob("per_sample_metrics.csv")):
@@ -49,8 +55,20 @@ def load_records(run_root: Path):
         if receipt.get("manifest_sha256") != MANIFEST_SHA256: raise RuntimeError(f"manifest mismatch {receipt_path}")
         with path.open() as handle: rows = list(csv.DictReader(handle))
         if not rows: raise RuntimeError(f"empty records {path}")
-        records.extend(rows); sources.append(str(path))
+        for key in ("experiment", "model", "branch", "seed"):
+            expected = str(receipt[key])
+            if any(str(row[key]) != expected for row in rows):
+                raise RuntimeError(f"receipt/row {key} mismatch in {path}")
+        records.extend(rows)
+        sources.append({"path": str(path), "sha256": sha256(path),
+                        "receipt": str(receipt_path), "receipt_sha256": sha256(receipt_path)})
     if not records: raise RuntimeError("no completed per-sample records found")
+    seen = set()
+    for row in records:
+        key = tuple(row[name] for name in ("experiment", "model", "branch", "seed", "condition", "sample_id")) + (row.get("reference", ""),)
+        if key in seen:
+            raise RuntimeError(f"duplicate formal record (usually overlapping reruns): {key}")
+        seen.add(key)
     return records, sources
 
 
@@ -59,22 +77,41 @@ def gate(records):
     for row in records:
         if row["manifest_sha256"] != MANIFEST_SHA256 or row["split"] != "dev":
             raise RuntimeError(f"non-frozen record: {row.get('source_run')}")
+        if row["experiment"] == "D1" and row.get("reference") != "isolated_target":
+            continue
         present[(row["experiment"], row["model"], row["branch"], int(row["seed"]))].add(row["condition"])
+    manifest = REPO_ROOT / "experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl"
+    expected_samples = {row["sample_id"] for row in (json.loads(line) for line in manifest.open()) if row["split"] == "dev"}
     missing = []
     for exp, spec in REQUIRED.items():
         for model in spec["models"]:
             for branch in spec["branches"]:
                 for seed in (0, 1, 2):
                     absent = set(spec["conditions"]) - present[(exp, model, branch, seed)]
-                    if absent: missing.append({"experiment": exp, "model": model, "branch": branch, "seed": seed, "conditions": sorted(absent)})
+                    if absent:
+                        missing.append({"experiment": exp, "model": model, "branch": branch, "seed": seed, "conditions": sorted(absent)})
+                    for condition in spec["conditions"]:
+                        actual = {row["sample_id"] for row in records if row["experiment"] == exp and row["model"] == model
+                                  and row["branch"] == branch and int(row["seed"]) == seed and row["condition"] == condition}
+                        if exp == "D1":
+                            actual = {row["sample_id"] for row in records if row["experiment"] == exp and row["model"] == model
+                                      and row["branch"] == branch and int(row["seed"]) == seed and row["condition"] == condition
+                                      and row.get("reference") == "isolated_target"}
+                        if actual != expected_samples:
+                            missing.append({"experiment": exp, "model": model, "branch": branch, "seed": seed,
+                                            "condition": condition, "missing_samples": len(expected_samples - actual),
+                                            "unexpected_samples": len(actual - expected_samples)})
     if missing: raise RuntimeError("formal matrix incomplete; refusing paper outputs:\n" + json.dumps(missing, indent=2))
 
 
 def group_rows(records, experiment):
     grouped = defaultdict(list)
     for row in records:
-        if row["experiment"] == experiment:
-            grouped[(row["model"], row["branch"], int(row["seed"]), row["condition"])].append(row)
+        if row["experiment"] == experiment and not (
+            experiment == "D1" and (row.get("reference") != "isolated_target" or row["branch"] not in REQUIRED["D1"]["branches"])
+        ):
+            horizon = int(row["horizon"]) if experiment == "D3" else "joint"
+            grouped[(row["model"], row["branch"], int(row["seed"]), row["condition"], horizon)].append(row)
     return grouped
 
 
@@ -85,11 +122,11 @@ def paired(records, condition, comparator):
 def table_rows(records, experiment):
     grouped, output = group_rows(records, experiment), []
     all_grouped = defaultdict(list)
-    for (model, branch, seed, condition), rows in grouped.items(): all_grouped[(model, branch, seed)].extend(rows)
-    for (model, branch, seed, condition), rows in sorted(grouped.items()):
-        base = all_grouped[(model, branch, seed)]
+    for (model, branch, seed, condition, horizon), rows in grouped.items(): all_grouped[(model, branch, seed, horizon)].extend(rows)
+    for (model, branch, seed, condition, horizon), rows in sorted(grouped.items()):
+        base = all_grouped[(model, branch, seed, horizon)]
         result = {
-            "model": model, "branch": branch, "condition": condition, "seed": seed,
+            "model": model, "branch": branch, "horizon": horizon, "condition": condition, "seed": seed,
             "scene_macro_mae": scene_macro(rows, "mae"), "scene_macro_absrel": scene_macro(rows, "absrel"),
             "scene_macro_delta1": scene_macro(rows, "delta1"), "scene_macro_coarse_mae": scene_macro(rows, "coarse_mae"),
             "scene_macro_detail_mae": scene_macro(rows, "detail_mae"),
@@ -113,12 +150,12 @@ def table_rows(records, experiment):
 
 
 def write_table(rows, csv_path, tex_path):
-    fields = sorted({key for row in rows for key in row}, key=lambda x: (x not in ["model", "branch", "condition", "seed"], x))
+    fields = sorted({key for row in rows for key in row}, key=lambda x: (x not in ["model", "branch", "horizon", "condition", "seed"], x))
     with csv_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n"); writer.writeheader(); writer.writerows(rows)
-    columns = ["model", "branch", "condition", "seed", "scene_macro_mae", "delta_ci_low", "delta_ci_high", "n", "scenes", "source_run"]
+    columns = ["model", "branch", "horizon", "condition", "seed", "scene_macro_mae", "delta_ci_low", "delta_ci_high", "n", "scenes", "source_run"]
     def esc(value): return str(value).replace("_", r"\_").replace("%", r"\%")
-    lines = [r"\begin{tabular}{llllrrrrrr}", r"\toprule", " & ".join(columns) + r" \\", r"\midrule"]
+    lines = [r"\begin{tabular}{lllllrrrrrr}", r"\toprule", " & ".join(columns) + r" \\", r"\midrule"]
     for row in rows:
         values = []
         for key in columns:
@@ -129,39 +166,159 @@ def write_table(rows, csv_path, tex_path):
     tex_path.write_text("\n".join(lines) + "\n")
 
 
-def plots(records, out):
-    d3 = [r for r in records if r["experiment"] == "D3" and r["condition"] in {"native_target_reference", "frozen_readout_transfer", "tokenwise_linear_adapter", "retrained_same_capacity_readout"}]
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.4), sharey=True)
-    for ax, branch in zip(axes, ("spatial", "pooled")):
-        subset = [r for r in d3 if r["branch"] == branch]
-        conditions = sorted({r["condition"] for r in subset})
-        for condition in conditions:
-            ys = [scene_macro([r for r in subset if r["condition"] == condition and int(r["seed"]) == seed and int(r["horizon"]) == h], "mae") for h in (2, 4) for seed in (0, 1, 2)]
-            means = [np.mean(ys[:3]), np.mean(ys[3:])]
-            ax.plot([2, 4], means, marker="o", label=condition)
-        ax.set(title=branch, xlabel="horizon (observation steps)", xticks=[2, 4]); ax.grid(alpha=.25)
-    axes[0].set_ylabel("scene-macro normalized-depth MAE"); axes[1].legend(fontsize=6)
-    fig.tight_layout(); fig.savefig(out / "d3_transfer_gap_by_horizon.pdf"); fig.savefig(out / "d3_transfer_gap_by_horizon.png", dpi=180); plt.close(fig)
+def _mean_seed_scene_macro(rows, metric):
+    values = []
+    for seed in (0, 1, 2):
+        selected = [row for row in rows if int(row["seed"]) == seed]
+        if selected:
+            values.append(scene_macro(selected, metric))
+    return float(np.mean(values)) if values else float("nan")
 
-    d2 = [r for r in records if r["experiment"] == "D2" and r["condition"] == "true_motion" and r.get("cosine") not in {None, "", "None"}]
-    fig, axes = plt.subplots(1, 3, figsize=(11, 3.2), sharey=True)
-    for ax, model in zip(axes, REQUIRED["D2"]["models"]):
-        subset = [r for r in d2 if r["model"] == model]
-        ax.scatter([float(r["cosine"]) for r in subset], [float(r["mae"]) for r in subset], s=5, alpha=.2)
-        ax.set(title=model, xlabel="latent cosine"); ax.grid(alpha=.2)
-    axes[0].set_ylabel("normalized-depth MAE"); fig.tight_layout()
+
+def _paired_rows(records, condition, comparator, metric="mae"):
+    index = {}
+    for row in records:
+        if row["condition"] == comparator:
+            key = (row["experiment"], row["model"], row["branch"], row["seed"], row["sample_id"])
+            index[key] = float(row[metric])
+    output = []
+    for row in records:
+        if row["condition"] != condition:
+            continue
+        key = (row["experiment"], row["model"], row["branch"], row["seed"], row["sample_id"])
+        if key in index:
+            output.append(dict(row, paired_delta=float(row[metric]) - index[key]))
+    return output
+
+
+def _motion_thresholds():
+    manifest = REPO_ROOT / "experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl"
+    rows = [json.loads(line) for line in manifest.open()]
+    fields = ("translation_m", "rotation_deg", "directed_depth_overlap")
+    output = {}
+    for horizon in (2, 4):
+        output[horizon] = {}
+        train = [row for row in rows if row["split"] == "train" and row["horizon"] == horizon]
+        for field in fields:
+            output[horizon][field] = np.quantile([row[field] for row in train], [1 / 3, 2 / 3]).tolist()
+    return output
+
+
+def _with_motion_bins(records):
+    thresholds = _motion_thresholds()
+    enriched = []
+    for row in records:
+        copy = dict(row)
+        horizon = int(row["horizon"])
+        for field in ("translation_m", "rotation_deg", "directed_depth_overlap"):
+            cuts = thresholds[horizon][field]
+            value = float(row[field])
+            copy[f"{field}_bin"] = int(value > cuts[0]) + int(value > cuts[1])
+        enriched.append(copy)
+    return enriched
+
+
+def plots(records, out):
+    records = _with_motion_bins(records)
+
+    # Frozen-transfer gap (prediction minus matched target reference), stratified
+    # with train-derived motion bins. This is not labelled information loss.
+    d3_gap = _paired_rows([r for r in records if r["experiment"] == "D3"], "frozen_readout_transfer", "native_target_reference")
+    fields = ("translation_m", "rotation_deg", "directed_depth_overlap")
+    field_titles = ("translation", "rotation", "directed overlap")
+    fig, axes = plt.subplots(2, 3, figsize=(11, 6), sharey=True)
+    for row_index, branch in enumerate(("spatial", "pooled")):
+        for col_index, (field, title) in enumerate(zip(fields, field_titles)):
+            ax = axes[row_index, col_index]
+            for horizon in (2, 4):
+                ys = []
+                for bin_id in range(3):
+                    subset = [r for r in d3_gap if r["branch"] == branch and int(r["horizon"]) == horizon and int(r[f"{field}_bin"]) == bin_id]
+                    ys.append(_mean_seed_scene_macro(subset, "paired_delta"))
+                ax.plot(range(3), ys, marker="o", label=f"h={horizon}")
+            ax.axhline(0, color="black", linewidth=.7); ax.grid(alpha=.2)
+            ax.set(title=f"{branch}: {title}", xlabel="train-tertile bin", xticks=[0, 1, 2])
+    axes[0, 0].set_ylabel("frozen transfer gap (MAE)"); axes[1, 0].set_ylabel("frozen transfer gap (MAE)")
+    axes[0, 2].legend(fontsize=7); fig.tight_layout()
+    fig.savefig(out / "d3_transfer_gap_by_horizon_motion.pdf"); fig.savefig(out / "d3_transfer_gap_by_horizon_motion.png", dpi=180); plt.close(fig)
+
+    # D2 true-motion gains, with every bin threshold estimated from train only.
+    d2_records = [r for r in records if r["experiment"] == "D2"]
+    comparisons = (("context-only", "independently_trained_context_only"), ("shuffled", "matched_horizon_shuffled_motion"))
+    fig, axes = plt.subplots(3, 3, figsize=(11, 8), sharey=True)
+    for row_index, model in enumerate(REQUIRED["D2"]["models"]):
+        for col_index, (field, title) in enumerate(zip(fields, field_titles)):
+            ax = axes[row_index, col_index]
+            for label, comparator in comparisons:
+                deltas = _paired_rows([r for r in d2_records if r["model"] == model], "true_motion", comparator)
+                ys = [_mean_seed_scene_macro([r for r in deltas if int(r[f"{field}_bin"]) == bin_id], "paired_delta") for bin_id in range(3)]
+                ax.plot(range(3), ys, marker="o", label=f"true - {label}")
+            ax.axhline(0, color="black", linewidth=.7); ax.grid(alpha=.2)
+            ax.set(title=f"{model}: {title}", xlabel="train-tertile bin", xticks=[0, 1, 2])
+        axes[row_index, 0].set_ylabel("paired MAE difference")
+    axes[0, 2].legend(fontsize=7); fig.tight_layout()
+    fig.savefig(out / "d2_motion_conditioning_by_bin.pdf"); fig.savefig(out / "d2_motion_conditioning_by_bin.png", dpi=180); plt.close(fig)
+
+    # D1 regional layout versus valid-neighbour gradient detail.
+    conditions = ("true_target", "within_scene_wrong_target", "spatial_token_shuffle", "train_layout_prior")
+    short = ("target", "wrong", "token shuffle", "prior")
+    fig, axes = plt.subplots(3, 2, figsize=(11, 9), sharey=False)
+    for row_index, model in enumerate(REQUIRED["D1"]["models"]):
+        for col_index, branch in enumerate(("spatial", "pooled")):
+            ax = axes[row_index, col_index]
+            subset = [r for r in records if r["experiment"] == "D1" and r.get("reference") == "isolated_target"
+                      and r["model"] == model and r["branch"] == branch]
+            x = np.arange(len(conditions)); width = .36
+            coarse = [_mean_seed_scene_macro([r for r in subset if r["condition"] == condition], "coarse_mae") for condition in conditions]
+            detail = [_mean_seed_scene_macro([r for r in subset if r["condition"] == condition], "detail_mae") for condition in conditions]
+            ax.bar(x - width / 2, coarse, width, label="4x4 layout")
+            ax.bar(x + width / 2, detail, width, label="local gradient")
+            ax.set(title=f"{model}: {branch}", xticks=x, xticklabels=short); ax.tick_params(axis="x", rotation=18); ax.grid(axis="y", alpha=.2)
+        axes[row_index, 0].set_ylabel("scene-macro error")
+    axes[0, 1].legend(fontsize=7); fig.tight_layout()
+    fig.savefig(out / "coarse_fine_analysis.pdf"); fig.savefig(out / "coarse_fine_analysis.png", dpi=180); plt.close(fig)
+
+    # Geometry error relative to each sample's prior, with variance contraction
+    # shown by colour. D2 contributes three models; D3 contributes V-JEPA2.
+    panels = [("D2", model, "pooled", "true_motion") for model in REQUIRED["D2"]["models"]]
+    panels.append(("D3", "vjepa2_vitl256", None, "frozen_readout_transfer"))
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex=True, sharey=True)
+    scatter = None
+    for ax, (experiment, model, branch, condition) in zip(axes.flat, panels):
+        base = [r for r in records if r["experiment"] == experiment and r["model"] == model and (branch is None or r["branch"] == branch)]
+        values = _paired_rows(base, condition, "train_layout_prior")
+        values = [r for r in values if r.get("cosine") not in {None, "", "None"}]
+        ratio = [float(r["pred_variance"]) / max(float(r["target_variance"]), 1e-12) for r in values]
+        scatter = ax.scatter([float(r["cosine"]) for r in values], [float(r["paired_delta"]) for r in values], c=ratio, s=6, alpha=.25, vmin=0, vmax=1.5, cmap="viridis")
+        ax.axhline(0, color="black", linewidth=.7); ax.grid(alpha=.2)
+        ax.set(title=f"{experiment}: {model}", xlabel="latent cosine")
+    axes[0, 0].set_ylabel("depth MAE minus prior"); axes[1, 0].set_ylabel("depth MAE minus prior")
+    if scatter is not None: fig.colorbar(scatter, ax=axes.ravel().tolist(), label="predicted / target latent variance", shrink=.8)
+    fig.subplots_adjust(left=.09, right=.88, bottom=.09, top=.94, wspace=.2, hspace=.28)
     fig.savefig(out / "cosine_vs_depth_error.pdf"); fig.savefig(out / "cosine_vs_depth_error.png", dpi=180); plt.close(fig)
 
 
 def write_text(rows_by_exp, out):
     def best(exp, condition):
-        rows = [r for r in rows_by_exp[exp] if r["condition"] == condition]
-        return min(rows, key=lambda r: r["scene_macro_mae"])
+        grouped = defaultdict(list)
+        for row in rows_by_exp[exp]:
+            if row["condition"] == condition:
+                grouped[(row["model"], row["branch"], int(row["seed"]))].append(float(row["scene_macro_mae"]))
+        by_configuration = defaultdict(list)
+        for (model, branch, seed), values in grouped.items():
+            by_configuration[(model, branch)].append(statistics.mean(values))
+        candidates = []
+        for (model, branch), seed_values in by_configuration.items():
+            if len(seed_values) != 3:
+                raise RuntimeError(f"expected three seeds for {exp}/{model}/{branch}/{condition}")
+            candidates.append({"model": model, "branch": branch, "mean": statistics.mean(seed_values),
+                               "sd": statistics.stdev(seed_values)})
+        return min(candidates, key=lambda row: row["mean"])
     d1, d2, d3 = best("D1", "true_target"), best("D2", "true_motion"), best("D3", "frozen_readout_transfer")
     paper = rf"""\subsection{{Read-Then-Predict Layout Consistency}}
 We evaluate whether normalized target-view depth is readable from frozen representations and remains readable after prediction. The frozen development protocol contains 681 ScanNet++ scenes (612 train, 69 development), 2,721 windows, and horizons 2 and 4; no historically unused test scenes were available, so these results are development evidence rather than held-out benchmark results. The primary metric is scene-macro normalized-depth MAE with scene-cluster paired bootstrap intervals.
 
-Across the complete D1 matrix, the lowest single-seed target-reference MAE was {d1['scene_macro_mae']:.3f} ({d1['model']}, {d1['branch']}, seed {d1['seed']}). In D2, the lowest true-motion MAE was {d2['scene_macro_mae']:.3f} ({d2['model']}, seed {d2['seed']}); motion dependence is judged only by paired true-vs-context-only and true-vs-shuffled intervals in Table~\ref{{tab:d2}}, not by ranking against last context alone. For V-JEPA2 D3, frozen readout transfer is separated from token-wise linear alignment and same-capacity readout retraining; the best single-seed frozen-transfer MAE was {d3['scene_macro_mae']:.3f} ({d3['branch']}, seed {d3['seed']}). A weak target reference limits any claim about dynamics, and failed recovery under these probes does not establish information-theoretic loss. Pose conditioning is derived from camera trajectories and is not an executed counterfactual action.
+Across the complete D1 matrix, the lowest three-seed mean target-reference MAE was {d1['mean']:.3f}$\pm${d1['sd']:.3f} ({d1['model']}, {d1['branch']}). In D2, the lowest three-seed mean true-motion MAE was {d2['mean']:.3f}$\pm${d2['sd']:.3f} ({d2['model']}); motion dependence is judged only by paired true-vs-context-only and true-vs-shuffled intervals in Table~\ref{{tab:d2}}, not by ranking against last context alone. For V-JEPA2 D3, frozen readout transfer is separated from token-wise linear alignment and same-capacity readout retraining; the lower three-seed mean frozen-transfer MAE was {d3['mean']:.3f}$\pm${d3['sd']:.3f} ({d3['branch']}). A weak target reference limits any claim about dynamics, and failed recovery under these probes does not establish information-theoretic loss. Pose conditioning is derived from camera trajectories and is not an executed counterfactual action.
 """
     (out / "paper_section.tex").write_text(paper)
     slides = f"""# 第1页：科学问题与冻结协议
@@ -173,9 +330,9 @@ Across the complete D1 matrix, the lowest single-seed target-reference MAE was {
 
 # 第2页：三组正式主结果
 
-- D1 最低单 seed target-reference MAE：{d1['scene_macro_mae']:.3f}（{d1['model']} / {d1['branch']} / seed {d1['seed']}）。
-- D2 最低单 seed true-motion MAE：{d2['scene_macro_mae']:.3f}（{d2['model']} / seed {d2['seed']}）；结论以 true-vs-context-only、true-vs-shuffled 配对 CI 为准。
-- D3 最低单 seed frozen-transfer MAE：{d3['scene_macro_mae']:.3f}（{d3['branch']} / seed {d3['seed']}）；另报 linear adapter 与同容量 retrained readout。
+- D1 最低三 seed 均值 target-reference MAE：{d1['mean']:.3f}±{d1['sd']:.3f}（{d1['model']} / {d1['branch']}）。
+- D2 最低三 seed 均值 true-motion MAE：{d2['mean']:.3f}±{d2['sd']:.3f}（{d2['model']}）；结论以 true-vs-context-only、true-vs-shuffled 配对 CI 为准。
+- D3 较低三 seed 均值 frozen-transfer MAE：{d3['mean']:.3f}±{d3['sd']:.3f}（{d3['branch']}）；另报 linear adapter 与同容量 retrained readout。
 - 这里展示完整三 seed，不挑最好 checkpoint 替代总体结果。
 
 # 第3页：机制与结论边界
@@ -225,6 +382,12 @@ def main():
     tables = {exp: table_rows(records, exp) for exp in ("D1", "D2", "D3")}
     for exp, stem in (("D1", "table_d1_decodability"), ("D2", "table_d2_motion_conditioning"), ("D3", "table_d3_native_transfer")):
         write_table(tables[exp], args.output_dir / f"{stem}.csv", args.output_dir / f"{stem}.tex")
+    enriched = _with_motion_bins(records)
+    fields = sorted({key for row in enriched for key in row})
+    with (args.output_dir / "per_sample_metrics.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n"); writer.writeheader(); writer.writerows(enriched)
+    with (args.output_dir / "per_sample_metrics.jsonl").open("w") as handle:
+        for row in enriched: handle.write(json.dumps(row, sort_keys=True) + "\n")
     plots(records, args.output_dir); visual_index(records, args.output_dir); write_text(tables, args.output_dir)
     (args.output_dir / "sources.json").write_text(json.dumps({"manifest_sha256": MANIFEST_SHA256, "per_sample_files": sources}, indent=2) + "\n")
 

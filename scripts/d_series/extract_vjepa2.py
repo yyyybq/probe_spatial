@@ -63,14 +63,18 @@ def order_control(frames, sample_id):
     return [item for index in perm for item in pairs[index]] + frames[6:]
 
 
-def assert_full_chain_future_invariance(model, processor, observed, device, atol, rtol):
+def assert_full_chain_future_invariance(model, processor, observed, other_scene_future, device, atol, rtol):
     prefix = observed[:8]
     height, width = np.asarray(observed[0]).shape[:2]
     rng = np.random.default_rng(0)
+    required_future = len(observed) - 8
+    if len(other_scene_future) < required_future:
+        raise ValueError("other-scene positive control does not contain enough future frames")
     variants = [
         observed,
         prefix + [Image.fromarray(np.zeros((height, width, 3), np.uint8))] * (len(observed) - 8),
         prefix + [Image.fromarray(rng.integers(0, 256, (height, width, 3), dtype=np.uint8)) for _ in observed[8:]],
+        prefix + list(other_scene_future[:required_future]),
     ]
     outputs = [predict_future_tubelets(model, process(processor, pad64(v), device)) for v in variants]
     maxima = {}
@@ -78,7 +82,7 @@ def assert_full_chain_future_invariance(model, processor, observed, device, atol
         maxima[str(obs)] = max(float((candidate[obs] - outputs[0][obs]).abs().max()) for candidate in outputs[1:])
         if not all(torch.allclose(candidate[obs], outputs[0][obs], atol=atol, rtol=rtol) for candidate in outputs[1:]):
             raise AssertionError(f"future-invariance failed at target observation {obs}: {maxima[str(obs)]}")
-    return maxima
+    return {"variants": ["real_future", "zeros", "noise", "other_scene"], "max_abs_difference": maxima}
 
 
 def main():
@@ -105,6 +109,11 @@ def main():
     if args.canary_only:
         selected = selected[:1]
     parents = {row["sample_id"]: row for row in (json.loads(line) for line in args.parent_manifest.open())}
+    first_selected_scene = selected[0][1][0]["scene_id"]
+    other_parent_id, other_rows = next(item for item in sorted(windows.items()) if item[1][0]["scene_id"] != first_selected_scene)
+    other_parent = parents[other_parent_id]
+    other_names = [other_parent["valid_frames"][i] for i in other_parent["streaming_window_indices"][:12]]
+    other_observed = load_rgb(args.scene_root, other_rows[0], other_names)
 
     processor = AutoVideoProcessor.from_pretrained(MODEL_ID, revision=REVISION)
     model = AutoModel.from_pretrained(
@@ -168,8 +177,9 @@ def main():
 
             if audit["future_invariance"] is None:
                 audit["future_invariance"] = assert_full_chain_future_invariance(
-                    model, processor, observed, args.device, 1e-5, 1e-5,
+                    model, processor, observed, other_observed[8:], args.device, 1e-5, 1e-5,
                 )
+                audit["future_invariance"]["other_scene_id"] = other_rows[0]["scene_id"]
             audit["windows_completed"] += 1
             print(json.dumps({"completed": audit["windows_completed"], "parent_sample_id": parent_id}), flush=True)
     args.output_root.mkdir(parents=True, exist_ok=True)

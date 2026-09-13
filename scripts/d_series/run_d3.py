@@ -89,7 +89,12 @@ def evaluate(target_readout, retrained, adapter, depth_dataset, rows, root, bran
                     "manifest_sha256": MANIFEST_SHA256, "sample_id": row["sample_id"],
                     "parent_sample_id": row["parent_sample_id"], "scene_id": row["scene_id"],
                     "window_id": row["window_id"], "horizon": row["horizon"],
-                    "target_raw_frame_id": row["target_raw_frame_id"], "target_layout_scale_m": float(scale),
+                    "target_raw_frame_id": row["target_raw_frame_id"],
+                    "target_observation_index": row["target_observation_index"],
+                    "target_temporal_token": row["target_observation_index"] // 2,
+                    "raw_frame_delta": row["raw_frame_delta"], "translation_m": row["translation_m"],
+                    "rotation_deg": row["rotation_deg"], "directed_depth_overlap": row["directed_depth_overlap"],
+                    "target_layout_scale_m": float(scale),
                     "source_run": source_run, **metric, **diag,
                 })
     return records
@@ -168,6 +173,9 @@ def main():
     receipt = {"schema_version": 1, "experiment": "D3", "status": "complete_development_evaluation",
                "source_run": source_run, "model": MODEL, "model_revision": REVISIONS[MODEL], "branch": args.branch,
                "seed": args.seed, "manifest_sha256": MANIFEST_SHA256, "native_d1_checkpoint": str(args.native_d1_checkpoint.resolve()),
+               "native_d1_checkpoint_sha256": sha256(args.native_d1_checkpoint),
+               "train_scenes_sha256": sha256(args.manifest.parent / "train_scenes.txt"),
+               "dev_scenes_sha256": sha256(args.manifest.parent / "dev_scenes.txt"), "test_scenes": 0,
                "adapter_parameters": parameter_count(adapter), "retrained_readout_parameters": parameter_count(retrained),
                "adapter_best_epoch": epoch_a, "adapter_dev_mse": best_a, "retrained_best_epoch": epoch_r,
                "retrained_dev_scene_macro_mae": best_r, "n_dev": len(dev_rows),

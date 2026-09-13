@@ -7,15 +7,26 @@ CANARY_RUN=${CANARY_RUN:?CANARY_RUN must name a passing canary run directory}
 RUN_TAG=${RUN_TAG:-dseries_features_full_$(date -u +%Y%m%d_%H%M%S)}
 FEATURE_ROOT=${FEATURE_ROOT:-/mnt/umm/users/yinbaiqiao/InsScene-15K/D_SERIES_SCANNETPP_V1_FEATURES}
 CANARY_STATUS=${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/runs/${CANARY_RUN}/status.json
+CANARY_REPORT=${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/runs/${CANARY_RUN}
+CANARY_FEATURES=${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/features_canary/${CANARY_RUN}
 REPORT=${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/runs/${RUN_TAG}/launcher
 PY=/mnt/umm/users/yinbaiqiao/.conda/envs/probe-spatial/bin/python
 cd "${PROJECT_ROOT}"
 
-"${PY}" - "${CANARY_STATUS}" <<'PY'
+"${PY}" - "${CANARY_STATUS}" "${CANARY_REPORT}" "${CANARY_FEATURES}" <<'PY'
 import json, sys
-path = sys.argv[1]
-value = json.load(open(path))
+from pathlib import Path
+value = json.load(open(sys.argv[1]))
 assert value["vjepa2_rc"] == value["dinov2_rc"] == value["wan_rc"] == 0, value
+report, features = Path(sys.argv[2]), Path(sys.argv[3])
+for name in ("vjepa2_native_spatial_overfit.json", "dinov2_spatial_overfit.json", "wan_spatial_overfit.json"):
+    result = json.load(open(report / name)); assert result["passed"], result
+for name in ("vjepa2_audit_0_1.json", "dinov2_audit_0_1.json", "wan_audit_0_1.json"):
+    audit = json.load(open(features / name))
+    assert audit["windows_requested"] == audit["windows_completed"] == 1, audit
+vjepa = json.load(open(features / "vjepa2_audit_0_1.json"))["future_invariance"]
+assert vjepa["variants"] == ["real_future", "zeros", "noise", "other_scene"], vjepa
+assert max(vjepa["max_abs_difference"].values()) <= 1e-5, vjepa
 PY
 test "$(sha256sum experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl | awk '{print $1}')" = \
   781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9

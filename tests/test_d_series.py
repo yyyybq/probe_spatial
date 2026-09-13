@@ -10,6 +10,7 @@ from features.vjepa2.native_predictor import (
     tubelet_token_indices,
 )
 from scripts.d_series.feature_store import load_verified, write_feature
+from scripts.d_series.run_d2 import bin_index, motion_bin_thresholds, shuffled_motion_map
 
 from vidfm3d.models.components.probe_layout_readout import (
     ExternalPooledPredictor,
@@ -82,6 +83,27 @@ def test_context_only_is_independently_parameterized_and_ignores_test_motion():
     y0 = model(context, torch.zeros(2, 12))
     y1 = model(context, torch.randn(2, 12))
     assert torch.equal(y0, y1)
+
+
+def test_motion_bins_and_shuffle_are_fit_on_train_and_horizon_matched():
+    train = []
+    dev = []
+    for horizon in (2, 4):
+        for index in range(6):
+            row = {"horizon": horizon, "translation_m": float(index), "rotation_deg": float(index * 2),
+                   "directed_depth_overlap": float(index) / 10, "sample_id": f"tr-{horizon}-{index}"}
+            train.append(row)
+        for index, value in enumerate((.2, .3, 2.2, 2.3, 4.2, 4.3)):
+            dev.append({"horizon": horizon, "translation_m": value, "rotation_deg": value * 2,
+                        "directed_depth_overlap": value / 10, "sample_id": f"dv-{horizon}-{index}"})
+    thresholds = motion_bin_thresholds(train)
+    shuffled = shuffled_motion_map(train, dev, thresholds)
+    assert set(shuffled) == {row["sample_id"] for row in dev}
+    for row in dev:
+        other = shuffled[row["sample_id"]]
+        assert other["horizon"] == row["horizon"]
+        cuts = thresholds[row["horizon"]]["translation_m"]
+        assert bin_index(other["translation_m"], cuts) == bin_index(row["translation_m"], cuts)
 
 
 def test_depth_metrics_use_gt_mask_and_mechanism_metrics_are_zero_on_identity():
