@@ -1,0 +1,9 @@
+model,branch,horizon_observation_steps,prefix_last_observation_zero_based,target_observation_zero_based,target_raw_frame_rule,temporal_token_zero_based,label_frame_rule,notes
+V-JEPA2,native,2,7,9,manifest.target_raw_frame_id,4,last observation in tubelet,"tubelet 4 contains observations 8,9"
+V-JEPA2,native,4,7,11,manifest.target_raw_frame_id,5,last observation in tubelet,"tubelet 5 contains observations 10,11"
+V-JEPA2,isolated_target,2,7,9,manifest.target_raw_frame_id,16,middle token of 64 repeated target frames,auxiliary cross-model reference
+V-JEPA2,isolated_target,4,7,11,manifest.target_raw_frame_id,16,middle token of 64 repeated target frames,auxiliary cross-model reference
+Wan,isolated_target,2,7,9,manifest.target_raw_frame_id,10,middle token of 81 repeated target frames,cross-model D1 reference only
+Wan,isolated_target,4,7,11,manifest.target_raw_frame_id,10,middle token of 81 repeated target frames,cross-model D1 reference only
+DINOv2,per_frame_target,2,7,9,manifest.target_raw_frame_id,0,single target frame,CLS dropped
+DINOv2,per_frame_target,4,7,11,manifest.target_raw_frame_id,0,single target frame,CLS dropped

@@ -1,0 +1,16 @@
+{
+  "checkpoint_status": {},
+  "counts": {
+    "dev_h2": 276,
+    "dev_h4": 276,
+    "train_h2": 2445,
+    "train_h4": 2445
+  },
+  "feature_status": {},
+  "manifest_sha256": "781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9",
+  "protocol": "d_series_scannetpp_v1",
+  "sample_identity_unique": true,
+  "scene_disjoint": true,
+  "schema_version": 1,
+  "test_empty": true
+}

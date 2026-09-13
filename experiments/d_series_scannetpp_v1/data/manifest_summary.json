@@ -1,0 +1,27 @@
+{
+  "evaluation_status": "development_only_no_historically_unused_test_scenes",
+  "exclusions": 0,
+  "overlap_definition": {
+    "direction": "context_to_target",
+    "sample_stride_pixels": 8,
+    "visibility_tolerance_m": "max(0.10,0.05*z_target_prediction)"
+  },
+  "parent_manifest": "artifacts/tstep_canonical_v2/manifests/inscene_c_h124_prefix8.jsonl",
+  "parent_manifest_actual_sha256": "20976fc86abfdc96d40446a0fe15fc32af699369309c540f9a352e868ce89f91",
+  "parent_manifest_expected_sha256": "20976fc86abfdc96d40446a0fe15fc32af699369309c540f9a352e868ce89f91",
+  "protocol": "d_series_scannetpp_v1",
+  "sample_counts": {
+    "dev_h2": 276,
+    "dev_h4": 276,
+    "train_h2": 2445,
+    "train_h4": 2445
+  },
+  "samples": 5442,
+  "scene_counts": {
+    "dev": 69,
+    "test": 0,
+    "train": 612
+  },
+  "scenes": 681,
+  "schema_version": 1
+}

@@ -1,0 +1,21 @@
+# d_series_scannetpp_v1 dataset card
+
+This is a frozen, scene-disjoint **development-evaluation** derivative of `inscene_streaming_canonical_v2_obs28_h124`. It is not a held-out ScanNet++ test set. Every one of the 681 eligible canonical scenes had prior project exposure: the old canonical training set used 612 scenes and its validation/pilot path used the remaining 69. The frozen test list is therefore intentionally empty.
+
+## Exact population
+
+The parent prefix-8 manifest has SHA-256 `20976fc86abfdc96d40446a0fe15fc32af699369309c540f9a352e868ce89f91`. All 2,721 parent windows survived D-series checks and each expands to horizons 2 and 4, yielding 5,442 rows. Train has 612 scenes, 2,445 windows, and 4,890 rows. Dev has 69 scenes, 276 windows, and 552 rows. Test has zero scenes and rows. Scene IDs are in `data/{train,dev,test}_scenes.txt`; `data/scene_historical_use.csv` gives both the inherited canonical role and the original InsScene split.
+
+Each JSONL row records the exact raw RGB/depth name and numeric raw-frame ID, window and prefix frame identities, target observation and horizon, target-from-context SE(3), translation, rotation, and directed depth overlap. Observation steps are motion-uniform samples and are not asserted to be consecutive raw frames. Timestamp delta is null because the packaged metadata does not expose a verified timestamp channel.
+
+## Source and geometry
+
+The local input is the InsScene-15K packaged directory named `processed_scannetpp_v2`, derived from ScanNet++ iPhone imagery. RGB images and camera-to-world trajectories/intrinsics come from each scene package. Depth files are uint16 PNG millimetres at the image geometry used by the package. The package itself does not contain a release receipt that establishes whether these PNGs are sensor depth or mesh-rendered depth, so that semantic is deliberately recorded as unresolved and must not be strengthened in the paper without an external provenance receipt.
+
+Depth is converted to metres. The main target divides every sample by the mean of its finite positive GT pixels and retains that mean as `target_layout_scale`, label-side metadata only. Evaluation always uses the GT finite-positive mask. Metric pointmaps are back-projected from the unnormalised metric depth with the matching target intrinsics into target-camera XYZ. No test/dev GT scale may be supplied to a model.
+
+## Exclusions and limitations
+
+The D-series exclusion ledger is empty because the parent canonical filtering already removed ineligible scenes (`a003a6585e`: no valid prefix sample; `c24f94007b`: missing images directory). Empty means no additional D-series row was removed, not that the parent dataset had no exclusions. The current scene inventory contains no historically unused qualified scenes. Results are suitable for protocol-locked development evidence only and must not be described as final held-out generalisation.
+
+Rebuild with `python scripts/d_series/build_manifest.py`; verify `data/hashes.sha256` before feature extraction or training.

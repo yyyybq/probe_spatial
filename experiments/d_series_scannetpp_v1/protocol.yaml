@@ -1,0 +1,86 @@
+schema_version: 1
+protocol_id: d_series_scannetpp_v1
+status: frozen_development_only
+freeze_reason: all 681 eligible canonical scenes have historical train/dev/pilot exposure
+parent:
+  id: inscene_streaming_canonical_v2_obs28_h124
+  manifest: artifacts/tstep_canonical_v2/manifests/inscene_c_h124_prefix8.jsonl
+  sha256: 20976fc86abfdc96d40446a0fe15fc32af699369309c540f9a352e868ce89f91
+data:
+  source: scannetpp_via_inscene15k_processed_scannetpp_v2
+  manifest: data/sample_manifest.jsonl
+  manifest_sha256: 781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+  obs_len: 28
+  prefix_observations: 8
+  horizons_observation_steps: [2, 4]
+  split_unit: scene
+  splits:
+    train: {scenes: 612, windows: 2445, samples: 4890}
+    dev: {scenes: 69, windows: 276, samples: 552}
+    test: {scenes: 0, windows: 0, samples: 0}
+  sample_identity: [scene_id, window_id, prefix, horizon, target_raw_frame_id]
+  filtering: inherit_complete_parent_canonical_rows_then_require_rgb_depth_pose_intrinsics
+  silent_skip_allowed: false
+depth:
+  source_file_encoding: uint16_png_millimeters
+  source_semantics: unresolved_sensor_or_mesh_rendered_do_not_claim
+  main_target: per_sample_valid_mean_normalized_target_view_depth
+  metric_target: original_metric_depth_meters
+  layout_scale: valid_pixel_mean_metric_depth_meters_label_only
+  output_height: 72
+  output_width: 128
+  resize: validity_weighted_area_interpolation
+  valid_mask: ground_truth_depth_finite_and_positive_only
+  pointmap: target_camera_xyz_from_metric_depth_and_matched_intrinsics
+  test_gt_scale_as_model_input: false
+models_file: models.yaml
+branches: [spatial, pooled]
+training:
+  seeds: [0, 1, 2]
+  horizons_joint_per_model_branch: true
+  optimizer: adamw
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 16
+  max_epochs: 40
+  early_stopping_patience: 6
+  selection_split: dev
+  selection_metric: scene_macro_normalized_depth_mae
+  backbone_frozen: true
+  readout_latent_normalization: per_token_layernorm_inside_frozen_readout
+  predictor_target_normalization: train_channel_mean_std
+  motion_normalization: train_feature_mean_std
+evaluation:
+  primary: scene_macro_normalized_depth_mae
+  secondary: [abs_rel, delta1, detail_gradient_mae, coarse_4x4_layout_mae]
+  appendix: metric_target_camera_pointmap
+  aggregation: sample_within_scene_then_macro_across_scenes
+  uncertainty: scene_cluster_paired_bootstrap_95ci
+  bootstrap_replicates: 10000
+  bootstrap_seed: 20270301
+  evaluation_split: dev
+  held_out_test_claim_allowed: false
+controls:
+  d1: [true_target, train_layout_prior, within_scene_wrong_target, across_scene_shuffled_target, last_context, zero, random, spatial_token_shuffle]
+  d2: [true_motion, identity_motion, matched_horizon_shuffled_motion, independently_trained_context_only, last_context, train_layout_prior, true_pooled_target_reference]
+  d3: [native_target_reference, frozen_readout_transfer, tokenwise_linear_adapter, retrained_same_capacity_readout, last_context, train_layout_prior, within_scene_wrong_target, early_tubelet_order_shuffle]
+motion:
+  representation: target_from_context_se3_matrix_first_3_rows_row_major
+  definition: inverse(target_camera_to_world) @ context_camera_to_world
+  units: {translation: meters, rotation: dimensionless_matrix}
+  shuffle_seed: 42
+  shuffle_matching: same_horizon_and_train_translation_magnitude_bin
+wan:
+  timestep_argument: 749
+  timestep_semantics: scheduler_timesteps_index_not_raw_noise_timestep
+  noise: sample_local_seeded_gaussian
+  noise_seed_rule: sha256(sample_id_and_global_seed)_uint32
+  text_condition: empty_prompt_only
+native_vjepa2:
+  target_label_rule: final_observation_in_two_frame_tubelet
+  h2: {target_observation_index_zero_based: 9, target_tubelet_zero_based: 4}
+  h4: {target_observation_index_zero_based: 11, target_tubelet_zero_based: 5}
+  predictor_input: prefix_rgb_only_mask_before_encoder_attention
+  oracle_reference: full_teacher_clip_target_encoder_final_normalized_space
+  future_invariance_atol: 0.00001
+  future_invariance_rtol: 0.00001
