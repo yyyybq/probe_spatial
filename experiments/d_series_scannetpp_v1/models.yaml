@@ -1,6 +1,7 @@
 schema_version: 1
 frozen_at_utc: 2026-09-13T07:52:39Z
-code_base_commit: 2075f3eb270cb0e8907c3927b6b079c64965b75a
+parent_code_commit: 2075f3eb270cb0e8907c3927b6b079c64965b75a
+implementation_commit: 60b20051678d1d5642a7621e586dec9ceaa2c690
 models:
   vjepa2_vitl256:
     checkpoint_id: facebook/vjepa2-vitl-fpc64-256
