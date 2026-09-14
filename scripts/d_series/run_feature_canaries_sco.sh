@@ -12,8 +12,18 @@ REPORT=${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/runs/${RUN_TAG}
 mkdir -p "${OUT}" "${REPORT}"
 date -u +%FT%TZ > "${REPORT}/started_utc.txt"
 nvidia-smi > "${REPORT}/nvidia_smi.txt"
-git -C "${PROJECT_ROOT}" rev-parse HEAD > "${REPORT}/base_commit.txt"
-git -C "${PROJECT_ROOT}" diff --binary HEAD > "${REPORT}/working_tree.patch"
+git -c safe.directory="${PROJECT_ROOT}" -C "${PROJECT_ROOT}" rev-parse HEAD > "${REPORT}/base_commit.txt"
+git -c safe.directory="${PROJECT_ROOT}" -C "${PROJECT_ROOT}" diff --binary HEAD -- \
+  experiments/d_series_scannetpp_v1 scripts/d_series features/vjepa2/native_predictor.py \
+  features/wan/wan_feature.py features/noise_seed.py vidfm3d/models/components/probe_layout_readout.py \
+  vidfm3d/utils/layout_metrics.py tests/test_d_series.py > "${REPORT}/working_tree.patch"
+tar -czf "${REPORT}/source_snapshot.tar.gz" experiments/d_series_scannetpp_v1/README.md \
+  experiments/d_series_scannetpp_v1/STATUS.md experiments/d_series_scannetpp_v1/protocol.yaml \
+  experiments/d_series_scannetpp_v1/models.yaml experiments/d_series_scannetpp_v1/dataset_card.md \
+  experiments/d_series_scannetpp_v1/model_card.md experiments/d_series_scannetpp_v1/frame_token_alignment.csv \
+  experiments/d_series_scannetpp_v1/data experiments/d_series_scannetpp_v1/audits scripts/d_series \
+  features/vjepa2/native_predictor.py features/wan/wan_feature.py features/noise_seed.py \
+  vidfm3d/models/components/probe_layout_readout.py vidfm3d/utils/layout_metrics.py tests/test_d_series.py
 
 cd "${PROJECT_ROOT}"
 set +e
@@ -46,6 +56,6 @@ set -e
 ended=$(date -u +%FT%TZ)
 printf '{"run_tag":"%s","ended_utc":"%s","vjepa2_rc":%d,"dinov2_rc":%d,"wan_rc":%d}\n' \
   "${RUN_TAG}" "${ended}" "${rc_vjepa}" "${rc_dino}" "${rc_wan}" > "${REPORT}/status.json"
-sha256sum "${REPORT}/working_tree.patch" "${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/protocol.yaml" \
+sha256sum "${REPORT}/working_tree.patch" "${REPORT}/source_snapshot.tar.gz" "${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/protocol.yaml" \
   "${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/models.yaml" > "${REPORT}/launcher_hashes.sha256"
 (( rc_vjepa == 0 && rc_dino == 0 && rc_wan == 0 ))

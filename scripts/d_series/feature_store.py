@@ -36,8 +36,9 @@ def code_provenance(paths):
     """Record the base commit and exact bytes of every extraction component."""
     repo = Path(__file__).resolve().parents[2]
     try:
-        commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-        dirty = bool(subprocess.check_output(["git", "-C", str(repo), "status", "--short"], text=True).strip())
+        git = ["git", "-c", f"safe.directory={repo}", "-C", str(repo)]
+        commit = subprocess.check_output(git + ["rev-parse", "HEAD"], text=True).strip()
+        dirty = bool(subprocess.check_output(git + ["status", "--short"], text=True).strip())
     except Exception:
         commit, dirty = "unknown", None
     resolved = [Path(path).resolve() for path in paths]

@@ -13,8 +13,18 @@ SCENE_ROOT=/mnt/umm/users/yinbaiqiao/InsScene-15K/data/processed_scannetpp_v2/pr
 mkdir -p "${REPORT}"
 date -u +%FT%TZ > "${REPORT}/started_utc.txt"
 nvidia-smi > "${REPORT}/nvidia_smi.txt"
-git -C "${PROJECT_ROOT}" rev-parse HEAD > "${REPORT}/base_commit.txt"
-git -C "${PROJECT_ROOT}" diff --binary HEAD > "${REPORT}/working_tree.patch"
+git -c safe.directory="${PROJECT_ROOT}" -C "${PROJECT_ROOT}" rev-parse HEAD > "${REPORT}/base_commit.txt"
+git -c safe.directory="${PROJECT_ROOT}" -C "${PROJECT_ROOT}" diff --binary HEAD -- \
+  experiments/d_series_scannetpp_v1 scripts/d_series features/vjepa2/native_predictor.py \
+  features/wan/wan_feature.py features/noise_seed.py vidfm3d/models/components/probe_layout_readout.py \
+  vidfm3d/utils/layout_metrics.py tests/test_d_series.py > "${REPORT}/working_tree.patch"
+tar -czf "${REPORT}/source_snapshot.tar.gz" experiments/d_series_scannetpp_v1/README.md \
+  experiments/d_series_scannetpp_v1/STATUS.md experiments/d_series_scannetpp_v1/protocol.yaml \
+  experiments/d_series_scannetpp_v1/models.yaml experiments/d_series_scannetpp_v1/dataset_card.md \
+  experiments/d_series_scannetpp_v1/model_card.md experiments/d_series_scannetpp_v1/frame_token_alignment.csv \
+  experiments/d_series_scannetpp_v1/data experiments/d_series_scannetpp_v1/audits scripts/d_series \
+  features/vjepa2/native_predictor.py features/wan/wan_feature.py features/noise_seed.py \
+  vidfm3d/models/components/probe_layout_readout.py vidfm3d/utils/layout_metrics.py tests/test_d_series.py
 cd "${PROJECT_ROOT}"
 
 "${PY}" scripts/d_series/audit_protocol.py --feature-root "${FEATURE_ROOT}" --run-root "${FORMAL_RUN_ROOT}"
@@ -28,4 +38,3 @@ PY
 
 "${PY}" scripts/d_series/run_training_campaign.py --stage "${STAGE}" --feature-root "${FEATURE_ROOT}" \
   --run-root "${FORMAL_RUN_ROOT}" --scene-root "${SCENE_ROOT}" --report-dir "${REPORT}"
-
