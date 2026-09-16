@@ -55,7 +55,7 @@ def sha256(path: Path):
 
 
 class D1Dataset(Dataset):
-    def __init__(self, rows, scene_root, feature_root, model, reference, branch, report_branch=None):
+    def __init__(self, rows, scene_root, feature_root, model, reference, branch, report_branch=None, v2_pooled=None):
         self.rows = rows
         self.scene_root = scene_root
         self.feature_root = feature_root
@@ -63,13 +63,20 @@ class D1Dataset(Dataset):
         self.reference = reference
         self.branch = branch
         self.report_branch = report_branch or branch
+        self.v2_pooled = v2_pooled or {}
 
     def __len__(self): return len(self.rows)
 
     def feature(self, sample_id, space=None, key=None):
+        requested_key = key or self.branch
+        if (
+            requested_key == "pooled" and (space or self.reference) == "isolated_target"
+            and self.model == "vjepa2_vitl256" and sample_id in self.v2_pooled
+        ):
+            return load_file(self.v2_pooled[sample_id])["feat"].float()
         payload, _ = feature_paths(self.feature_root, self.model, space or self.reference, sample_id)
         values = load_file(payload)
-        return values[key or self.branch].float()
+        return values[requested_key].float()
 
     def label(self, row):
         depth = torch.from_numpy(np.asarray(Image.open(self.scene_root / row["depth_rel"]), dtype=np.float32).copy()) / 1000.0
@@ -124,7 +131,7 @@ def permutations(rows):
     return within, across
 
 
-def evaluate(readout, dataset, rows, prior, device, seed, source_run):
+def evaluate(readout, dataset, rows, prior, device, seed, source_run, depth_only=False):
     readout.eval()
     within, across = permutations(rows)
     records = []
@@ -133,8 +140,10 @@ def evaluate(readout, dataset, rows, prior, device, seed, source_run):
         for index, row in enumerate(rows):
             target, valid, scale = dataset.label(row)
             target_b, valid_b = target[None].to(device), valid[None].to(device)
-            intrinsic = dataset.resized_intrinsic(row).to(device)
-            target_pointmap = metric_depth_to_camera_pointmap(target_b[0] * scale.to(device), intrinsic)
+            intrinsic = target_pointmap = None
+            if not depth_only:
+                intrinsic = dataset.resized_intrinsic(row).to(device)
+                target_pointmap = metric_depth_to_camera_pointmap(target_b[0] * scale.to(device), intrinsic)
             true = dataset.feature(row["sample_id"]).to(device)
             spatial_for_shuffle = dataset.feature(row["sample_id"], key="spatial")
             flat_spatial = spatial_for_shuffle.reshape(-1, spatial_for_shuffle.shape[-1])
@@ -159,10 +168,12 @@ def evaluate(readout, dataset, rows, prior, device, seed, source_run):
                 metric = depth_metrics(prediction, target_b, valid_b)[0]
                 metric["coarse_mae"] = float(coarse_layout_mae(prediction, target_b, valid_b)[0])
                 metric["detail_mae"] = float(detail_gradient_mae(prediction, target_b, valid_b)[0])
-                oracle_pred_pointmap = metric_depth_to_camera_pointmap(prediction[0, 0] * scale.to(device), intrinsic)
-                metric["oracle_gt_scale_pointmap_mae_m"] = float(
-                    torch.linalg.vector_norm(oracle_pred_pointmap - target_pointmap, dim=-1)[valid_b[0]].mean()
-                )
+                metric["oracle_gt_scale_pointmap_mae_m"] = ""
+                if not depth_only:
+                    oracle_pred_pointmap = metric_depth_to_camera_pointmap(prediction[0, 0] * scale.to(device), intrinsic)
+                    metric["oracle_gt_scale_pointmap_mae_m"] = float(
+                        torch.linalg.vector_norm(oracle_pred_pointmap - target_pointmap, dim=-1)[valid_b[0]].mean()
+                    )
                 records.append({
                     "schema_version": 1, "experiment": "D1", "protocol": "d_series_scannetpp_v1",
                     "evaluation_status": "development_only", "model": dataset.model,
@@ -194,6 +205,9 @@ def main():
     parser.add_argument("--max-epochs", type=int, default=40)
     parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--depth-only", action="store_true")
+    parser.add_argument("--v2-mapping", type=Path)
+    parser.add_argument("--feature-audit-receipt", type=Path)
     args = parser.parse_args()
     if sha256(args.manifest) != MANIFEST_SHA256:
         raise ValueError("manifest hash mismatch")
@@ -203,17 +217,34 @@ def main():
     rows = [json.loads(line) for line in args.manifest.open()]
     train_rows = [row for row in rows if row["split"] == "train"]
     dev_rows = [row for row in rows if row["split"] == "dev"]
+    v2_pooled = {}
+    if args.v2_mapping is not None:
+        with args.v2_mapping.open() as handle:
+            for entry in csv.DictReader(handle):
+                if entry["d_series_role"] == "isolated_target" and entry["status"] == "adapted":
+                    v2_pooled[entry["sample_id"]] = entry["v2_payload"]
 
-    # Fail closed on every feature/receipt before training, including dev prefix controls.
-    for row in rows:
-        load_verified(args.feature_root, args.model, args.reference, row["sample_id"], REVISIONS[args.model])
-    for parent in sorted({row["parent_sample_id"] for row in rows}):
-        load_verified(args.feature_root, args.model, "prefix", parent, REVISIONS[args.model])
+    # Either cite the one-time full feature audit, or perform the expensive scan here.
+    if args.feature_audit_receipt is not None:
+        audit = json.loads(args.feature_audit_receipt.read_text())
+        expected_role = {"expected": len(rows), "complete": len(rows)}
+        expected_prefix = {"expected": len({row['parent_sample_id'] for row in rows}),
+                           "complete": len({row['parent_sample_id'] for row in rows})}
+        if (audit.get("status") != "COMPLETE_VALID" or audit.get("manifest_sha256") != MANIFEST_SHA256
+                or audit.get("model") != args.model or audit.get("roles", {}).get(args.reference) != expected_role
+                or audit.get("roles", {}).get("prefix") != expected_prefix):
+            raise ValueError("feature audit receipt does not cover this D1 input")
+    else:
+        for row in rows:
+            load_verified(args.feature_root, args.model, args.reference, row["sample_id"], REVISIONS[args.model])
+        for parent in sorted({row["parent_sample_id"] for row in rows}):
+            load_verified(args.feature_root, args.model, "prefix", parent, REVISIONS[args.model])
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train = D1Dataset(train_rows, args.scene_root, args.feature_root, args.model, args.reference, branch, args.branch)
-    dev = D1Dataset(dev_rows, args.scene_root, args.feature_root, args.model, args.reference, branch, args.branch)
+    use_v2 = v2_pooled if args.model == "vjepa2_vitl256" and args.reference == "isolated_target" and args.branch == "pooled" else {}
+    train = D1Dataset(train_rows, args.scene_root, args.feature_root, args.model, args.reference, branch, args.branch, use_v2)
+    dev = D1Dataset(dev_rows, args.scene_root, args.feature_root, args.model, args.reference, branch, args.branch, use_v2)
     example = train.feature(train_rows[0]["sample_id"])
     channels = example.shape[-1]
     if args.branch == "spatial": readout = SpatialDepthReadout(channels)
@@ -237,7 +268,7 @@ def main():
             prediction = readout(batch["feature"].to(device, non_blocking=True))
             loss = masked_l1(prediction, batch["depth"].to(device), batch["valid"].to(device))
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
-        dev_records = evaluate(readout, dev, dev_rows, prior, device, args.seed, source_run)
+        dev_records = evaluate(readout, dev, dev_rows, prior, device, args.seed, source_run, args.depth_only)
         score = scene_macro((row for row in dev_records if row["condition"] == "true_target"), "mae")
         history.append({"epoch": epoch, "dev_scene_macro_mae": score})
         print(json.dumps(history[-1]), flush=True)
@@ -249,7 +280,7 @@ def main():
             patience_left -= 1
             if patience_left == 0: break
     readout.load_state_dict(best_state)
-    records = evaluate(readout, dev, dev_rows, prior, device, args.seed, source_run)
+    records = evaluate(readout, dev, dev_rows, prior, device, args.seed, source_run, args.depth_only)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     torch.save({"state_dict": best_state, "train_layout_prior": prior, "args": vars(args)}, args.output_dir / "checkpoint.pt")
     with (args.output_dir / "per_sample_metrics.csv").open("w", newline="") as handle:
@@ -265,6 +296,11 @@ def main():
         "manifest_sha256": MANIFEST_SHA256, "train_scenes_sha256": sha256(args.manifest.parent / "train_scenes.txt"),
         "dev_scenes_sha256": sha256(args.manifest.parent / "dev_scenes.txt"), "test_scenes": 0,
         "parameter_count": parameter_count(readout), "best_epoch": best_epoch,
+        "depth_only": args.depth_only, "v2_pooled_reused_samples": len(use_v2),
+        "v2_mapping": str(args.v2_mapping.resolve()) if args.v2_mapping else None,
+        "v2_mapping_sha256": sha256(args.v2_mapping) if args.v2_mapping else None,
+        "feature_audit_receipt": str(args.feature_audit_receipt.resolve()) if args.feature_audit_receipt else None,
+        "feature_audit_receipt_sha256": sha256(args.feature_audit_receipt) if args.feature_audit_receipt else None,
         "dev_scene_macro_mae": best, "n_dev": len(dev_rows), "n_dev_scenes": len({r['scene_id'] for r in dev_rows}),
         "git_base_commit": commit, "git_dirty": dirty_env == "true" if dirty_env is not None else bool(subprocess.check_output(git + ["status", "--short"], text=True).strip()),
         "history": history,

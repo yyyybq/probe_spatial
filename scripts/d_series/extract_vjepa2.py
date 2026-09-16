@@ -103,6 +103,8 @@ def main():
     parser.add_argument("--window-start", type=int, default=0)
     parser.add_argument("--max-windows", type=int)
     parser.add_argument("--canary-only", action="store_true")
+    parser.add_argument("--skip-order-shuffle", action="store_true")
+    parser.add_argument("--skip-future-invariance", action="store_true")
     args = parser.parse_args()
 
     rows = [json.loads(line) for line in args.manifest.open()]
@@ -170,8 +172,10 @@ def main():
                     raise AssertionError("h2 and h4 native predictions are unexpectedly identical")
                 audit["native_prediction_h2_h4_max_abs_difference"] = difference
             reference = native_target_reference(model, teacher_pixels)
-            shuffled_pixels = process(processor, pad64(order_control(observed, parent_id)), args.device)
-            shuffled_pred = predict_future_tubelets(model, shuffled_pixels)
+            shuffled_pred = None
+            if not args.skip_order_shuffle:
+                shuffled_pixels = process(processor, pad64(order_control(observed, parent_id)), args.device)
+                shuffled_pred = predict_future_tubelets(model, shuffled_pixels)
             safe = make_prefix_safe_clip(teacher_pixels, 8, 64)
             context_indices = tubelet_token_indices([0, 1, 2, 3], (16, 16), device=safe.device)
             context, _ = _masked_encoder(model, safe, context_indices)
@@ -198,11 +202,12 @@ def main():
                 write_feature(args.output_root, MODEL, "native_pred", row["sample_id"], {
                     "spatial": pred[obs][0].half(), "pooled": pred[obs][0].mean((0, 1)).half(),
                 }, common | {"future_rgb_access": False})
-                write_feature(args.output_root, MODEL, "native_pred_order_shuffle", row["sample_id"], {
-                    "spatial": shuffled_pred[obs][0].half(), "pooled": shuffled_pred[obs][0].mean((0, 1)).half(),
-                }, common | {"last_tubelet_fixed": True})
+                if shuffled_pred is not None:
+                    write_feature(args.output_root, MODEL, "native_pred_order_shuffle", row["sample_id"], {
+                        "spatial": shuffled_pred[obs][0].half(), "pooled": shuffled_pred[obs][0].mean((0, 1)).half(),
+                    }, common | {"last_tubelet_fixed": True})
 
-            if audit["future_invariance"] is None:
+            if audit["future_invariance"] is None and not args.skip_future_invariance:
                 audit["future_invariance"] = assert_full_chain_future_invariance(
                     model, processor, observed, other_observed[8:], args.device, 1e-5, 1e-5,
                 )

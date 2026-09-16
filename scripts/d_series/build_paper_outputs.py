@@ -274,7 +274,7 @@ def plots(records, out):
     fig.savefig(out / "coarse_fine_analysis.pdf"); fig.savefig(out / "coarse_fine_analysis.png", dpi=180); plt.close(fig)
 
     # Geometry error relative to each sample's prior, with variance contraction
-    # shown by colour. D2 contributes three models; D3 contributes V-JEPA2.
+    # shown by colour. D2 contributes the active Wan+V-JEPA2 models; D3 contributes V-JEPA2.
     panels = [("D2", model, "pooled", "true_motion") for model in REQUIRED["D2"]["models"]]
     panels.append(("D3", "vjepa2_vitl256", None, "frozen_readout_transfer"))
     fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex=True, sharey=True)
@@ -320,7 +320,7 @@ Across the complete D1 matrix, the lowest three-seed mean target-reference MAE w
 
 - 问题：目标视图深度能否从表示读出，且这种可读性是否在预测后保持？
 - ScanNet++ development-only：612 train / 69 dev / 0 held-out test 场景；2,721 windows；prefix=8，horizon={{2,4}}。
-- 三个冻结 backbone：V-JEPA2 ViT-L/256、Wan2.1-T2V-1.3B layer20/index749、DINOv2 ViT-L/14。
+- 两个 active 冻结 backbone：V-JEPA2 ViT-L/256、Wan2.1-T2V-1.3B layer20/index749；历史 DINOv2 不在当前范围。
 - 主指标：scene-macro normalized-depth MAE；scene-cluster paired bootstrap 95% CI。
 
 # 第2页：三组正式主结果

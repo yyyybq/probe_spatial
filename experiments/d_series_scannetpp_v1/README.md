@@ -14,7 +14,7 @@ RUNS=/path/to/d_series_scannetpp_v1_runs
 
 $PY scripts/d_series/build_manifest.py
 $PY scripts/d_series/extract_vjepa2.py --scene-root "$SCENES" --output-root "$FEATURES"
-$PY scripts/d_series/extract_dinov2.py --scene-root "$SCENES" --output-root "$FEATURES"
+# DINOv2 is historical-only under protocol revision d_series_scope_r2_20260916.
 WAN_T2V_DTYPE=bf16 $PY scripts/d_series/extract_wan.py --scene-root "$SCENES" --output-root "$FEATURES"
 ```
 
@@ -27,7 +27,7 @@ $PY scripts/d_series/run_d2.py --model vjepa2_vitl256 --seed 0 --scene-root "$SC
 $PY scripts/d_series/run_d3.py --branch spatial --seed 0 --scene-root "$SCENES" --feature-root "$FEATURES" --native-d1-checkpoint "$RUNS/d1_vjepa2_native_spatial_s0/checkpoint.pt" --output-dir "$RUNS/d3_vjepa2_spatial_s0"
 ```
 
-Repeat the analogous D1/D2 commands for Wan and DINOv2 and all seeds. No D3 command exists for those models. Every runner audits all cache receipts and hashes before training, trains both horizons jointly, selects on dev, writes its checkpoint, receipt, and per-sample CSV, and refuses an existing output directory.
+Repeat the analogous D1/D2 commands for Wan and all seeds. DINOv2 files/logs are preserved but it is not active and cannot block Wan or V-JEPA2. No D3 command exists for Wan. Every runner audits cache receipts, trains both horizons jointly, selects on dev, writes its checkpoint, receipt, and per-sample CSV, and refuses an existing output directory.
 
 Paper outputs are fail-closed:
 
@@ -37,10 +37,10 @@ MPLCONFIGDIR=/tmp/dseries_mpl $PY scripts/d_series/build_paper_outputs.py --run-
 $PY scripts/d_series/render_qualitative.py --visual-index experiments/d_series_scannetpp_v1/paper_outputs/visual_index.csv --run-root "$RUNS" --feature-root "$FEATURES" --scene-root "$SCENES" --output-dir experiments/d_series_scannetpp_v1/paper_outputs/qualitative
 ```
 
-The builder requires all three models/branches/conditions and seeds `{0,1,2}` on the exact manifest hash. Missing records, incomplete receipts, or mismatched hashes are hard errors; historical pilot values cannot enter the tables.
+The formal builder requires the active Wan+V-JEPA2 models/branches/conditions and seeds `{0,1,2}` on the exact manifest hash. Seed0 diagnostic tables are separately labelled and do not relax the formal gate. Missing records, incomplete receipts, or mismatched hashes are hard errors; historical pilot values cannot enter the tables.
 
 ## Sharding and recovery
 
 Feature extractors accept `--window-start` and `--max-windows`; each feature has an immutable `.sft` + `.json` pair with model revision, raw IDs, tensor contract, payload size, and SHA-256. A matching pair is a resume hit; a partial or mismatched pair aborts. Use disjoint window shards that share one fresh formal root.
 
-`scripts/d_series/submit_feature_canaries_sco.sh` submits one bounded four-GPU allocation running three isolated extractor workers. A submitted job is not complete until its run directory contains `status.json` with all three return codes zero and each extractor audit reports the requested window count. Only then may `submit_full_features_sco.sh` launch the three model-specific eight-way feature jobs. After all feature audits pass, `submit_training_stage_sco.sh` launches the recoverable `d1` stage; its independently resumable `d2d3` stage is hard-gated on all required D1 receipts and checkpoints. The training orchestrator schedules at most one process per listed GPU and refuses partial output directories.
+`scripts/d_series/submit_feature_canaries_sco.sh` submits a bounded single-GPU V-JEPA2 canary. It passes independently when the real V2 read/overfit/identity receipt and native predictor/future-invariance receipt both pass. `submit_vjepa2_missing_features_sco.sh` then fills only the D-series roles absent from V2 and produces a one-time full coverage audit. Wan has its own independent path; neither model waits for DINOv2 or for the other model's canary. Formal training remains recoverable and fail-closed.
