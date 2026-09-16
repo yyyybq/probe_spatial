@@ -2,7 +2,7 @@
 
 The dataset and protocol are frozen, but formal feature extraction/training/evaluation has not yet produced a complete result matrix. No main-table number exists in this directory yet. This file is intentionally explicit so submitted/running work cannot be mistaken for completed evidence.
 
-Latest scheduler observation (2026-09-16 16:23:35 UTC): corrected GPU canary job `pt-bvkfd4i0` (`dseries_feature_canary_20260914_2032_r3`) is `FAILED`. It received a worker at 2026-09-14 21:46:47 UTC and failed three seconds later, again before any extractor log or `status.json`; `base_commit.txt` is empty. This rules out a model or memory failure and shows that worker-side Git provenance itself is unavailable. Provenance capture has therefore been moved completely to the submission host: the worker now only copies a prebuilt commit receipt, scoped patch, hashes, and source snapshot and receives the commit through environment variables. A fresh canary is required. The earlier submission was rejected before job creation because the requested three-GPU work spec did not exist. Machine-readable events are in `job_ledger.jsonl`.
+Latest scheduler observation (2026-09-16 16:37:30 UTC): GPU canary job `pt-l1563r8x` (`dseries_feature_canary_20260916_1642_r4`) is `STARTING`, with zero running worker replicas and no start time. It is submitted but not running or complete. Its submission directory already contains the nonempty base commit `95ebf6ce8efdb13ae3691d74c7f9c0deebbeb43d`, scoped patch, hashes, and a 1,487,197-byte source snapshot; the worker path no longer invokes Git or tar. The prior r3 job failed before any extractor log because worker-side Git provenance was unavailable. Machine-readable events are in `job_ledger.jsonl`.
 
 Completed gates:
 
