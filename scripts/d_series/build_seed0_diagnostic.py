@@ -20,12 +20,19 @@ from vidfm3d.utils.layout_metrics import scene_cluster_paired_bootstrap, scene_m
 
 def load(root: Path):
     records, sources = [], []
+    candidates = []
     for path in sorted(root.rglob("per_sample_metrics.csv")):
         receipt_path = path.parent / "run_receipt.json"
         receipt = json.loads(receipt_path.read_text())
         if receipt.get("status") != "complete_development_evaluation" or receipt.get("manifest_sha256") != MANIFEST_SHA256:
             raise ValueError(f"invalid diagnostic receipt: {receipt_path}")
         if receipt.get("seed") != 0 or receipt.get("model") != "vjepa2_vitl256":
+            continue
+        candidates.append((path, receipt_path, receipt))
+    has_full_d3 = any(receipt.get("experiment") == "D3" and receipt.get("phase") != "AB"
+                      for _, _, receipt in candidates)
+    for path, receipt_path, receipt in candidates:
+        if has_full_d3 and receipt.get("experiment") == "D3" and receipt.get("phase") == "AB":
             continue
         with path.open() as handle:
             rows = list(csv.DictReader(handle))

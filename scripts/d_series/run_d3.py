@@ -43,14 +43,16 @@ class D3TrainDataset(Dataset):
         return {"pred": pred, "target": target, "depth": depth, "valid": valid, "index": index}
 
 
-def evaluate(target_readout, retrained, adapter, depth_dataset, rows, root, branch, prior, device, seed, source_run):
+def evaluate(target_readout, retrained, adapter, depth_dataset, rows, root, branch, prior, device, seed, source_run,
+             depth_only=False, include_order_shuffle=True):
     for module in (target_readout, retrained, adapter): module.eval()
     within, _ = permutations(rows); records = []
     with torch.inference_mode():
         for row in rows:
             def feat(space, sample=row["sample_id"]):
                 return load_file(feature_paths(root, MODEL, space, sample)[0])[branch].float().to(device)[None]
-            target, pred, shuffled = feat("native_target"), feat("native_pred"), feat("native_pred_order_shuffle")
+            target, pred = feat("native_target"), feat("native_pred")
+            shuffled = feat("native_pred_order_shuffle") if include_order_shuffle else None
             prefix = load_file(feature_paths(root, MODEL, "prefix", row["parent_sample_id"])[0])
             last = prefix["context_spatial" if branch == "spatial" else "context_pooled_sequence"].float()
             if branch == "pooled": last = last[-1]
@@ -64,19 +66,24 @@ def evaluate(target_readout, retrained, adapter, depth_dataset, rows, root, bran
                 "last_context": target_readout(last),
                 "train_layout_prior": prior[None, None].to(device),
                 "within_scene_wrong_target": target_readout(wrong),
-                "early_tubelet_order_shuffle": target_readout(shuffled),
             }
+            if include_order_shuffle:
+                outputs["early_tubelet_order_shuffle"] = target_readout(shuffled)
             depth, valid, scale = depth_dataset.label(row); db, vb = depth[None].to(device), valid[None].to(device)
-            intrinsic = depth_dataset.resized_intrinsic(row).to(device)
-            target_pointmap = metric_depth_to_camera_pointmap(db[0] * scale.to(device), intrinsic)
+            intrinsic = target_pointmap = None
+            if not depth_only:
+                intrinsic = depth_dataset.resized_intrinsic(row).to(device)
+                target_pointmap = metric_depth_to_camera_pointmap(db[0] * scale.to(device), intrinsic)
             for condition, output in outputs.items():
                 metric = depth_metrics(output, db, vb)[0]
                 metric["coarse_mae"] = float(coarse_layout_mae(output, db, vb)[0])
                 metric["detail_mae"] = float(detail_gradient_mae(output, db, vb)[0])
-                oracle_pointmap = metric_depth_to_camera_pointmap(output[0, 0] * scale.to(device), intrinsic)
-                metric["oracle_gt_scale_pointmap_mae_m"] = float(
-                    torch.linalg.vector_norm(oracle_pointmap - target_pointmap, dim=-1)[vb[0]].mean()
-                )
+                metric["oracle_gt_scale_pointmap_mae_m"] = ""
+                if not depth_only:
+                    oracle_pointmap = metric_depth_to_camera_pointmap(output[0, 0] * scale.to(device), intrinsic)
+                    metric["oracle_gt_scale_pointmap_mae_m"] = float(
+                        torch.linalg.vector_norm(oracle_pointmap - target_pointmap, dim=-1)[vb[0]].mean()
+                    )
                 latent = pred if condition not in {"native_target_reference", "within_scene_wrong_target", "last_context"} else None
                 diag = {"cosine": None, "pred_variance": None, "target_variance": float(target.var(unbiased=False))}
                 if latent is not None:
@@ -109,15 +116,31 @@ def main():
     p.add_argument("--native-d1-checkpoint", type=Path, required=True); p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--batch-size", type=int, default=16); p.add_argument("--max-epochs", type=int, default=40)
     p.add_argument("--patience", type=int, default=6); p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--depth-only", action="store_true")
+    p.add_argument("--skip-order-shuffle", action="store_true")
+    p.add_argument("--feature-audit-receipt", type=Path)
     args = p.parse_args()
     if sha256(args.manifest) != MANIFEST_SHA256: raise ValueError("manifest hash mismatch")
     rows = [json.loads(line) for line in args.manifest.open()]
     train_rows, dev_rows = ([r for r in rows if r["split"] == split] for split in ("train", "dev"))
-    for row in rows:
-        for space in ("native_target", "native_pred", "native_pred_order_shuffle"):
-            load_verified(args.feature_root, MODEL, space, row["sample_id"], REVISIONS[MODEL])
-    for parent in sorted({row["parent_sample_id"] for row in rows}):
-        load_verified(args.feature_root, MODEL, "prefix", parent, REVISIONS[MODEL])
+    required_spaces = ["native_target", "native_pred"]
+    if not args.skip_order_shuffle:
+        required_spaces.append("native_pred_order_shuffle")
+    if args.feature_audit_receipt is not None:
+        audit = json.loads(args.feature_audit_receipt.read_text())
+        expected_samples = {"expected": len(rows), "complete": len(rows)}
+        expected_parents = {"expected": len({row['parent_sample_id'] for row in rows}),
+                            "complete": len({row['parent_sample_id'] for row in rows})}
+        if (audit.get("status") != "COMPLETE_VALID" or audit.get("manifest_sha256") != MANIFEST_SHA256
+                or audit.get("model") != MODEL or audit.get("roles", {}).get("prefix") != expected_parents
+                or any(audit.get("roles", {}).get(space) != expected_samples for space in required_spaces)):
+            raise ValueError("feature audit receipt does not cover D3 inputs")
+    else:
+        for row in rows:
+            for space in required_spaces:
+                load_verified(args.feature_root, MODEL, space, row["sample_id"], REVISIONS[MODEL])
+        for parent in sorted({row["parent_sample_id"] for row in rows}):
+            load_verified(args.feature_root, MODEL, "prefix", parent, REVISIONS[MODEL])
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     depth_train = D1Dataset(train_rows, args.scene_root, args.feature_root, MODEL, "native_target", args.branch)
@@ -150,7 +173,7 @@ def main():
             for batch in DataLoader(dev, batch_size=args.batch_size, num_workers=args.num_workers):
                 latent_losses.append(torch.nn.functional.mse_loss(adapter(batch["pred"].to(device)), batch["target"].to(device)).item())
         records = evaluate(target_readout, retrained, adapter, depth_dev, dev_rows, args.feature_root, args.branch,
-                           prior, device, args.seed, source_run)
+                           prior, device, args.seed, source_run, args.depth_only, not args.skip_order_shuffle)
         score_r = scene_macro((r for r in records if r["condition"] == "retrained_same_capacity_readout"), "mae")
         score_a = float(np.mean(latent_losses)); history.append({"epoch": epoch, "adapter_dev_mse": score_a, "retrained_dev_scene_macro_mae": score_r})
         print(json.dumps(history[-1]), flush=True)
@@ -165,7 +188,7 @@ def main():
         if left_a == 0 and left_r == 0: break
     adapter.load_state_dict(state_a); retrained.load_state_dict(state_r)
     records = evaluate(target_readout, retrained, adapter, depth_dev, dev_rows, args.feature_root, args.branch,
-                       prior, device, args.seed, source_run)
+                       prior, device, args.seed, source_run, args.depth_only, not args.skip_order_shuffle)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     torch.save({"adapter_state_dict": state_a, "retrained_readout_state_dict": state_r}, args.output_dir / "checkpoint.pt")
     with (args.output_dir / "per_sample_metrics.csv").open("w", newline="") as handle:
@@ -178,6 +201,9 @@ def main():
                "dev_scenes_sha256": sha256(args.manifest.parent / "dev_scenes.txt"), "test_scenes": 0,
                "adapter_parameters": parameter_count(adapter), "retrained_readout_parameters": parameter_count(retrained),
                "adapter_best_epoch": epoch_a, "adapter_dev_mse": best_a, "retrained_best_epoch": epoch_r,
+               "depth_only": args.depth_only, "order_shuffle_included": not args.skip_order_shuffle,
+               "feature_audit_receipt": str(args.feature_audit_receipt.resolve()) if args.feature_audit_receipt else None,
+               "feature_audit_receipt_sha256": sha256(args.feature_audit_receipt) if args.feature_audit_receipt else None,
                "retrained_dev_scene_macro_mae": best_r, "n_dev": len(dev_rows),
                "n_dev_scenes": len({r['scene_id'] for r in dev_rows}), "history": history} | code_provenance([
                    Path(__file__), REPO_ROOT / "scripts/d_series/run_d1.py",

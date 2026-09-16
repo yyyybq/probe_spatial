@@ -63,6 +63,27 @@ done
 set +e; d3_failed=0
 for pid in "${pids[@]}"; do wait "${pid}" || d3_failed=$((d3_failed + 1)); done
 set -e
-printf '{"stage":"seed0_D1_D3_AB","d1_failed":0,"d3_failed":%d,"ended_utc":"%s"}\n' \
-  "${d3_failed}" "$(date -u +%FT%TZ)" > "${REPORT}/status.json"
-(( d3_failed == 0 ))
+if (( d3_failed > 0 )); then
+  printf '{"stage":"seed0_D1_D3_AB","d1_failed":0,"d3_ab_failed":%d,"d3_cd_failed":null,"ended_utc":"%s"}\n' \
+    "${d3_failed}" "$(date -u +%FT%TZ)" > "${REPORT}/status.json"
+  exit 1
+fi
+
+# A/B is already complete and visible. C/D now fit only on train predicted/target
+# pairs and predicted features respectively, with dev used only for selection.
+pids=()
+for spec in "0 spatial" "1 pooled"; do
+  read -r gpu branch <<<"${spec}"
+  CUDA_VISIBLE_DEVICES=${gpu} "${PY}" scripts/d_series/run_d3.py --branch "${branch}" --seed 0 --depth-only \
+    --skip-order-shuffle --scene-root "${SCENE_ROOT}" --feature-root "${FEATURE_ROOT}" \
+    --feature-audit-receipt "${FEATURE_AUDIT}" \
+    --native-d1-checkpoint "${OUTPUT_ROOT}/d1_native_${branch}_s0/checkpoint.pt" \
+    --output-dir "${OUTPUT_ROOT}/d3_abcd_${branch}_s0" > "${REPORT}/d3_abcd_${branch}_s0.log" 2>&1 &
+  pids+=("$!")
+done
+set +e; cd_failed=0
+for pid in "${pids[@]}"; do wait "${pid}" || cd_failed=$((cd_failed + 1)); done
+set -e
+printf '{"stage":"seed0_D1_D3_ABCD","d1_failed":0,"d3_ab_failed":0,"d3_cd_failed":%d,"ended_utc":"%s"}\n' \
+  "${cd_failed}" "$(date -u +%FT%TZ)" > "${REPORT}/status.json"
+(( cd_failed == 0 ))
