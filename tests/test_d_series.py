@@ -9,7 +9,7 @@ from features.vjepa2.native_predictor import (
     predict_future_tubelets,
     tubelet_token_indices,
 )
-from scripts.d_series.feature_store import load_verified, write_feature
+from scripts.d_series.feature_store import code_provenance, load_verified, write_feature
 from scripts.d_series.run_d2 import bin_index, motion_bin_thresholds, shuffled_motion_map
 
 from vidfm3d.models.components.probe_layout_readout import (
@@ -188,6 +188,14 @@ def test_feature_store_is_resume_safe_and_fails_closed(tmp_path):
         pass
     else:
         raise AssertionError("mismatched feature receipt was accepted")
+
+
+def test_feature_provenance_accepts_submit_host_receipt(monkeypatch):
+    monkeypatch.setenv("D_SERIES_BASE_COMMIT", "f" * 40)
+    monkeypatch.setenv("D_SERIES_GIT_DIRTY", "true")
+    receipt = code_provenance([__import__("pathlib").Path("scripts/d_series/feature_store.py")])
+    assert receipt["git_base_commit"] == "f" * 40
+    assert receipt["git_dirty"] is True
 
 
 def test_evaluator_identity_gate_uses_same_frozen_readout():

@@ -7,6 +7,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import random
 import subprocess
 import sys
@@ -253,8 +254,10 @@ def main():
     torch.save({"state_dict": best_state, "train_layout_prior": prior, "args": vars(args)}, args.output_dir / "checkpoint.pt")
     with (args.output_dir / "per_sample_metrics.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(records[0]), lineterminator="\n"); writer.writeheader(); writer.writerows(records)
+    commit = os.environ.get("D_SERIES_BASE_COMMIT")
+    dirty_env = os.environ.get("D_SERIES_GIT_DIRTY")
     git = ["git", "-c", f"safe.directory={REPO_ROOT}"]
-    commit = subprocess.check_output(git + ["rev-parse", "HEAD"], text=True).strip()
+    if not commit: commit = subprocess.check_output(git + ["rev-parse", "HEAD"], text=True).strip()
     receipt = {
         "schema_version": 1, "experiment": "D1", "status": "complete_development_evaluation",
         "source_run": source_run, "model": args.model, "model_revision": REVISIONS[args.model],
@@ -263,7 +266,7 @@ def main():
         "dev_scenes_sha256": sha256(args.manifest.parent / "dev_scenes.txt"), "test_scenes": 0,
         "parameter_count": parameter_count(readout), "best_epoch": best_epoch,
         "dev_scene_macro_mae": best, "n_dev": len(dev_rows), "n_dev_scenes": len({r['scene_id'] for r in dev_rows}),
-        "git_base_commit": commit, "git_dirty": bool(subprocess.check_output(git + ["status", "--short"], text=True).strip()),
+        "git_base_commit": commit, "git_dirty": dirty_env == "true" if dirty_env is not None else bool(subprocess.check_output(git + ["status", "--short"], text=True).strip()),
         "history": history,
     } | code_provenance([
         Path(__file__), REPO_ROOT / "vidfm3d/models/components/probe_layout_readout.py",

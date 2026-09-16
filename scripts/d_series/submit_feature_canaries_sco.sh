@@ -15,8 +15,12 @@ for path in scripts/d_series/extract_vjepa2.py scripts/d_series/extract_dinov2.p
   scripts/d_series/extract_wan.py scripts/d_series/run_feature_canaries_sco.sh; do
   test -f "${path}"
 done
+PROJECT_ROOT="${PROJECT_ROOT}" PROVENANCE_DIR="${REPORT}/launcher" \
+  bash scripts/d_series/capture_source_provenance.sh
+base_commit=$(cat "${REPORT}/launcher/base_commit.txt")
+git_dirty=$(cat "${REPORT}/launcher/git_dirty.txt")
 
-command="cd ${PROJECT_ROOT} && PROJECT_ROOT=${PROJECT_ROOT} RUN_TAG=${RUN_TAG} bash scripts/d_series/run_feature_canaries_sco.sh"
+command="cd ${PROJECT_ROOT} && PROJECT_ROOT=${PROJECT_ROOT} RUN_TAG=${RUN_TAG} D_SERIES_BASE_COMMIT=${base_commit} D_SERIES_GIT_DIRTY=${git_dirty} bash scripts/d_series/run_feature_canaries_sco.sh"
 printf '%s\n' "${command}" > "${REPORT}/launcher/command.txt"
 printf '%s\n' "${JOB_NAME}" > "${REPORT}/launcher/job_name.txt"
 sco acp jobs create \

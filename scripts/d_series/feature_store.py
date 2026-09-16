@@ -35,12 +35,17 @@ def sha256_file(path: Path) -> str:
 def code_provenance(paths):
     """Record the base commit and exact bytes of every extraction component."""
     repo = Path(__file__).resolve().parents[2]
-    try:
-        git = ["git", "-c", f"safe.directory={repo}", "-C", str(repo)]
-        commit = subprocess.check_output(git + ["rev-parse", "HEAD"], text=True).strip()
-        dirty = bool(subprocess.check_output(git + ["status", "--short"], text=True).strip())
-    except Exception:
-        commit, dirty = "unknown", None
+    commit_from_launcher = os.environ.get("D_SERIES_BASE_COMMIT")
+    dirty_from_launcher = os.environ.get("D_SERIES_GIT_DIRTY")
+    if commit_from_launcher:
+        commit, dirty = commit_from_launcher, dirty_from_launcher == "true"
+    else:
+        try:
+            git = ["git", "-c", f"safe.directory={repo}", "-C", str(repo)]
+            commit = subprocess.check_output(git + ["rev-parse", "HEAD"], text=True).strip()
+            dirty = bool(subprocess.check_output(git + ["status", "--short"], text=True).strip())
+        except Exception:
+            commit, dirty = "unknown", None
     resolved = [Path(path).resolve() for path in paths]
     return {
         "git_base_commit": commit,

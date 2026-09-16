@@ -29,8 +29,12 @@ PY
 esac
 
 mkdir -p "${REPORT}"
+PROJECT_ROOT="${PROJECT_ROOT}" PROVENANCE_DIR="${REPORT}" \
+  bash scripts/d_series/capture_source_provenance.sh
+base_commit=$(cat "${REPORT}/base_commit.txt")
+git_dirty=$(cat "${REPORT}/git_dirty.txt")
 job_name="bq_dseries_train_${STAGE}_$(date -u +%m%d%H%M%S)"
-command="cd ${PROJECT_ROOT} && PROJECT_ROOT=${PROJECT_ROOT} STAGE=${STAGE} RUN_TAG=${RUN_TAG} FEATURE_ROOT=${FEATURE_ROOT} FORMAL_RUN_ROOT=${FORMAL_RUN_ROOT} bash scripts/d_series/run_training_stage_sco.sh"
+command="cd ${PROJECT_ROOT} && PROJECT_ROOT=${PROJECT_ROOT} STAGE=${STAGE} RUN_TAG=${RUN_TAG} FEATURE_ROOT=${FEATURE_ROOT} FORMAL_RUN_ROOT=${FORMAL_RUN_ROOT} D_SERIES_BASE_COMMIT=${base_commit} D_SERIES_GIT_DIRTY=${git_dirty} bash scripts/d_series/run_training_stage_sco.sh"
 printf '%s\n' "${command}" > "${REPORT}/command.txt"
 printf '%s\n' "${job_name}" > "${REPORT}/job_name.txt"
 sco acp jobs create --workspace-name=aigc --aec2-name=zoetrope --job-name="${job_name}" --priority=HIGHEST \

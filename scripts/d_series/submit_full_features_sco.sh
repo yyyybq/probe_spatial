@@ -31,10 +31,14 @@ PY
 test "$(sha256sum experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl | awk '{print $1}')" = \
   781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
 mkdir -p "${REPORT}"
+PROJECT_ROOT="${PROJECT_ROOT}" PROVENANCE_DIR="${REPORT}" \
+  bash scripts/d_series/capture_source_provenance.sh
+base_commit=$(cat "${REPORT}/base_commit.txt")
+git_dirty=$(cat "${REPORT}/git_dirty.txt")
 : > "${REPORT}/sco_submit.log"
 for model in vjepa2_vitl256 dinov2_vitl14 wan21_t2v_1p3b; do
   job_name="bq_dseries_${model}_$(date -u +%m%d%H%M%S)"
-  command="cd ${PROJECT_ROOT} && PROJECT_ROOT=${PROJECT_ROOT} RUN_TAG=${RUN_TAG} MODEL=${model} FEATURE_ROOT=${FEATURE_ROOT} NPROC=8 bash scripts/d_series/run_feature_shards_sco.sh"
+  command="cd ${PROJECT_ROOT} && PROJECT_ROOT=${PROJECT_ROOT} RUN_TAG=${RUN_TAG} MODEL=${model} FEATURE_ROOT=${FEATURE_ROOT} NPROC=8 D_SERIES_BASE_COMMIT=${base_commit} D_SERIES_GIT_DIRTY=${git_dirty} bash scripts/d_series/run_feature_shards_sco.sh"
   printf '%s\t%s\n' "${model}" "${command}" >> "${REPORT}/commands.tsv"
   sco acp jobs create --workspace-name=aigc --aec2-name=zoetrope --job-name="${job_name}" --priority=HIGHEST \
     --container-image-url=registry.cn-fz-01.fjscms.com/ccr_fj2/wc-dev:260617 \
