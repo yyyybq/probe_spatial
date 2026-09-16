@@ -93,6 +93,7 @@ def main() -> int:
     if bad_coverage:
         raise ValueError(f"V2 coverage receipt mismatch: {bad_coverage}")
 
+    v2_root = args.v2_root.resolve()
     request_rows = [json.loads(line) for line in args.v2_request.open() if line.strip()]
     vjepa = [row for row in request_rows if row.get("model") == MODEL]
     contexts = {tuple(row["context_raw_ids"]): row for row in vjepa if row["feature_role"] == "streaming_context_p8"}
@@ -116,7 +117,7 @@ def main() -> int:
                 missing["streaming_context"] += 1
                 parents[parent_id] = {"status": "missing"}
             else:
-                payload, meta = validate_candidate(args.v2_root, unit, "streaming_context_p8")
+                payload, meta = validate_candidate(v2_root, unit, "streaming_context_p8")
                 parents[parent_id] = {"status": "adapted", "unit": unit, "payload": payload, "meta": meta}
                 adapted["streaming_context"] += 1
         target = raw_id(row["scene_id"], row["target_frame_name"])
@@ -125,7 +126,7 @@ def main() -> int:
             missing["isolated_target"] += 1
             target_entry = {"status": "missing"}
         else:
-            payload, meta = validate_candidate(args.v2_root, unit, "isolated_frame")
+            payload, meta = validate_candidate(v2_root, unit, "isolated_frame")
             target_entry = {"status": "adapted", "unit": unit, "payload": payload, "meta": meta}
             adapted["isolated_target"] += 1
         context_entry = parents[parent_id]
@@ -205,7 +206,7 @@ def main() -> int:
         "v2": {
             "request_manifest": str(args.v2_request), "request_manifest_sha256": REQUEST_SHA256,
             "coverage_receipt": str(args.coverage_receipt), "coverage_receipt_sha256": sha256(args.coverage_receipt),
-            "feature_root": str(args.v2_root), "vjepa2_units": len(vjepa),
+            "feature_root": str(v2_root), "vjepa2_units": len(vjepa),
             "checkpoint": "facebook/vjepa2-vitl-fpc64-256", "revision": MODEL_REVISION,
             "layer_zero_based": 23, "raw_layout": [32, 16, 16, 1024],
             "stored_layout": [1024], "pooling": "FP32 mean over every returned temporal and spatial token",

@@ -32,7 +32,8 @@ CUDA_VISIBLE_DEVICES=0 "${PY}" scripts/d_series/vjepa2_v2_canary.py \
     --manifest experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl \
     --mapping experiments/d_series_scannetpp_v1/v2_reuse_mapping.csv \
     --coverage-receipt results/independent_actionability_algebra_p8_final_v1_20260913/coverage/vjepa2_coverage_receipt.json \
-    --scene-root "${SCENE_ROOT}" --output "${REPORT}/vjepa2_v2_pooled_canary.json" \
+    --scene-root "${SCENE_ROOT}" --shared-project-root "${PROJECT_ROOT}" \
+    --output "${REPORT}/vjepa2_v2_pooled_canary.json" \
     > "${REPORT}/vjepa2_v2.log" 2>&1
 rc_v2=$?
 ( CUDA_VISIBLE_DEVICES=0 "${PY}" scripts/d_series/extract_vjepa2.py \

@@ -41,6 +41,7 @@ def main() -> int:
     parser.add_argument("--mapping", type=Path, required=True)
     parser.add_argument("--coverage-receipt", type=Path, required=True)
     parser.add_argument("--scene-root", type=Path, required=True)
+    parser.add_argument("--shared-project-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=300)
     args = parser.parse_args()
@@ -57,6 +58,8 @@ def main() -> int:
     rows = {row["sample_id"]: row for row in (json.loads(line) for line in args.manifest.open())}
     row = rows[selected["sample_id"]]
     payload = Path(selected["v2_payload"])
+    if not payload.is_absolute():
+        payload = args.shared_project_root.resolve() / payload
     feature = load_file(str(payload))["feat"].float()
     if list(feature.shape) != [1024] or not torch.isfinite(feature).all():
         raise ValueError("real V2 tensor identity/dimension check failed")

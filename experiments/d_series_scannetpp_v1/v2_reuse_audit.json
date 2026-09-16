@@ -3,7 +3,7 @@
     {
       "dtype": "torch.float32",
       "finite": true,
-      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/00a231a370/fu_72e8fbafe33ecb30d8570182.safetensors",
+      "path": "/mnt/umm/users/yinbaiqiao/probe_spatial/features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/00a231a370/fu_72e8fbafe33ecb30d8570182.safetensors",
       "sha256": "9a7b401239ea8049d2e4ca1705eac7444581c7e87437a0070f830b346a5197b2",
       "shape": [
         1024
@@ -12,7 +12,7 @@
     {
       "dtype": "torch.float32",
       "finite": true,
-      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/2f5996ff01/fu_e4362608faf6eec456c12710.safetensors",
+      "path": "/mnt/umm/users/yinbaiqiao/probe_spatial/features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/2f5996ff01/fu_e4362608faf6eec456c12710.safetensors",
       "sha256": "1c0f6bca87485c476b3603701fbe6b0390163988c40d94940a43b7f00df7ff29",
       "shape": [
         1024
@@ -21,7 +21,7 @@
     {
       "dtype": "torch.float32",
       "finite": true,
-      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/635852d56e/fu_4024f458e726b0196df36fda.safetensors",
+      "path": "/mnt/umm/users/yinbaiqiao/probe_spatial/features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/635852d56e/fu_4024f458e726b0196df36fda.safetensors",
       "sha256": "816cb419b1554070ca42bf663ad173eb9ef14ddbb50e04b8ffd16caa40d158cc",
       "shape": [
         1024
@@ -30,7 +30,7 @@
     {
       "dtype": "torch.float32",
       "finite": true,
-      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/90d8e25cee/fu_5739c6bb4417cb9a2ade7f30.safetensors",
+      "path": "/mnt/umm/users/yinbaiqiao/probe_spatial/features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/90d8e25cee/fu_5739c6bb4417cb9a2ade7f30.safetensors",
       "sha256": "21a3c2b30cb803385fbbf60075f775fd261ba27f37feea6280beed1af98a6ad3",
       "shape": [
         1024
@@ -39,7 +39,7 @@
     {
       "dtype": "torch.float32",
       "finite": true,
-      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/c178491bc5/fu_599c6266c28bbabb152cb147.safetensors",
+      "path": "/mnt/umm/users/yinbaiqiao/probe_spatial/features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/c178491bc5/fu_599c6266c28bbabb152cb147.safetensors",
       "sha256": "a59a78b55cc29a24b5dc24f7d6f34bcfb3bd9262ebe63ba6414768095fcf1bfe",
       "shape": [
         1024
@@ -116,7 +116,7 @@
     "context_padding": "repeat_tail to 64 frames",
     "coverage_receipt": "results/independent_actionability_algebra_p8_final_v1_20260913/coverage/vjepa2_coverage_receipt.json",
     "coverage_receipt_sha256": "adbd0a972ae60126b6771e3c2c0268dcf75fbf5205561197fc21ea443096e903",
-    "feature_root": "features/independent_actionability_algebra_p8_final_v1_20260913",
+    "feature_root": "/mnt/umm/users/yinbaiqiao/probe_spatial/features/independent_actionability_algebra_p8_final_v1_20260913",
     "isolated_padding": "repeat_single_frame to 64 frames",
     "layer_zero_based": 23,
     "pooling": "FP32 mean over every returned temporal and spatial token",
