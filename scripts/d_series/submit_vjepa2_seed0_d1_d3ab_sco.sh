@@ -3,6 +3,7 @@ set -euo pipefail
 
 export PATH="${HOME}/.sco/bin:${PATH}"
 PROJECT_ROOT=${PROJECT_ROOT:-/mnt/umm/users/yinbaiqiao/probe_spatial}
+AEC2_NAME=${AEC2_NAME:-h800}
 FEATURE_RUN=${FEATURE_RUN:?FEATURE_RUN is required}
 FEATURE_ROOT=${FEATURE_ROOT:?FEATURE_ROOT is required}
 RUN_TAG=${RUN_TAG:-dseries_vjepa2_seed0_$(date -u +%Y%m%d_%H%M%S)}
@@ -29,7 +30,7 @@ base_commit=$(cat "${REPORT}/base_commit.txt"); git_dirty=$(cat "${REPORT}/git_d
 job_name="bq_dseries_vjepa2_s0_$(date -u +%m%d%H%M%S)"
 command="cd ${PROJECT_ROOT} && PROJECT_ROOT=${PROJECT_ROOT} RUN_TAG=${RUN_TAG} FEATURE_ROOT=${FEATURE_ROOT} FEATURE_AUDIT=${FEATURE_AUDIT} OUTPUT_ROOT=${OUTPUT_ROOT} D_SERIES_BASE_COMMIT=${base_commit} D_SERIES_GIT_DIRTY=${git_dirty} bash scripts/d_series/run_vjepa2_seed0_d1_d3ab_sco.sh"
 printf '%s\n' "${command}" > "${REPORT}/command.txt"; printf '%s\n' "${job_name}" > "${REPORT}/job_name.txt"
-sco acp jobs create --workspace-name=aigc --aec2-name=zoetrope --job-name="${job_name}" --priority=HIGHEST \
+sco acp jobs create --workspace-name=aigc --aec2-name="${AEC2_NAME}" --job-name="${job_name}" --priority=HIGHEST \
   --container-image-url=registry.cn-fz-01.fjscms.com/ccr_fj2/wc-dev:260617 \
   --storage-mount=019ec9f9-6d12-7d49-aad4-864b15c9eb06:/mnt/umm --training-framework=pytorch \
   --worker-nodes=1 --worker-spec=N4lS.Iq.I80.4 --command="${command}" | tee "${REPORT}/sco_submit.log"
