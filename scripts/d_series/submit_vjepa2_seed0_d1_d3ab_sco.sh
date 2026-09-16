@@ -10,14 +10,18 @@ RUN_TAG=${RUN_TAG:-dseries_vjepa2_seed0_$(date -u +%Y%m%d_%H%M%S)}
 OUTPUT_ROOT=${OUTPUT_ROOT:-${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/diagnostic_runs/${RUN_TAG}}
 FEATURE_REPORT=${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/runs/${FEATURE_RUN}/vjepa2_vitl256
 FEATURE_AUDIT=${FEATURE_REPORT}/feature_audit.json
+FEATURE_AUDIT_RECOVERY=${FEATURE_REPORT}/feature_audit_recovery_status.json
 REPORT=${PROJECT_ROOT}/experiments/d_series_scannetpp_v1/runs/${RUN_TAG}/launcher
 PY=/mnt/umm/users/yinbaiqiao/.conda/envs/probe-spatial/bin/python
 cd "${PROJECT_ROOT}"
 
-"${PY}" - "${FEATURE_REPORT}/status.json" "${FEATURE_AUDIT}" <<'PY'
+"${PY}" - "${FEATURE_REPORT}/status.json" "${FEATURE_AUDIT}" "${FEATURE_AUDIT_RECOVERY}" <<'PY'
 import json, sys
-status, audit = (json.load(open(path)) for path in sys.argv[1:])
-assert status["failed"] == 0, status
+status, audit = (json.load(open(path)) for path in sys.argv[1:3])
+if status["failed"] != 0:
+    recovery = json.load(open(sys.argv[3]))
+    assert recovery["status"] == "RECOVERED_COMPLETE_VALID", recovery
+    assert recovery["original_status_failed"] == 1, recovery
 assert audit["status"] == "COMPLETE_VALID", audit
 assert audit["resolved"] == audit["expected"], audit
 for role, expected in {"prefix": 2721, "isolated_target": 5442, "native_target": 5442, "native_pred": 5442}.items():

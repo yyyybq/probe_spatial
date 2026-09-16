@@ -44,7 +44,7 @@ set +e; failed=0
 for pid in "${pids[@]}"; do wait "${pid}" || failed=$((failed + 1)); done
 set -e
 if (( failed == 0 )); then
-  "${PY}" scripts/d_series/audit_vjepa2_d_features.py \
+  PYTHONPATH="${FROZEN_ROOT}" "${PY}" scripts/d_series/audit_vjepa2_d_features.py \
     --manifest experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl \
     --feature-root "${FEATURE_ROOT}" --output "${REPORT}/feature_audit.json" \
     > "${REPORT}/feature_audit.log" 2>&1 || failed=$((failed + 1))
