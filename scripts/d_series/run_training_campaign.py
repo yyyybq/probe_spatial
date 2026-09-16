@@ -21,6 +21,8 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.d_series.feature_store import MANIFEST_SHA256
 from scripts.d_series.run_d1 import REVISIONS
 
+ACTIVE_MODELS = ("vjepa2_vitl256", "wan21_t2v_1p3b")
+
 
 @dataclass(frozen=True)
 class Task:
@@ -60,7 +62,7 @@ def completed(task: Task):
 
 def d1_tasks(args):
     tasks = []
-    model_specs = [(model, "isolated_target", branch) for model in REVISIONS for branch in ("spatial", "pooled", "linear_spatial")]
+    model_specs = [(model, "isolated_target", branch) for model in ACTIVE_MODELS for branch in ("spatial", "pooled", "linear_spatial")]
     model_specs += [("vjepa2_vitl256", "native_target", branch) for branch in ("spatial", "pooled")]
     for model, reference, branch in model_specs:
         for seed in (0, 1, 2):
@@ -75,7 +77,7 @@ def d1_tasks(args):
 
 def downstream_tasks(args):
     tasks = []
-    for model in REVISIONS:
+    for model in ACTIVE_MODELS:
         for seed in (0, 1, 2):
             source = args.run_root / "d1" / f"d1_{model}_isolated_target_pooled_s{seed}" / "checkpoint.pt"
             name = f"d2_{model}_s{seed}"

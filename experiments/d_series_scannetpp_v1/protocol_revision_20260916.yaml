@@ -1,0 +1,28 @@
+schema_version: 1
+revision_id: d_series_scope_r2_20260916
+effective_at_utc: 2026-09-16T00:00:00Z
+parent_protocol:
+  path: protocol.yaml
+  sha256: 234ca23861a32731dea0ce4961030b2faafc8c0c0f029d00010ca83f87720813
+  immutable: true
+change_authority: user_directive
+change_reason: User removed DINOv2 from the D-series scope; Wan and V-JEPA2 remain active.
+active_models:
+  - vjepa2_vitl256
+  - wan21_t2v_1p3b
+inactive_historical_models:
+  dinov2_vitl14:
+    reason: removed_by_user_scope_revision
+    preserve_existing_files_and_logs: true
+    new_extraction_or_training: false
+gates:
+  model_independent_canary: true
+  vjepa2_must_not_wait_for_wan: true
+  missing_dinov2_receipt_blocks_active_models: false
+formal_matrix:
+  models: [vjepa2_vitl256, wan21_t2v_1p3b]
+  seeds: [0, 1, 2]
+  branches: [spatial, pooled]
+diagnostic_matrix:
+  label: development-only / seed0 / diagnostic
+  vjepa2_first: true

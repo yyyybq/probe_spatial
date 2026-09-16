@@ -1,0 +1,138 @@
+{
+  "actual_read_evidence": [
+    {
+      "dtype": "torch.float32",
+      "finite": true,
+      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/00a231a370/fu_72e8fbafe33ecb30d8570182.safetensors",
+      "sha256": "9a7b401239ea8049d2e4ca1705eac7444581c7e87437a0070f830b346a5197b2",
+      "shape": [
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "finite": true,
+      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/2f5996ff01/fu_e4362608faf6eec456c12710.safetensors",
+      "sha256": "1c0f6bca87485c476b3603701fbe6b0390163988c40d94940a43b7f00df7ff29",
+      "shape": [
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "finite": true,
+      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/635852d56e/fu_4024f458e726b0196df36fda.safetensors",
+      "sha256": "816cb419b1554070ca42bf663ad173eb9ef14ddbb50e04b8ffd16caa40d158cc",
+      "shape": [
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "finite": true,
+      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/90d8e25cee/fu_5739c6bb4417cb9a2ade7f30.safetensors",
+      "sha256": "21a3c2b30cb803385fbbf60075f775fd261ba27f37feea6280beed1af98a6ad3",
+      "shape": [
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "finite": true,
+      "path": "features/independent_actionability_algebra_p8_final_v1_20260913/vjepa2/scannetpp/c178491bc5/fu_599c6266c28bbabb152cb147.safetensors",
+      "sha256": "a59a78b55cc29a24b5dc24f7d6f34bcfb3bd9262ebe63ba6414768095fcf1bfe",
+      "shape": [
+        1024
+      ]
+    }
+  ],
+  "d_series_manifest": "experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl",
+  "d_series_manifest_sha256": "781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9",
+  "expected": {
+    "dev_samples": 552,
+    "samples": 5442,
+    "scenes": 681,
+    "train_samples": 4890,
+    "windows": 2721
+  },
+  "mapping_csv": "experiments/d_series_scannetpp_v1/v2_reuse_mapping.csv",
+  "notes": [
+    "Exact matches are adapted, not called original-layout reuse, because the V2 tensor key/path schema differs.",
+    "No teacher/target latent is mapped to predictor input.",
+    "Unmatched and native roles must be extracted only as missing-role fills."
+  ],
+  "resolved": {
+    "dev_samples": 552,
+    "samples": 5442,
+    "scenes": 681,
+    "train_samples": 4890,
+    "windows": 2721
+  },
+  "roles": {
+    "isolated_target": {
+      "adapted_samples": 425,
+      "classification": "adapted",
+      "compatibility": "pooled only; exact target raw-frame identity; tensor key rename only",
+      "missing_samples": 5017,
+      "requested_samples": 5442,
+      "v2_actual_role": "isolated_frame"
+    },
+    "native_predictor_output": {
+      "classification": "missing",
+      "compatibility": "not present; no predictor output role exists in V2",
+      "missing_samples": 5442,
+      "requested_samples": 5442,
+      "reused_samples": 0,
+      "v2_actual_role": null
+    },
+    "native_target_reference": {
+      "classification": "missing",
+      "compatibility": "not present; isolated_frame is not a native full-teacher target reference",
+      "missing_samples": 5442,
+      "requested_samples": 5442,
+      "reused_samples": 0,
+      "v2_actual_role": null
+    },
+    "streaming_context": {
+      "adapted_windows": 0,
+      "classification": "missing",
+      "compatibility": "pooled only; exact ordered p8 identity; tensor key rename only",
+      "missing_windows": 2721,
+      "requested_windows": 2721,
+      "v2_actual_role": "streaming_context_p8"
+    }
+  },
+  "schema_version": 1,
+  "scope": "D-series to independent-P8 V2 V-JEPA2 exact reuse audit",
+  "selection_dependency_on_overlap_geometry": false,
+  "spatial_branch": {
+    "classification": "incompatible",
+    "reason": "V2 deliberately stores only a pooled vector; spatial tokens cannot be reconstructed reversibly",
+    "reused_samples": 0
+  },
+  "status": "COMPLETE_VALID",
+  "v2": {
+    "checkpoint": "facebook/vjepa2-vitl-fpc64-256",
+    "context_padding": "repeat_tail to 64 frames",
+    "coverage_receipt": "results/independent_actionability_algebra_p8_final_v1_20260913/coverage/vjepa2_coverage_receipt.json",
+    "coverage_receipt_sha256": "adbd0a972ae60126b6771e3c2c0268dcf75fbf5205561197fc21ea443096e903",
+    "feature_root": "features/independent_actionability_algebra_p8_final_v1_20260913",
+    "isolated_padding": "repeat_single_frame to 64 frames",
+    "layer_zero_based": 23,
+    "pooling": "FP32 mean over every returned temporal and spatial token",
+    "preprocessing": "resize shortest edge 292, center crop 256, ImageNet normalization",
+    "raw_layout": [
+      32,
+      16,
+      16,
+      1024
+    ],
+    "request_manifest": "artifacts/independent_actionability_algebra_p8_20260831T091224Z_28bda217/manifests/feature_request_manifest_v2.jsonl",
+    "request_manifest_sha256": "fb1dbd2d71878edae7eae9034a16ee9809fc0c0cfb67352e0a301ad0edbed369",
+    "revision": "b3c1679b7c34d3255ef3547f27c7b226aefab26f",
+    "stored_layout": [
+      1024
+    ],
+    "vjepa2_units": 12358
+  }
+}

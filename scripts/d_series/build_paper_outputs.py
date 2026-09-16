@@ -25,12 +25,12 @@ from vidfm3d.utils.layout_metrics import scene_cluster_paired_bootstrap, scene_m
 
 REQUIRED = {
     "D1": {
-        "models": ["vjepa2_vitl256", "wan21_t2v_1p3b", "dinov2_vitl14"],
+        "models": ["vjepa2_vitl256", "wan21_t2v_1p3b"],
         "branches": ["spatial", "pooled"],
         "conditions": ["true_target", "train_layout_prior", "within_scene_wrong_target", "across_scene_shuffled_target", "last_context", "zero", "random", "spatial_token_shuffle"],
     },
     "D2": {
-        "models": ["vjepa2_vitl256", "wan21_t2v_1p3b", "dinov2_vitl14"],
+        "models": ["vjepa2_vitl256", "wan21_t2v_1p3b"],
         "branches": ["pooled"],
         "conditions": ["true_motion", "identity_motion", "matched_horizon_shuffled_motion", "independently_trained_context_only", "last_context", "train_layout_prior", "true_pooled_target_reference"],
     },

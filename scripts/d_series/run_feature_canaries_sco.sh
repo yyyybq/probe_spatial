@@ -22,36 +22,31 @@ test -s "${REPORT}/source_snapshot.tar.gz"
 export D_SERIES_BASE_COMMIT=${D_SERIES_BASE_COMMIT:-$(cat "${REPORT}/base_commit.txt")}
 export D_SERIES_GIT_DIRTY=${D_SERIES_GIT_DIRTY:-$(cat "${REPORT}/git_dirty.txt")}
 
-cd "${PROJECT_ROOT}"
+FROZEN_ROOT=$(mktemp -d "/tmp/dseries_${RUN_TAG}_source.XXXXXX")
+tar -xzf "${REPORT}/source_snapshot.tar.gz" -C "${FROZEN_ROOT}"
+printf '%s\n' "${FROZEN_ROOT}" > "${REPORT}/executed_source_root.txt"
+sha256sum "${REPORT}/source_snapshot.tar.gz" > "${REPORT}/executed_source_snapshot.sha256"
+cd "${FROZEN_ROOT}"
 set +e
+CUDA_VISIBLE_DEVICES=0 "${PY}" scripts/d_series/vjepa2_v2_canary.py \
+    --manifest experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl \
+    --mapping experiments/d_series_scannetpp_v1/v2_reuse_mapping.csv \
+    --coverage-receipt results/independent_actionability_algebra_p8_final_v1_20260913/coverage/vjepa2_coverage_receipt.json \
+    --scene-root "${SCENE_ROOT}" --output "${REPORT}/vjepa2_v2_pooled_canary.json" \
+    > "${REPORT}/vjepa2_v2.log" 2>&1
+rc_v2=$?
 ( CUDA_VISIBLE_DEVICES=0 "${PY}" scripts/d_series/extract_vjepa2.py \
-    --scene-root "${SCENE_ROOT}" --output-root "${OUT}" --canary-only && \
+    --scene-root "${SCENE_ROOT}" --output-root "${OUT}" --canary-only \
+    --model-source "${PROJECT_ROOT}/model_cache/models--facebook--vjepa2-vitl-fpc64-256/snapshots/b3c1679b7c34d3255ef3547f27c7b226aefab26f" && \
   CUDA_VISIBLE_DEVICES=0 "${PY}" scripts/d_series/overfit_canary.py --model vjepa2_vitl256 \
     --reference native_target --branch spatial --scene-root "${SCENE_ROOT}" --feature-root "${OUT}" \
     --output "${REPORT}/vjepa2_native_spatial_overfit.json" ) \
   > "${REPORT}/vjepa2.log" 2>&1 &
 pid_vjepa=$!
-( CUDA_VISIBLE_DEVICES=1 "${PY}" scripts/d_series/extract_dinov2.py \
-    --scene-root "${SCENE_ROOT}" --output-root "${OUT}" --canary-only && \
-  CUDA_VISIBLE_DEVICES=1 "${PY}" scripts/d_series/overfit_canary.py --model dinov2_vitl14 \
-    --branch spatial --scene-root "${SCENE_ROOT}" --feature-root "${OUT}" \
-    --output "${REPORT}/dinov2_spatial_overfit.json" ) \
-  > "${REPORT}/dinov2.log" 2>&1 &
-pid_dino=$!
-( CUDA_VISIBLE_DEVICES=2 WAN_T2V_DTYPE=bf16 "${PY}" scripts/d_series/extract_wan.py \
-    --scene-root "${SCENE_ROOT}" --output-root "${OUT}" --canary-only && \
-  CUDA_VISIBLE_DEVICES=2 "${PY}" scripts/d_series/overfit_canary.py --model wan21_t2v_1p3b \
-    --branch spatial --scene-root "${SCENE_ROOT}" --feature-root "${OUT}" \
-    --output "${REPORT}/wan_spatial_overfit.json" ) \
-  > "${REPORT}/wan.log" 2>&1 &
-pid_wan=$!
-
 wait "${pid_vjepa}"; rc_vjepa=$?
-wait "${pid_dino}"; rc_dino=$?
-wait "${pid_wan}"; rc_wan=$?
 set -e
 ended=$(date -u +%FT%TZ)
-printf '{"run_tag":"%s","ended_utc":"%s","vjepa2_rc":%d,"dinov2_rc":%d,"wan_rc":%d}\n' \
-  "${RUN_TAG}" "${ended}" "${rc_vjepa}" "${rc_dino}" "${rc_wan}" > "${REPORT}/status.json"
+printf '{"run_tag":"%s","ended_utc":"%s","scope":"vjepa2_independent","vjepa2_v2_rc":%d,"vjepa2_native_rc":%d}\n' \
+  "${RUN_TAG}" "${ended}" "${rc_v2}" "${rc_vjepa}" > "${REPORT}/status.json"
 cp "${REPORT}/source_hashes.sha256" "${REPORT}/launcher_hashes.sha256"
-(( rc_vjepa == 0 && rc_dino == 0 && rc_wan == 0 ))
+(( rc_v2 == 0 && rc_vjepa == 0 ))

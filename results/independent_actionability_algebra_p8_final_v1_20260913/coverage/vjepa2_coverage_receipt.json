@@ -1,0 +1,34 @@
+{
+  "coverage_contract": "requested == verified; missing == duplicate == fallback == raw-ID mismatch == nonfinite == zero/constant == 0",
+  "duplicate_feature_paths": [],
+  "duplicates": 0,
+  "extraction_contract_sha256": {
+    "29604bd7ce2d9705ff01db066691ac2eb5ecd56b95e8d7abced0706caf594daf": 12358
+  },
+  "fallback": 0,
+  "feature_root": "/mnt/umm/users/yinbaiqiao/probe_spatial/features/independent_actionability_algebra_p8_final_v1_20260913",
+  "missing_or_invalid": 0,
+  "model": "vjepa2",
+  "model_revision": {
+    "b3c1679b7c34d3255ef3547f27c7b226aefab26f": 12358
+  },
+  "nonfinite": 0,
+  "problems": [],
+  "raw_id_or_contract_mismatch": 0,
+  "request_manifest": "/mnt/umm/users/yinbaiqiao/probe_spatial/artifacts/independent_actionability_algebra_p8_20260831T091224Z_28bda217/manifests/feature_request_manifest_v2.jsonl",
+  "request_manifest_sha256": "fb1dbd2d71878edae7eae9034a16ee9809fc0c0cfb67352e0a301ad0edbed369",
+  "requested": 12358,
+  "schema_version": 1,
+  "science_tag": "independent_actionability_algebra_p8_final_v1_20260913",
+  "scope": "full_model_request",
+  "shape_counts": {
+    "[1024]": 12358
+  },
+  "snapshot_tree_sha256": {
+    "d0f9af5294aafd55b4474c378dc3ee00be00652a60be54a0db6bcba1842971b9": 12358
+  },
+  "status": "COMPLETE_VALID",
+  "study_protocol_sha256": "6bf96b1d30cb2d9e55126fdbc2ecca1a62a25d13d1123c2066a614d2455d6fb4",
+  "verified": 12358,
+  "zero_or_constant": 0
+}

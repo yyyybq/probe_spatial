@@ -31,6 +31,7 @@ from scripts.d_series.feature_store import MANIFEST_SHA256, code_provenance, sta
 MODEL = "vjepa2_vitl256"
 MODEL_ID = "facebook/vjepa2-vitl-fpc64-256"
 REVISION = "b3c1679b7c34d3255ef3547f27c7b226aefab26f"
+DEFAULT_MODEL_SOURCE = REPO_ROOT / "model_cache/models--facebook--vjepa2-vitl-fpc64-256/snapshots" / REVISION
 
 
 def load_rgb(scene_root: Path, row, names):
@@ -82,7 +83,13 @@ def assert_full_chain_future_invariance(model, processor, observed, other_scene_
         maxima[str(obs)] = max(float((candidate[obs] - outputs[0][obs]).abs().max()) for candidate in outputs[1:])
         if not all(torch.allclose(candidate[obs], outputs[0][obs], atol=atol, rtol=rtol) for candidate in outputs[1:]):
             raise AssertionError(f"future-invariance failed at target observation {obs}: {maxima[str(obs)]}")
-    return {"variants": ["real_future", "zeros", "noise", "other_scene"], "max_abs_difference": maxima}
+    return {
+        "variants": ["real_future", "zeros", "noise", "other_scene"],
+        "max_abs_difference": maxima,
+        "prediction_cache_used": False,
+        "independent_predictor_calls": 4,
+        "fixed_random_seed": 0,
+    }
 
 
 def main():
@@ -92,6 +99,7 @@ def main():
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--parent-manifest", type=Path, default=Path("artifacts/tstep_canonical_v2/manifests/inscene_c_h124_prefix8.jsonl"))
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--model-source", type=Path, default=DEFAULT_MODEL_SOURCE)
     parser.add_argument("--window-start", type=int, default=0)
     parser.add_argument("--max-windows", type=int)
     parser.add_argument("--canary-only", action="store_true")
@@ -115,13 +123,18 @@ def main():
     other_names = [other_parent["valid_frames"][i] for i in other_parent["streaming_window_indices"][:12]]
     other_observed = load_rgb(args.scene_root, other_rows[0], other_names)
 
-    processor = AutoVideoProcessor.from_pretrained(MODEL_ID, revision=REVISION)
+    model_source = args.model_source.resolve()
+    if not model_source.is_dir():
+        raise FileNotFoundError(f"missing frozen V-JEPA2 snapshot: {model_source}")
+    processor = AutoVideoProcessor.from_pretrained(model_source, local_files_only=True)
     model = AutoModel.from_pretrained(
-        MODEL_ID, revision=REVISION, torch_dtype=torch.float16, attn_implementation="sdpa",
+        model_source, local_files_only=True, torch_dtype=torch.float16, attn_implementation="sdpa",
     ).to(args.device).eval()
     base_receipt = {
         "model_id": MODEL_ID,
         "model_revision": REVISION,
+        "model_source": str(model_source),
+        "local_files_only": True,
         "layer_zero_based": 23,
         "final_layernorm": True,
         "preprocess": "checkpoint resize-short-edge-292 center-crop-256 imagenet-normalize",
@@ -130,7 +143,16 @@ def main():
         Path(__file__), REPO_ROOT / "scripts/d_series/feature_store.py",
         REPO_ROOT / "features/vjepa2/native_predictor.py",
     ])
-    audit = {"windows_requested": len(selected), "windows_completed": 0, "future_invariance": None}
+    audit = {
+        "windows_requested": len(selected), "windows_completed": 0, "future_invariance": None,
+        "model_source": str(model_source), "local_files_only": True,
+        "horizon_token_mapping": {
+            "h2": {"target_observation_index": 9, "target_tubelet": 4},
+            "h4": {"target_observation_index": 11, "target_tubelet": 5},
+            "distinct": True,
+        },
+        "native_prediction_h2_h4_max_abs_difference": None,
+    }
 
     with torch.inference_mode():
         for parent_id, horizon_rows in selected:
@@ -142,6 +164,11 @@ def main():
             observed = load_rgb(args.scene_root, first, observed_names)
             teacher_pixels = process(processor, pad64(observed), args.device)
             pred = predict_future_tubelets(model, teacher_pixels)
+            if audit["native_prediction_h2_h4_max_abs_difference"] is None:
+                difference = float((pred[9] - pred[11]).abs().max())
+                if difference <= 0:
+                    raise AssertionError("h2 and h4 native predictions are unexpectedly identical")
+                audit["native_prediction_h2_h4_max_abs_difference"] = difference
             reference = native_target_reference(model, teacher_pixels)
             shuffled_pixels = process(processor, pad64(order_control(observed, parent_id)), args.device)
             shuffled_pred = predict_future_tubelets(model, shuffled_pixels)

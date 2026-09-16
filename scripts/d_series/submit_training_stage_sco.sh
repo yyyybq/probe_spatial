@@ -14,7 +14,7 @@ cd "${PROJECT_ROOT}"
 case "${STAGE}" in
   d1)
     [[ -n "${FEATURE_RUN}" ]] || { echo "FEATURE_RUN must identify the completed full-feature run" >&2; exit 2; }
-    for model in vjepa2_vitl256 dinov2_vitl14 wan21_t2v_1p3b; do
+    for model in vjepa2_vitl256 wan21_t2v_1p3b; do
       status="experiments/d_series_scannetpp_v1/runs/${FEATURE_RUN}/${model}/status.json"
       test -f "${status}"
       /mnt/umm/users/yinbaiqiao/.conda/envs/probe-spatial/bin/python - "${status}" <<'PY'

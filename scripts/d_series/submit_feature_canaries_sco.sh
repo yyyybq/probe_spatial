@@ -11,8 +11,9 @@ mkdir -p "${REPORT}/launcher"
 cd "${PROJECT_ROOT}"
 test "$(sha256sum experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl | awk '{print $1}')" = \
   781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
-for path in scripts/d_series/extract_vjepa2.py scripts/d_series/extract_dinov2.py \
-  scripts/d_series/extract_wan.py scripts/d_series/run_feature_canaries_sco.sh; do
+for path in scripts/d_series/extract_vjepa2.py scripts/d_series/vjepa2_v2_canary.py \
+  scripts/d_series/run_feature_canaries_sco.sh experiments/d_series_scannetpp_v1/v2_reuse_mapping.csv \
+  results/independent_actionability_algebra_p8_final_v1_20260913/coverage/vjepa2_coverage_receipt.json; do
   test -f "${path}"
 done
 PROJECT_ROOT="${PROJECT_ROOT}" PROVENANCE_DIR="${REPORT}/launcher" \
@@ -32,7 +33,7 @@ sco acp jobs create \
   --storage-mount=019ec9f9-6d12-7d49-aad4-864b15c9eb06:/mnt/umm \
   --training-framework=pytorch \
   --worker-nodes=1 \
-  --worker-spec=N4lS.Iq.I80.4 \
+  --worker-spec=N4lS.Iq.I80.1 \
   --command="${command}" | tee "${REPORT}/launcher/sco_submit.log"
 grep -oE 'pt-[a-z0-9]+' "${REPORT}/launcher/sco_submit.log" | awk '!seen[$0]++' > "${REPORT}/launcher/job_ids.txt"
 job_id=$(head -1 "${REPORT}/launcher/job_ids.txt")
