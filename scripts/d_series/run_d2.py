@@ -153,16 +153,28 @@ def main():
     p.add_argument("--motion-thresholds", type=Path, default=Path("experiments/d_series_scannetpp_v1/data/motion_bin_thresholds.json"))
     p.add_argument("--scene-root", type=Path, required=True); p.add_argument("--feature-root", type=Path, required=True)
     p.add_argument("--d1-checkpoint", type=Path, required=True); p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--feature-audit-receipt", type=Path)
     p.add_argument("--batch-size", type=int, default=32); p.add_argument("--max-epochs", type=int, default=40)
     p.add_argument("--patience", type=int, default=6); p.add_argument("--num-workers", type=int, default=4)
     args = p.parse_args()
     if sha256(args.manifest) != MANIFEST_SHA256: raise ValueError("manifest hash mismatch")
     rows = [json.loads(line) for line in args.manifest.open()]
     train_rows, dev_rows = ([r for r in rows if r["split"] == split] for split in ("train", "dev"))
-    for row in rows:
-        load_verified(args.feature_root, args.model, "isolated_target", row["sample_id"], REVISIONS[args.model])
-    for parent in sorted({row["parent_sample_id"] for row in rows}):
-        load_verified(args.feature_root, args.model, "prefix", parent, REVISIONS[args.model])
+    if args.feature_audit_receipt is not None:
+        audit = json.loads(args.feature_audit_receipt.read_text())
+        expected_samples = {"expected": len(rows), "complete": len(rows)}
+        expected_parents = {"expected": len({row['parent_sample_id'] for row in rows}),
+                            "complete": len({row['parent_sample_id'] for row in rows})}
+        if (audit.get("status") != "COMPLETE_VALID" or audit.get("manifest_sha256") != MANIFEST_SHA256
+                or audit.get("model") != args.model
+                or audit.get("roles", {}).get("isolated_target") != expected_samples
+                or audit.get("roles", {}).get("prefix") != expected_parents):
+            raise ValueError("feature audit receipt does not cover D2 inputs")
+    else:
+        for row in rows:
+            load_verified(args.feature_root, args.model, "isolated_target", row["sample_id"], REVISIONS[args.model])
+        for parent in sorted({row["parent_sample_id"] for row in rows}):
+            load_verified(args.feature_root, args.model, "prefix", parent, REVISIONS[args.model])
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train = PredictorDataset(train_rows, args.feature_root, args.model); dev = PredictorDataset(dev_rows, args.feature_root, args.model)
@@ -213,7 +225,8 @@ def main():
     with (args.output_dir / "per_sample_metrics.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(records[0]), lineterminator="\n"); writer.writeheader(); writer.writerows(records)
     receipt = {"schema_version": 1, "experiment": "D2", "status": "complete_development_evaluation",
-               "source_run": source_run, "model": args.model, "model_revision": REVISIONS[args.model], "seed": args.seed,
+               "source_run": source_run, "model": args.model, "model_revision": REVISIONS[args.model],
+               "branch": "pooled", "seed": args.seed,
                "manifest_sha256": MANIFEST_SHA256, "d1_checkpoint": str(args.d1_checkpoint.resolve()),
                "d1_checkpoint_sha256": sha256(args.d1_checkpoint),
                "train_scenes_sha256": sha256(args.manifest.parent / "train_scenes.txt"),
@@ -227,6 +240,8 @@ def main():
                    REPO_ROOT / "vidfm3d/models/components/probe_layout_readout.py",
                    REPO_ROOT / "vidfm3d/utils/layout_metrics.py",
                ])
+    receipt["feature_audit_receipt"] = str(args.feature_audit_receipt.resolve()) if args.feature_audit_receipt else None
+    receipt["feature_audit_receipt_sha256"] = sha256(args.feature_audit_receipt) if args.feature_audit_receipt else None
     (args.output_dir / "run_receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
 
 
