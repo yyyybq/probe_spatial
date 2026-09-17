@@ -119,7 +119,7 @@ def main() -> int:
         writer.writeheader(); writer.writerows(records)
     receipt = {
         "schema_version": 1, "experiment": "D3", "phase": "AB", "status": "complete_development_evaluation",
-        "diagnostic_label": "development-only / seed0 / diagnostic", "source_run": args.output_dir.name,
+        "diagnostic_label": f"development-only / seed{args.seed} / diagnostic", "source_run": args.output_dir.name,
         "model": MODEL, "model_revision": REVISIONS[MODEL], "branch": args.branch, "seed": args.seed,
         "manifest_sha256": MANIFEST_SHA256, "native_d1_checkpoint": str(args.native_d1_checkpoint.resolve()),
         "native_d1_checkpoint_sha256": sha256(args.native_d1_checkpoint), "depth_only": True,
