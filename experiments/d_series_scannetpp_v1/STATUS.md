@@ -8,6 +8,8 @@ The missing-role extraction job `pt-a7v0cmx6` completed all 2,721 window shards 
 
 Seed0 worker `pt-ca3z0nnl` completed its local frozen-source chain at 2026-09-17 00:37:08 UTC with `d1_failed=0`, `d3_ab_failed=0`, and `d3_cd_failed=0`. The 92-row diagnostic table and 12-example qualitative index are under `diagnostics/dseries_vjepa2_seed0_20260916_h800_r1/`; checkpoints, curves, receipts, and per-sample rows are under `diagnostic_runs/dseries_vjepa2_seed0_20260916_h800_r1/`.
 
+V-JEPA2 seed1 job `pt-hfosgdj8` and seed2 job `pt-8ykywqfl` were submitted to zoetrope at 2026-09-17 05:04 UTC with `HIGHEST` priority and exactly one H800 each. Both scheduler records are `RUNNING`, and each worker has entered its first serial stage (`d1_isolated_spatial_s1` / `d1_isolated_spatial_s2`). They are not counted as completed. Each job runs four D1 cells followed by D3 A/B and A/B/C/D for spatial and pooled branches, and validates completed stage receipts before resume.
+
 Seed0 scene-macro normalized-depth MAE highlights (h2 / h4):
 
 | experiment | branch/reference | h2 | h4 |
@@ -39,7 +41,7 @@ Completed gates:
 Remaining evidence gates:
 
 - formal matched Wan caches, especially layer20/index749;
-- V-JEPA2 seeds 1/2 and the remaining active Wan+V-JEPA2 formal matrix;
+- completion and aggregation of the running V-JEPA2 seeds 1/2 jobs, plus the remaining active Wan+V-JEPA2 formal matrix;
 - formal three-seed aggregation, plots, paper section, and slides from real records.
 
 Any table builder must fail closed while required records are absent. Historical pilot values must never be copied into the formal tables.
