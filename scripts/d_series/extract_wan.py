@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -18,7 +18,13 @@ import torch
 from PIL import Image
 
 from features.wan.wan_feature import get_wan_featurizer
-from scripts.d_series.feature_store import MANIFEST_SHA256, code_provenance, stable_seed, write_feature
+from scripts.d_series.feature_store import (
+    MANIFEST_SHA256,
+    code_provenance,
+    load_verified,
+    stable_seed,
+    write_feature,
+)
 
 
 MODEL = "wan21_t2v_1p3b"
@@ -58,6 +64,24 @@ def encode(model, frames, key):
     return raw[0].reshape(21, 30, 52, raw.shape[-1])
 
 
+def complete_feature(root: Path, space: str, sample_id: str, expected_tensors, expected_receipt):
+    try:
+        tensors, receipt = load_verified(root, MODEL, space, sample_id, REVISION)
+    except (FileNotFoundError, ValueError):
+        return False
+    actual = {key: list(value.shape) for key, value in tensors.items()}
+    if actual != expected_tensors:
+        raise RuntimeError(f"existing {space}/{sample_id} tensor contract mismatch: {actual}")
+    failures = {
+        key: (receipt.get(key), value)
+        for key, value in expected_receipt.items()
+        if receipt.get(key) != value
+    }
+    if failures:
+        raise RuntimeError(f"existing {space}/{sample_id} receipt mismatch: {failures}")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=Path("experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl"))
@@ -65,6 +89,8 @@ def main():
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--window-start", type=int, default=0)
     parser.add_argument("--max-windows", type=int)
+    parser.add_argument("--selection-file", type=Path)
+    parser.add_argument("--shard-id")
     parser.add_argument("--canary-only", action="store_true")
     args = parser.parse_args()
     if hashlib.sha256(args.manifest.read_bytes()).hexdigest() != MANIFEST_SHA256:
@@ -73,7 +99,20 @@ def main():
     for line in args.manifest.open():
         row = json.loads(line)
         windows[row["parent_sample_id"]].append(row)
-    selected = sorted(windows.items())[args.window_start:]
+    selected = sorted(windows.items())
+    selection_ids = None
+    if args.selection_file is not None:
+        values = [line.strip() for line in args.selection_file.read_text().splitlines() if line.strip()]
+        if not values or len(values) != len(set(values)):
+            raise ValueError("selection file must contain unique non-empty parent sample IDs")
+        selection_ids = set(values)
+        unknown = selection_ids - set(windows)
+        if unknown:
+            raise ValueError(f"selection contains unknown parents: {sorted(unknown)[:5]}")
+        selected = [item for item in selected if item[0] in selection_ids]
+        if len(selected) != len(selection_ids):
+            raise RuntimeError("selection coverage mismatch")
+    selected = selected[args.window_start:]
     if args.max_windows is not None:
         selected = selected[:args.max_windows]
     if args.canary_only:
@@ -95,29 +134,55 @@ def main():
         Path(__file__), REPO_ROOT / "scripts/d_series/feature_store.py",
         REPO_ROOT / "features/wan/wan_feature.py", REPO_ROOT / "features/noise_seed.py",
     ])
+    counters = Counter()
     with torch.inference_mode():
         for number, (parent_id, rows) in enumerate(selected, 1):
             rows.sort(key=lambda row: row["horizon"])
             first = rows[0]
-            prefix_frames = load_images(args.scene_root, first, first["prefix_frame_names"])
-            prefix = encode(model, prefix_frames, f"prefix:{parent_id}")
-            context_only = encode(model, [prefix_frames[-1]], f"last_context:{parent_id}")[10]
-            write_feature(args.output_root, MODEL, "prefix", parent_id, {
-                "context_spatial": context_only.half(),
-                "context_pooled_sequence": prefix.mean((1, 2)).half(),
-            }, receipt | {"raw_frame_ids": first["prefix_raw_frame_ids"], "future_rgb_access": False})
+            prefix_expected = receipt | {
+                "raw_frame_ids": first["prefix_raw_frame_ids"], "future_rgb_access": False,
+            }
+            if complete_feature(
+                args.output_root, "prefix", parent_id,
+                {"context_pooled_sequence": [21, 1536], "context_spatial": [30, 52, 1536]},
+                prefix_expected,
+            ):
+                counters["prefix_skipped_complete"] += 1
+            else:
+                prefix_frames = load_images(args.scene_root, first, first["prefix_frame_names"])
+                prefix = encode(model, prefix_frames, f"prefix:{parent_id}")
+                context_only = encode(model, [prefix_frames[-1]], f"last_context:{parent_id}")[10]
+                write_feature(args.output_root, MODEL, "prefix", parent_id, {
+                    "context_spatial": context_only.half(),
+                    "context_pooled_sequence": prefix.mean((1, 2)).half(),
+                }, prefix_expected)
+                counters["prefix_extracted"] += 1
             for row in rows:
-                target_frame = load_images(args.scene_root, row, [row["target_frame_name"]])
-                target = encode(model, target_frame, f"target:{row['sample_id']}")[10]
-                write_feature(args.output_root, MODEL, "isolated_target", row["sample_id"], {
-                    "spatial": target.half(), "pooled": target.mean((0, 1)).half(),
-                }, receipt | {"horizon": row["horizon"], "target_raw_frame_id": row["target_raw_frame_id"]})
+                target_expected = receipt | {
+                    "horizon": row["horizon"], "target_raw_frame_id": row["target_raw_frame_id"],
+                }
+                if complete_feature(
+                    args.output_root, "isolated_target", row["sample_id"],
+                    {"pooled": [1536], "spatial": [30, 52, 1536]}, target_expected,
+                ):
+                    counters[f"h{row['horizon']}_skipped_complete"] += 1
+                else:
+                    target_frame = load_images(args.scene_root, row, [row["target_frame_name"]])
+                    target = encode(model, target_frame, f"target:{row['sample_id']}")[10]
+                    write_feature(args.output_root, MODEL, "isolated_target", row["sample_id"], {
+                        "spatial": target.half(), "pooled": target.mean((0, 1)).half(),
+                    }, target_expected)
+                    counters[f"h{row['horizon']}_extracted"] += 1
             print(json.dumps({"completed": number, "parent_sample_id": parent_id}), flush=True)
     args.output_root.mkdir(parents=True, exist_ok=True)
-    (args.output_root / f"wan_audit_{args.window_start}_{len(selected)}.json").write_text(
+    audit_key = args.shard_id or f"{args.window_start}_{len(selected)}"
+    (args.output_root / f"wan_shard_{audit_key}.json").write_text(
         json.dumps({
             "windows_requested": len(selected), "windows_completed": len(selected),
             "resolved_scheduler_timestep": actual_timestep,
+            "selection_file": str(args.selection_file.resolve()) if args.selection_file else None,
+            "selection_sha256": hashlib.sha256(args.selection_file.read_bytes()).hexdigest() if args.selection_file else None,
+            "counts": dict(counters),
         }, indent=2) + "\n"
     )
 

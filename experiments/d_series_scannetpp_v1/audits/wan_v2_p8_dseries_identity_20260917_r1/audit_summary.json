@@ -1,0 +1,116 @@
+{
+  "canonical_p8_manifest": "/mnt/umm/users/yinbaiqiao/probe_spatial/artifacts/tstep_canonical_v2/manifests/inscene_c_h124_prefix8.jsonl",
+  "canonical_p8_manifest_sha256": "20976fc86abfdc96d40446a0fe15fc32af699369309c540f9a352e868ce89f91",
+  "canonical_v2_candidate_contract": {
+    "layer20_route_catalog_disposition": "REEXTRACT_IDENTITY_MISMATCH",
+    "legacy_p8_exact_full_layers": [
+      0,
+      5,
+      10,
+      15,
+      25,
+      29
+    ],
+    "prompt": "."
+  },
+  "development_only": true,
+  "dseries_contract": {
+    "layer_zero_based": 20,
+    "model_revision": "0fad780a534b6463e45facd96134c9f345acfa5b",
+    "noise_seed_scheme": "sha256(42|role:sample_id)_uint32_little_endian",
+    "prompt": "",
+    "timestep_argument": 749
+  },
+  "dseries_manifest": "/mnt/umm/users/yinbaiqiao/probe_spatial/experiments/d_series_scannetpp_v1/data/sample_manifest.jsonl",
+  "dseries_manifest_sha256": "781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9",
+  "frame_identity_counts": {
+    "h2_exact": 2721,
+    "h4_exact": 2721,
+    "prefix_exact": 2721
+  },
+  "gap_file": "/mnt/umm/users/yinbaiqiao/probe_spatial/experiments/d_series_scannetpp_v1/audits/wan_v2_p8_dseries_identity_20260917_r1/gap_windows.jsonl",
+  "gap_role_counts": {
+    "h2_gap": 2721,
+    "h4_gap": 2721,
+    "prefix_gap": 2721
+  },
+  "gap_sha256": "264cb51b0c89929c256a1823aa3756235f001d8cc3cecda0fac4416d7d341cdc",
+  "incompatibilities": [
+    "required_layer20_not_present_in_legacy_p8_exact_full_layers_0_5_10_15_25_29",
+    "canonical_v2_wan_prompt_literal_dot_but_dseries_requires_empty_prompt",
+    "canonical_v2_noise_identity_not_dseries_sha256_42_pipe_role_and_sample_id"
+  ],
+  "mapping_file": "/mnt/umm/users/yinbaiqiao/probe_spatial/experiments/d_series_scannetpp_v1/audits/wan_v2_p8_dseries_identity_20260917_r1/identity_mapping.jsonl",
+  "mapping_sha256": "22f65616303a28bbf3fdd60d5325398d9c23376d9fc5d7c7f8891f7313695f5a",
+  "num_shards": 6,
+  "reusable_role_counts": {
+    "h2": 0,
+    "h4": 0,
+    "prefix": 0
+  },
+  "role_count": 8163,
+  "shards": [
+    {
+      "first_parent_sample_id": "00777c41d4_w000_p8",
+      "last_parent_sample_id": "c178491bc5_w001_p8",
+      "role_count": 1362,
+      "scene_count": 454,
+      "selection_file": "/mnt/umm/users/yinbaiqiao/probe_spatial/experiments/d_series_scannetpp_v1/audits/wan_v2_p8_dseries_identity_20260917_r1/shard_00_parent_ids.txt",
+      "selection_sha256": "7df202a901240178ecd2f0a84fea7207cc5c424ed9e57188f435c8a13470e7a8",
+      "shard": 0,
+      "window_count": 454
+    },
+    {
+      "first_parent_sample_id": "00777c41d4_w001_p8",
+      "last_parent_sample_id": "c178491bc5_w002_p8",
+      "role_count": 1362,
+      "scene_count": 454,
+      "selection_file": "/mnt/umm/users/yinbaiqiao/probe_spatial/experiments/d_series_scannetpp_v1/audits/wan_v2_p8_dseries_identity_20260917_r1/shard_01_parent_ids.txt",
+      "selection_sha256": "00d4e2ddb73770dd9186a1212c1d31cb3deb8f31ab48b4cdd4fa63c8a1be64ab",
+      "shard": 1,
+      "window_count": 454
+    },
+    {
+      "first_parent_sample_id": "00777c41d4_w002_p8",
+      "last_parent_sample_id": "c178491bc5_w003_p8",
+      "role_count": 1362,
+      "scene_count": 454,
+      "selection_file": "/mnt/umm/users/yinbaiqiao/probe_spatial/experiments/d_series_scannetpp_v1/audits/wan_v2_p8_dseries_identity_20260917_r1/shard_02_parent_ids.txt",
+      "selection_sha256": "0aa0b821ac2d7b62f7f7b69392cca0a8fa41a0fab8ec4a49fd16c4ffa9e84b09",
+      "shard": 2,
+      "window_count": 454
+    },
+    {
+      "first_parent_sample_id": "00777c41d4_w003_p8",
+      "last_parent_sample_id": "c173f62b15_w002_p8",
+      "role_count": 1359,
+      "scene_count": 453,
+      "selection_file": "/mnt/umm/users/yinbaiqiao/probe_spatial/experiments/d_series_scannetpp_v1/audits/wan_v2_p8_dseries_identity_20260917_r1/shard_03_parent_ids.txt",
+      "selection_sha256": "c0bf8612625ac99fad90f24184fa66c4f16910237db83008fb10060ff596b671",
+      "shard": 3,
+      "window_count": 453
+    },
+    {
+      "first_parent_sample_id": "00a231a370_w000_p8",
+      "last_parent_sample_id": "c173f62b15_w003_p8",
+      "role_count": 1359,
+      "scene_count": 453,
+      "selection_file": "/mnt/umm/users/yinbaiqiao/probe_spatial/experiments/d_series_scannetpp_v1/audits/wan_v2_p8_dseries_identity_20260917_r1/shard_04_parent_ids.txt",
+      "selection_sha256": "acd38921fe5b2f47b0b5ce2974a99c75e80a92a647dbc8166c0daeb8702ac3c9",
+      "shard": 4,
+      "window_count": 453
+    },
+    {
+      "first_parent_sample_id": "00a231a370_w001_p8",
+      "last_parent_sample_id": "c178491bc5_w000_p8",
+      "role_count": 1359,
+      "scene_count": 453,
+      "selection_file": "/mnt/umm/users/yinbaiqiao/probe_spatial/experiments/d_series_scannetpp_v1/audits/wan_v2_p8_dseries_identity_20260917_r1/shard_05_parent_ids.txt",
+      "selection_sha256": "9f0f7a19e9d42d4d5a129df147d99ab15f37c7755bf52656274502a83d25b00b",
+      "shard": 5,
+      "window_count": 453
+    }
+  ],
+  "status": "COMPLETE_EXACT_IDENTITY_ZERO_NUMERICAL_REUSE",
+  "window_count": 2721
+}
