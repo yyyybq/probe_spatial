@@ -1,6 +1,6 @@
 # Execution status
 
-The frozen dataset now has a complete real V-JEPA2 **development-only / three-seed** D1/D3 result. This is not the final Wan+V-JEPA2 paper table: V-JEPA2 D2 is running, Wan remains incomplete, and there is no held-out test split. This file is intentionally explicit so a diagnostic or submitted job cannot be mistaken for completed formal evidence.
+The frozen dataset now has complete real V-JEPA2 **development-only / three-seed** D1/D2/D3 runs. This is not the final Wan+V-JEPA2 paper table: Wan feature extraction and its D1/D2 matrix remain incomplete, and there is no held-out test split. This file is intentionally explicit so a diagnostic or submitted job cannot be mistaken for completed formal evidence.
 
 Canary scheduler observation (2026-09-16 21:03:19 UTC): V-JEPA2-only canary `pt-404n3gnv` (`dseries_vjepa2_canary_20260916_r6`) is `SUCCEEDED`. It executed submit-side snapshot SHA256 `c2b75656a4966a469c24e0238e9d429437d1f6f5ea2a1980d326d819f75ea222` from a worker-local temporary directory at base commit `dbbbce70b7ea394998de6c8ac704b9e114ef4403`. Both V2 pooled and native predictor return codes are zero. r4 and r5 are preserved as failures with their exact first failure points. Machine-readable events are in `job_ledger.jsonl`.
 
@@ -10,7 +10,9 @@ Seed0 worker `pt-ca3z0nnl` completed its local frozen-source chain at 2026-09-17
 
 V-JEPA2 seed1 job `pt-hfosgdj8` and seed2 job `pt-8ykywqfl` completed successfully at 2026-09-17 08:53 and 08:52 UTC on zoetrope with exactly one H800 each. Both have `failed=0`, eight complete checkpoints/receipts/metric files, and all four D1 cells plus D3 A/B and A/B/C/D for spatial and pooled branches. The fail-closed three-seed build under `diagnostics/dseries_vjepa2_d1_d3_three_seed_20260917_zoetrope_r1/` contains 276 per-seed rows, 92 across-seed rows, and 16 paired D3 comparison rows with 10,000-draw 69-scene cluster bootstrap intervals.
 
-V-JEPA2 D2 is parallelized safely by seed. Jobs `pt-iilm18ac` (seed0), `pt-l9r28mzi` (seed1), and `pt-e8yjd5wh` (seed2) started on zoetrope at 2026-09-17 10:37--10:38 UTC with `HIGHEST` priority and one H800 each. Their output directories are disjoint and each cites its seed-matched isolated/pooled D1 checkpoint and the complete V-JEPA2 feature audit. They are `RUNNING` and are not counted as completed.
+V-JEPA2 D2 jobs `pt-iilm18ac` (seed0), `pt-l9r28mzi` (seed1), and `pt-e8yjd5wh` (seed2) all succeeded on zoetrope at 2026-09-17 10:44--10:49 UTC with `HIGHEST` priority and one H800 each. Each has `failed=0`, its seed-matched D1 checkpoint identity, a complete checkpoint/receipt, and 3,864 per-sample condition rows.
+
+Wan V2-to-D-series p8 identity audit `audits/wan_v2_p8_dseries_identity_20260917_r1/` maps all 2,721 prefixes and all 5,442 h2/h4 targets to exact canonical frames. Numerical reuse is zero: the completed legacy p8 set omits layer20, canonical-V2 Wan uses literal `.` text conditioning, and its noise identity is not the frozen D-series empty-prompt/sample-role seed contract. All 8,163 roles are therefore explicit gaps rather than silently coerced reuse. Six disjoint zoetrope jobs (`pt-vkyicuoe`, `pt-8bhnudk1`, `pt-1nf1iln7`, `pt-b6invkwb`, `pt-gms2yyzf`, `pt-7u3eubrq`) started at 2026-09-17 11:38 UTC; each requests exactly one H800 at `HIGHEST` priority and owns 453 or 454 windows. They are `RUNNING` and are not counted as completed.
 
 Seed0 scene-macro normalized-depth MAE highlights (h2 / h4):
 
@@ -44,8 +46,8 @@ Completed gates:
 
 Remaining evidence gates:
 
-- formal matched Wan caches, especially layer20/index749;
-- completion of the three running single-GPU V-JEPA2 D2 jobs, plus the remaining active Wan D1/D2 matrix;
+- completion and full audit of the six running Wan layer20/index749 empty-prompt p8 feature shards;
+- the remaining Wan D1/D2 matrix;
 - formal three-seed aggregation, plots, paper section, and slides from real records.
 
 Any table builder must fail closed while required records are absent. Historical pilot values must never be copied into the formal tables.
