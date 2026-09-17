@@ -1,0 +1,15 @@
+{
+  "label": "development-only / seed0 / diagnostic",
+  "rows": 12,
+  "sources": [
+    {
+      "metrics": "experiments/d_series_scannetpp_v1/diagnostic_runs/dseries_vjepa2_seed0_20260916_h800_r1/d3_abcd_pooled_s0/per_sample_metrics.csv",
+      "receipt": "experiments/d_series_scannetpp_v1/diagnostic_runs/dseries_vjepa2_seed0_20260916_h800_r1/d3_abcd_pooled_s0/run_receipt.json"
+    },
+    {
+      "metrics": "experiments/d_series_scannetpp_v1/diagnostic_runs/dseries_vjepa2_seed0_20260916_h800_r1/d3_abcd_spatial_s0/per_sample_metrics.csv",
+      "receipt": "experiments/d_series_scannetpp_v1/diagnostic_runs/dseries_vjepa2_seed0_20260916_h800_r1/d3_abcd_spatial_s0/run_receipt.json"
+    }
+  ],
+  "status": "COMPLETE_DIAGNOSTIC_VISUAL_INDEX"
+}

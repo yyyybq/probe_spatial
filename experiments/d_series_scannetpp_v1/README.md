@@ -39,6 +39,19 @@ $PY scripts/d_series/render_qualitative.py --visual-index experiments/d_series_s
 
 The formal builder requires the active Wan+V-JEPA2 models/branches/conditions and seeds `{0,1,2}` on the exact manifest hash. Seed0 diagnostic tables are separately labelled and do not relax the formal gate. Missing records, incomplete receipts, or mismatched hashes are hard errors; historical pilot values cannot enter the tables.
 
+The completed V-JEPA2 seed0 diagnostic can be rebuilt separately without relaxing the formal gate:
+
+```bash
+$PY scripts/d_series/build_seed0_diagnostic.py \
+  --run-root experiments/d_series_scannetpp_v1/diagnostic_runs/dseries_vjepa2_seed0_20260916_h800_r1 \
+  --output-dir /path/to/fresh_seed0_diagnostic_output
+$PY scripts/d_series/build_seed0_visual_index.py \
+  --run-root experiments/d_series_scannetpp_v1/diagnostic_runs/dseries_vjepa2_seed0_20260916_h800_r1 \
+  --output /path/to/fresh_seed0_diagnostic_output/visual_index.csv
+```
+
+The preserved result is labelled `development-only / seed0 / diagnostic`; it contains 92 h2/h4 table rows and 12 deterministic best/median/worst visual selections. It is not a substitute for seeds 1/2 or Wan.
+
 ## Sharding and recovery
 
 Feature extractors accept `--window-start` and `--max-windows`; each feature has an immutable `.sft` + `.json` pair with model revision, raw IDs, tensor contract, payload size, and SHA-256. A matching pair is a resume hit; a partial or mismatched pair aborts. Use disjoint window shards that share one fresh formal root.

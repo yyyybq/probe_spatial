@@ -1,0 +1,13 @@
+label,selection_rule,branch,horizon,sample_id,scene_id,window_id,frozen_transfer_mae,manifest_sha256
+development-only / seed0 / diagnostic,best,pooled,2,ad2d07fd11_w003_p8_h2,ad2d07fd11,3,0.06621294468641281,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,median,pooled,2,a8bf42d646_w003_p8_h2,a8bf42d646,3,0.22581923007965088,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,worst,pooled,2,97e5512e91_w003_p8_h2,97e5512e91,3,0.6571560502052307,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,best,pooled,4,1c4b893630_w001_p8_h4,1c4b893630,1,0.08161933720111847,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,median,pooled,4,0a5c013435_w001_p8_h4,0a5c013435,1,0.22611913084983826,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,worst,pooled,4,0f25f24a4f_w002_p8_h4,0f25f24a4f,2,0.5970139503479004,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,best,spatial,2,99010a8938_w000_p8_h2,99010a8938,0,0.08922520279884338,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,median,spatial,2,7b898d2d22_w000_p8_h2,7b898d2d22,0,0.23082663118839264,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,worst,spatial,2,97e5512e91_w003_p8_h2,97e5512e91,3,0.5983756184577942,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,best,spatial,4,97e5512e91_w000_p8_h4,97e5512e91,0,0.08717560023069382,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,median,spatial,4,11fc9df3a0_w000_p8_h4,11fc9df3a0,0,0.23350022733211517,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
+development-only / seed0 / diagnostic,worst,spatial,4,0f25f24a4f_w002_p8_h4,0f25f24a4f,2,0.5497721433639526,781e25848de48fa5219aad876bd10cb8f9445328b145a19193a6f6b2ab5efcc9
