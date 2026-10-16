@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -20,6 +21,20 @@ class FeatureLayerSpec:
     def last_layer(self) -> int | None:
         return self.num_layers - 1 if self.num_layers is not None else None
 
+    @property
+    def default_timestep(self) -> int | None:
+        """Scheduler timestep encoded in the default cache name, if any."""
+        match = _POSTFIX_TIMESTEP.match(self.feat_postfix)
+        return int(match.group(1)) if match else None
+
+
+_POSTFIX_TIMESTEP = re.compile(r"^_t(\d+)_layer")
+
+# Diffusion backbones whose cache names carry the scheduler timestep:
+# ``feature_t{t}_layer{L}.sft``. Encoder backbones use ``feature_layer{L}.sft``.
+_TIMESTEP_POSTFIX_VFMS = frozenset(
+    {"wan", "cogvideox", "minimax_h3", "lingbot", "aether", "opensora"}
+)
 
 FEATURE_LAYER_SPECS: dict[str, FeatureLayerSpec] = {
     # Current diagnostic-suite defaults.
@@ -112,6 +127,25 @@ FEATURE_LAYER_SPECS: dict[str, FeatureLayerSpec] = {
         in_channels=1024,
         note="Fast3R ViT-L transformer block 24; 288×512 input → 18×32 patch grid.",
     ),
+    # Canonical-V2 diffusion backbones extracted at scheduler timestep 250.
+    # Both caches are named feature_t250_layer{L}.sft (features/minimax_h3,
+    # features/lingbot). Campaign ledgers call the last block by its 1-based
+    # count (MiniMax "L50" = disk layer 49, LingBot "L48" = disk layer 47);
+    # the registry only knows 0-based disk layers.
+    "minimax_h3": FeatureLayerSpec(
+        default_layer=30,
+        num_layers=50,
+        feat_postfix="_t250_layer30",
+        in_channels=5376,
+        note="MiniMax-H3 video DiT block 30 at t=250; 480×832 input → 15×26 token grid (fp16 caches saturate at layers ≥20).",
+    ),
+    "lingbot": FeatureLayerSpec(
+        default_layer=30,
+        num_layers=48,
+        feat_postfix="_t250_layer30",
+        in_channels=2048,
+        note="LingBot-Video DiT block 30 at t=250; 480×832 input → 30×52 token grid.",
+    ),
 }
 
 
@@ -148,8 +182,17 @@ def all_output_layers(vfm_name: str, model_id: str | None = None) -> list[int]:
     return list(range(spec.num_layers))
 
 
-def feat_postfix_for_layer(vfm_name: str, layer: int, t: int = 749) -> str:
-    if vfm_name in {"wan", "cogvideox", "aether", "opensora"}:
+def default_feature_timestep(vfm_name: str, model_id: str | None = None) -> int:
+    """Scheduler timestep used by a backend's default cache name (749 if unknown)."""
+    spec = get_feature_layer_spec(vfm_name, model_id)
+    if spec is not None and spec.default_timestep is not None:
+        return spec.default_timestep
+    return 749
+
+
+def feat_postfix_for_layer(vfm_name: str, layer: int, t: int | None = None) -> str:
+    if vfm_name in _TIMESTEP_POSTFIX_VFMS:
+        t = default_feature_timestep(vfm_name) if t is None else int(t)
         return f"_t{t}_layer{layer}"
     if vfm_name == "f3r":
         return f"_l{layer}"
@@ -187,6 +230,8 @@ _DEFAULT_FEATURE_HW: dict[str, tuple[int, int]] = {
     "aether": (30, 45),  # 480×720, patch_size=16
     "opensora": (30, 53),  # 480×848, patch_size=16
     "f3r": (18, 32),     # 288×512, patch_size=16
+    "minimax_h3": (15, 26),  # 480×832 → 30×52 latent → (1,2,2) patches; cached files are (T,15,26,5376)
+    "lingbot": (30, 52),     # 480×832; cached files are (T,30,52,2048)
 }
 
 
@@ -209,7 +254,9 @@ def feature_filename(
     ``feat_postfix`` keeps old configs working.  ``feature_layer`` is the new
     sweep-friendly path and maps to the extractor filenames:
     ``feature_t{t}_layer{L}.sft`` for diffusion VFMs and
-    ``feature_layer{L}.sft`` for V-JEPA2 / MLLM caches.
+    ``feature_layer{L}.sft`` for V-JEPA2 / MLLM caches. When ``feature_layer``
+    is given without ``feature_timestep``, the backend's registered default
+    timestep is used (749 for Wan/CogVideoX/Aether, 250 for MiniMax/LingBot).
     """
 
     if vfm_name in {"vjepa", "dino"}:
@@ -221,7 +268,7 @@ def feature_filename(
         feature_timestep = None if feature_timestep in {"", "None", "none", "null"} else int(feature_timestep)
 
     if feature_layer is not None:
-        t = 749 if feature_timestep is None else int(feature_timestep)
+        t = default_feature_timestep(vfm_name) if feature_timestep is None else int(feature_timestep)
         return f"{feature_prefix}{feat_postfix_for_layer(vfm_name, int(feature_layer), t)}.sft"
 
     postfix = feat_postfix if feat_postfix is not None else default_feature_postfix(vfm_name)
