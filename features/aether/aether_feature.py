@@ -10,6 +10,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import imageio.v3 as iio
 import numpy as np
 import torch
+
+from features.noise_seed import randn_like_on_generator_device
+from features.offline_hf import resolve_offline_snapshot
 from diffusers.image_processor import PipelineImageInput
 from diffusers.models import CogVideoXTransformer3DModel
 from diffusers.models.autoencoders.autoencoder_kl_cogvideox import (
@@ -37,6 +40,25 @@ from .aether.pipelines.aetherv1_pipeline_cogvideox import (  # noqa: E402
 from .aether.utils.postprocess_utils import colorize_depth
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+_COGVIDEOX_I2V_REQUIRED = (
+    "configuration.json",
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors.index.json",
+    "tokenizer/tokenizer_config.json",
+    "tokenizer/added_tokens.json",
+    "tokenizer/special_tokens_map.json",
+    "tokenizer/spiece.model",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+)
+_AETHER_REQUIRED = (
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+)
 
 
 class TransformerCogVideoXWithFeatureOutput(CogVideoXTransformer3DModel):
@@ -321,6 +343,7 @@ class OneStepAetherPipeline(AetherV1PipelineCogVideoX):
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        extra_step_kwargs["generator"] = generator
 
         # 7. Create rotary embeds if required
         image_rotary_emb = (
@@ -520,6 +543,7 @@ class OneStepAetherPipeline(AetherV1PipelineCogVideoX):
             self.scheduler, num_inference_steps, device, None
         )
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, 0)
+        extra_step_kwargs["generator"] = generator
         # timesteps = self.scheduler.timesteps
 
         # Encode video to latent space using VAE
@@ -554,7 +578,7 @@ class OneStepAetherPipeline(AetherV1PipelineCogVideoX):
         t_idx = torch.tensor([t], dtype=torch.long, device=device)
         # t_idx: 261 -> t_input: 894 (reversed)
         t_input = self.scheduler.timesteps[t_idx].to(device)
-        noise = torch.randn_like(latents).to(device)
+        noise = randn_like_on_generator_device(latents, generator).to(device)
         latents_noisy = self.scheduler.add_noise(latents, noise, t_input)
 
         # Ensure the transformer supports feature output
@@ -605,31 +629,61 @@ class AetherFeaturizer:
         """
         Initialize the AetherFeaturizer with a specific Aether model.
         """
+        # Keep the logical model IDs in outer feature provenance, but never
+        # pass them to Transformers/Diffusers in an offline SCO worker.  Those
+        # loaders can still issue a Hub ``model_info`` call even though the
+        # full cache is mounted.  ``resolve_offline_snapshot`` validates the
+        # revision pinned by refs/main and every indexed weight shard first.
+        cog_path, self.cog_load_provenance = resolve_offline_snapshot(
+            "THUDM/CogVideoX-5b-I2V", required_paths=_COGVIDEOX_I2V_REQUIRED
+        )
+        aether_path, self.aether_load_provenance = resolve_offline_snapshot(
+            "AetherWorldModel/AetherV1", required_paths=_AETHER_REQUIRED
+        )
         pipeline = OneStepAetherPipeline(
             tokenizer=AutoTokenizer.from_pretrained(
-                "THUDM/CogVideoX-5b-I2V",
+                cog_path,
                 subfolder="tokenizer",
+                local_files_only=True,
             ),
             text_encoder=T5EncoderModel.from_pretrained(
-                "THUDM/CogVideoX-5b-I2V", subfolder="text_encoder"
+                cog_path, subfolder="text_encoder", local_files_only=True
             ),
             vae=AutoencoderKLCogVideoX.from_pretrained(
-                "THUDM/CogVideoX-5b-I2V",
+                cog_path,
                 subfolder="vae",
                 torch_dtype=torch.bfloat16,
+                local_files_only=True,
             ),
             scheduler=CogVideoXDPMScheduler.from_pretrained(
-                "THUDM/CogVideoX-5b-I2V", subfolder="scheduler"
+                cog_path, subfolder="scheduler", local_files_only=True
             ),
             transformer=TransformerCogVideoXWithFeatureOutput.from_pretrained(
-                "AetherWorldModel/AetherV1",
+                aether_path,
                 subfolder="transformer",
                 torch_dtype=torch.bfloat16,
+                local_files_only=True,
             ),
         )
         pipeline.vae.enable_slicing()
         pipeline.vae.enable_tiling()
         pipeline.to("cuda")
+        for module in pipeline.components.values():
+            if isinstance(module, torch.nn.Module):
+                module.eval()
+        # Re-encode the empty prompt after eval so T5 dropout (p=0.1) cannot
+        # bake a train-mode mask into the cached embeddings.
+        with torch.no_grad():
+            pipeline.empty_prompt_embeds, _ = pipeline.encode_prompt(
+                prompt="",
+                negative_prompt=None,
+                do_classifier_free_guidance=False,
+                num_videos_per_prompt=1,
+                prompt_embeds=None,
+            )
+            pipeline.empty_prompt_embeds = pipeline.empty_prompt_embeds.to(
+                dtype=torch.bfloat16
+            )
         self.pipe = pipeline
 
     @torch.no_grad()
@@ -639,6 +693,7 @@ class AetherFeaturizer:
         t: int = 499,
         output_layer_indices: List[int] = [1],
         task: str = "videogen",
+        noise_generator: Optional[torch.Generator] = None,
     ) -> Dict[int, torch.FloatTensor]:
         """
         Extract features from specific layers of the Aether transformer.
@@ -658,7 +713,12 @@ class AetherFeaturizer:
         # Extract features from the transformer
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             all_hidden_states = self.pipe(
-                video[0], video, t=t, output_layers=output_layer_indices, task=task
+                video[0],
+                video,
+                t=t,
+                output_layers=output_layer_indices,
+                task=task,
+                generator=noise_generator,
             )
 
         # Get features from the specified layers

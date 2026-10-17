@@ -1,0 +1,17 @@
+# @package _global_
+# A1 protocol-matched ablation: replace absolute pose with adjacent movement
+# while retaining the jointly trained depth head and all other A1 settings.
+
+defaults:
+  - /experiment/inscene15k_streaming/streaming_depth_dino_v1
+  - _self_
+
+tags: ["train", "inscene15k_streaming", "dino", "streaming_prefix", "depth", "movement"]
+job_name: streaming_movement_dino_v1
+
+model:
+  probe:
+    active_heads: ["depth", "movement"]
+  loss_weights:
+    camera: 0.0
+    movement: 1.0

@@ -1,6 +1,6 @@
 _target_: vidfm3d.models.probe_ext_module.ProbeExtensionLitModule
 
-probe_type: ???   # one of: view_consistency, abnormal, ego_belief, ego_belief_v2, action_dynamics, path_integration, counterfactual
+probe_type: ???   # trainable: view_consistency, abnormal, ego_belief, ego_belief_v2, action_dynamics, path_integration; counterfactual is legacy-only
 output_path: ${paths.output_dir}
 
 optimizer:
@@ -32,4 +32,6 @@ polar_loss_weights: [1.0, 1.0, 0.5]
 mse_loss_weight: 1.0
 cosine_loss_weight: 1.0
 
+# Compiled module checkpoint keys are incompatible with the strict evaluator.
+# ProbeExtensionLitModule rejects true until that round trip is supported.
 compile: false

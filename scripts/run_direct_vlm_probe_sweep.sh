@@ -37,7 +37,7 @@ EXTRA_TRAIN=${EXTRA_TRAIN:-}
 EXTRA_EVAL=${EXTRA_EVAL:-}
 
 if [[ "${STREAMING}" == "1" ]]; then
-    STREAMING_PROBES=${PROBES:-"streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual"}
+    STREAMING_PROBES=${PROBES:-"streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration"}
     for vfm in ${VFMS}; do
         echo "==== direct VLM streaming vfm=${vfm} layers=${LAYERS} prefixes=${PREFIX_LENGTHS:-8 12 16 24} ===="
         cmd=(env
@@ -87,7 +87,7 @@ EOF
     exit 2
 fi
 
-PROBES=${PROBES:-"view_consistency abnormal ego_belief ego_belief_v2 action_dynamics path_integration counterfactual"}
+PROBES=${PROBES:-"view_consistency abnormal ego_belief ego_belief_v2 action_dynamics path_integration"}
 FEAT_ROOT=${FEAT_ROOT:?set FEAT_ROOT or INSCENE_MLLM_FEAT_ROOT for legacy non-streaming direct VLM}
 
 backend_for_vfm() {

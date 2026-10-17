@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - /experiment/inscene15k_streaming/streaming_depth_f3r_v1
+  - _self_
+tags: ["train", "inscene15k_streaming", "f3r", "streaming_prefix", "depth", "movement"]
+job_name: streaming_movement_f3r_v1
+model:
+  probe:
+    active_heads: ["depth", "movement"]
+  loss_weights: {camera: 0.0, movement: 1.0}

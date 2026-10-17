@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from features.noise_seed import randn_like_local
 from diffusers import CogVideoXPipeline
 from diffusers.models import CogVideoXTransformer3DModel
 from diffusers.models.autoencoders.autoencoder_kl_cogvideox import (
@@ -243,7 +244,7 @@ class OneStepCogVideoXPipeline(CogVideoXPipeline):
         t_idx = torch.tensor([t], dtype=torch.long, device=device)
         self.scheduler: CogVideoXDDIMScheduler
         t_input = self.scheduler.timesteps[t_idx].to(device)
-        noise = torch.randn_like(latents).to(device)
+        noise = randn_like_local(latents, generator=generator)
         latents_noisy = self.scheduler.add_noise(latents, noise, t_input)
 
         # Ensure the transformer supports feature output
@@ -345,6 +346,7 @@ class CogVideoXFeaturizer:
         prompt: str = "",
         t: int = 261,
         output_layer_indices: List[int] = [1],
+        noise_generator: Optional[torch.Generator] = None,
     ) -> Dict[int, torch.FloatTensor]:
         """
         Extract features from specific layers of the CogVideoX transformer.
@@ -354,7 +356,7 @@ class CogVideoXFeaturizer:
             prompt (`str`): The prompt to use for conditioning
             t (`int`): Timestep for feature extraction (0-1000)
             output_layer_indices (`List[int]`): Which transformer blocks to extract features from
-            ensemble_size (`int`): Number of repeated videos in batch for feature extraction
+            noise_generator (`torch.Generator`, optional): Sample-local generator for diffusion noise
 
         Returns:
             `Dict[int, torch.FloatTensor]`: Dictionary mapping layer index to extracted features
@@ -377,6 +379,7 @@ class CogVideoXFeaturizer:
                 t=t,
                 output_layers=output_layer_indices,
                 prompt_embeds=prompt_embeds,
+                generator=noise_generator,
             )
 
         # Get features from the specified layers

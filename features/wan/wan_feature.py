@@ -13,9 +13,11 @@
 # limitations under the License.
 
 
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+from features.noise_seed import randn_like_local
 from diffusers import WanPipeline
 from diffusers.models import WanTransformer3DModel
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -29,6 +31,16 @@ from diffusers.utils import (
 from PIL import Image
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _optional_t2v_amp_dtype() -> Optional[torch.dtype]:
+    """H800 target extract can request bf16; default stays fp32 for stream identity."""
+    raw = os.environ.get("WAN_T2V_DTYPE", "").strip().lower()
+    if raw in {"", "fp32", "float32"}:
+        return None
+    if raw in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(f"WAN_T2V_DTYPE must be unset/fp32 or bf16, got {raw!r}")
 
 
 class TransformerWanWithFeatureOutput(WanTransformer3DModel):
@@ -189,12 +201,13 @@ class OneStepWanPipeline(WanPipeline):
         Returns:
             `Dict[str, torch.FloatTensor]`: Dictionary containing features from specified transformer layers
         """
-        device = self._execution_device
+        vae_param = next(self.vae.parameters())
+        device = vae_param.device
         height = 480  # height or self.transformer.config.sample_height * self.vae_scale_factor_spatial
         width = 832  # width or self.transformer.config.sample_width * self.vae_scale_factor_spatial
         video = self.video_processor.preprocess_video(
             video, height=height, width=width
-        ).to(device, dtype=torch.float32)
+        ).to(device, dtype=vae_param.dtype)
 
         num_inference_steps = 1000
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -215,7 +228,13 @@ class OneStepWanPipeline(WanPipeline):
         # Convert timestep to tensor and prepare noise
         t_idx = torch.tensor([t], dtype=torch.long, device=device)
         t_input = self.scheduler.timesteps[t_idx].to(device)
-        noise = torch.randn_like(latents).to(device)
+        if generator is None:
+            noise = randn_like_local(latents)
+        else:
+            sample_gen = generator[0] if isinstance(generator, (list, tuple)) else generator
+            noise = randn_like_local(
+                latents.to(sample_gen.device), generator=generator
+            ).to(device=latents.device, dtype=latents.dtype)
         latents_noisy = self.scheduler.add_noise(latents, noise, t_input)
 
         # Ensure the transformer supports feature output
@@ -269,15 +288,21 @@ class WanFeaturizer:
             model_id (`str`): Identifier for the Wan model to use
             null_prompt (`str`): Prompt used for unconditional generation
         """
+        amp_dtype = _optional_t2v_amp_dtype()
+        load_kwargs: Dict[str, Any] = {} if amp_dtype is None else {"torch_dtype": amp_dtype}
         # Load the transformer model with feature output capability
         transformer = TransformerWanWithFeatureOutput.from_pretrained(
-            model_id, subfolder="transformer"
+            model_id, subfolder="transformer", **load_kwargs
         )
 
         # Initialize the pipeline with the modified transformer
-        onestep_pipe = OneStepWanPipeline.from_pretrained(
-            model_id, transformer=transformer, safety_checker=None
-        )
+        pipe_kwargs: Dict[str, Any] = {
+            "transformer": transformer,
+            "safety_checker": None,
+        }
+        if amp_dtype is not None:
+            pipe_kwargs["torch_dtype"] = amp_dtype
+        onestep_pipe = OneStepWanPipeline.from_pretrained(model_id, **pipe_kwargs)
 
         flow_shift = 3.0  # 5.0 for 720P, 3.0 for 480P
         onestep_pipe.scheduler = UniPCMultistepScheduler.from_config(
@@ -295,9 +320,14 @@ class WanFeaturizer:
                 device="cuda",
             )
 
+        if amp_dtype is not None:
+            onestep_pipe.text_encoder.cpu()
+            torch.cuda.empty_cache()
+
         self.null_prompt_embeds = null_prompt_embeds
         self.null_prompt = null_prompt
         self.pipe = onestep_pipe
+        self._amp_dtype = amp_dtype
 
     @torch.no_grad()
     def forward(
@@ -307,6 +337,7 @@ class WanFeaturizer:
         t: int = 261,
         output_layer_indices: List[int] = [1],
         ensemble_size: int = 1,
+        noise_generator: Optional[torch.Generator] = None,
     ) -> Dict[int, torch.FloatTensor]:
         """
         Extract features from specific layers of the Wan transformer.
@@ -317,6 +348,7 @@ class WanFeaturizer:
             t (`int`): Timestep for feature extraction (0-1000)
             output_layer_indices (`List[int]`): Which transformer blocks to extract features from
             ensemble_size (`int`): Number of repeated videos in batch for feature extraction
+            noise_generator (`torch.Generator`, optional): Sample-local generator for diffusion noise
 
         Returns:
             `Dict[int, torch.FloatTensor]`: Dictionary mapping layer index to extracted features
@@ -324,8 +356,10 @@ class WanFeaturizer:
         """
         # Get the appropriate prompt embeddings
         if prompt == self.null_prompt:
-            prompt_embeds = self.null_prompt_embeds
+            prompt_embeds = self.null_prompt_embeds.to("cuda")
         else:
+            if next(self.pipe.text_encoder.parameters()).device.type != "cuda":
+                self.pipe.text_encoder.to("cuda")
             prompt_embeds, _ = self.pipe.encode_prompt(
                 prompt=prompt,
                 do_classifier_free_guidance=False,
@@ -337,12 +371,24 @@ class WanFeaturizer:
             prompt_embeds = prompt_embeds.repeat(ensemble_size, 1, 1)
 
         # Extract features from the transformer
-        _, all_hidden_states = self.pipe(
-            video=video,
-            t=t,
-            output_layers=output_layer_indices,
-            prompt_embeds=prompt_embeds,
-        )
+        if self._amp_dtype is not None:
+            self.pipe.text_encoder.cpu()
+            with torch.amp.autocast("cuda", dtype=self._amp_dtype):
+                _, all_hidden_states = self.pipe(
+                    video=video,
+                    t=t,
+                    output_layers=output_layer_indices,
+                    prompt_embeds=prompt_embeds,
+                    generator=noise_generator,
+                )
+        else:
+            _, all_hidden_states = self.pipe(
+                video=video,
+                t=t,
+                output_layers=output_layer_indices,
+                prompt_embeds=prompt_embeds,
+                generator=noise_generator,
+            )
 
         # Get features from the specified layers
         extracted_features = {

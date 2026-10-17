@@ -11,16 +11,6 @@ from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-# Monkeypatch torch.load to use weights_only=False for PyTorch 2.6+ compat
-# (our own checkpoints contain omegaconf objects from Hydra/Lightning)
-import functools
-_orig_torch_load = torch.load
-@functools.wraps(_orig_torch_load)
-def _patched_torch_load(*args, **kwargs):
-    kwargs['weights_only'] = False
-    return _orig_torch_load(*args, **kwargs)
-torch.load = _patched_torch_load
-
 # Monkey-patch ModelCheckpoint to always save last.ckpt regardless of top-k
 # Lightning gates save_last behind _last_global_step_saved == global_step,
 # which means last.ckpt is NOT saved when val/loss doesn't improve (top-k skip).
@@ -148,7 +138,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     _guard_legacy_non_streaming(cfg)
 
     # set seed for random number generators in pytorch, numpy and python.random
-    if cfg.get("seed"):
+    if cfg.get("seed") is not None:
         L.seed_everything(cfg.seed, workers=True)
 
     write_run_manifest(cfg, cfg.paths.output_dir)
@@ -185,18 +175,26 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     if cfg.get("train"):
         log.info("Starting training!")
-        trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+        # Our Lightning checkpoints contain Hydra/OmegaConf objects; scope
+        # pickle compatibility to these explicit project checkpoint loads.
+        trainer.fit(
+            model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"),
+            weights_only=False,
+        )
 
-    train_metrics = trainer.callback_metrics
+    train_metrics = dict(trainer.callback_metrics)
 
     if cfg.get("test"):
         log.info("Starting testing!")
-        # ckpt_path = trainer.checkpoint_callback.best_model_path
-        # if ckpt_path == "":
-        #     log.warning("Best ckpt not found! Using current weights for testing...")
-        #     ckpt_path = None
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
-        # log.info(f"Best ckpt path: {ckpt_path}")
+        test_ckpt = cfg.get("ckpt_path")
+        if cfg.get("train"):
+            checkpoint_callback = trainer.checkpoint_callback
+            test_ckpt = (
+                checkpoint_callback.best_model_path if checkpoint_callback else None
+            ) or None
+            if test_ckpt is None:
+                log.warning("Best checkpoint unavailable; testing current trained weights.")
+        trainer.test(model=model, datamodule=datamodule, ckpt_path=test_ckpt, weights_only=False)
 
     test_metrics = trainer.callback_metrics
 
@@ -225,7 +223,7 @@ def main(cfg: DictConfig) -> Optional[float]:
             log.info(f"Found and resuming from last checkpoint: {auto_ckpt}")
             # try to load the checkpoint -- if corrupted, also set ckpt_path to None
             try:
-                torch.load(auto_ckpt)
+                torch.load(auto_ckpt, map_location="cpu", weights_only=False)
             except Exception as e:
                 log.warning(f"Checkpoint loading failed: {e}")
                 auto_ckpt = None
@@ -234,7 +232,7 @@ def main(cfg: DictConfig) -> Optional[float]:
                 cfg.ckpt_path = auto_ckpt
 
                 # If wandb is used for logging, fetch the run ID so it can be resumed
-                if "wandb" in cfg.logger and cfg.get("train"):
+                if cfg.get("logger") and "wandb" in cfg.logger and cfg.get("train"):
                     wandb_dir = os.path.join(
                         cfg.paths.output_dir, "wandb", "latest-run"
                     )

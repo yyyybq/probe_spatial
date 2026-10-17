@@ -4,10 +4,12 @@
 # feature dim = 3072
 
 
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from features.noise_seed import randn_like_local
 from diffusers import CogVideoXImageToVideoPipeline
 from diffusers.models import CogVideoXTransformer3DModel
 from diffusers.models.autoencoders.autoencoder_kl_cogvideox import (
@@ -181,6 +183,7 @@ class OneStepCogVideoXPipeline(CogVideoXImageToVideoPipeline):
         output_layers: List[int],
         negative_prompt: Optional[Union[str, List[str]]] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        noise_generator: Optional[torch.Generator] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
@@ -214,6 +217,9 @@ class OneStepCogVideoXPipeline(CogVideoXImageToVideoPipeline):
         image = self.video_processor.preprocess(image, height=height, width=width).to(
             device, dtype=torch.float16
         )
+        sample_generator = (
+            noise_generator if noise_generator is not None else generator
+        )
         _, image_latents = self.prepare_latents(
             image,
             1,
@@ -223,14 +229,14 @@ class OneStepCogVideoXPipeline(CogVideoXImageToVideoPipeline):
             width,
             prompt_embeds.dtype,
             device,
-            generator,
+            sample_generator,
         )  # [1, 13, 16, 60, 90]
 
         num_inference_steps = 1000
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler, num_inference_steps, device, None
         )
-        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, 0)
+        extra_step_kwargs = self.prepare_extra_step_kwargs(sample_generator, 0)
         # timesteps = self.scheduler.timesteps
 
         # Encode video to latent space using VAE
@@ -262,7 +268,10 @@ class OneStepCogVideoXPipeline(CogVideoXImageToVideoPipeline):
         t_idx = torch.tensor([t], dtype=torch.long, device=device)
         self.scheduler: CogVideoXDDIMScheduler
         t_input = self.scheduler.timesteps[t_idx].to(device)
-        noise = torch.randn_like(latents).to(device)
+        noise = randn_like_local(
+            latents,
+            generator=sample_generator,
+        )
         latents_noisy = self.scheduler.add_noise(latents, noise, t_input)
 
         # Ensure the transformer supports feature output
@@ -324,15 +333,19 @@ class CogVideoXFeaturizer:
             null_prompt (`str`): Prompt used for unconditional generation
         """
 
+        load_kw = {"torch_dtype": torch.float16}
+        if os.path.isdir(model_id):
+            load_kw["local_files_only"] = True
+
         # Load the transformer model with feature output capability
         transformer = TransformerCogVideoXWithFeatureOutput.from_pretrained(
-            model_id, subfolder="transformer", torch_dtype=torch.float16
+            model_id, subfolder="transformer", **load_kw
         )
         vae = AutoencoderKLCogVideoX.from_pretrained(
-            model_id, subfolder="vae", torch_dtype=torch.float16
+            model_id, subfolder="vae", **load_kw
         )
         text_encoder = T5EncoderModel.from_pretrained(
-            model_id, subfolder="text_encoder", torch_dtype=torch.float16
+            model_id, subfolder="text_encoder", **load_kw
         )
 
         # Initialize the pipeline with the modified transformer
@@ -341,7 +354,7 @@ class CogVideoXFeaturizer:
             text_encoder=text_encoder,
             vae=vae,
             transformer=transformer,
-            torch_dtype=torch.float16,
+            **load_kw,
         ).to("cuda")
 
         # onestep_pipe.enable_sequential_cpu_offload()
@@ -364,6 +377,7 @@ class CogVideoXFeaturizer:
         prompt: str = "",
         t: int = 261,
         output_layer_indices: List[int] = [1],
+        noise_generator: Optional[torch.Generator] = None,
     ) -> Dict[int, torch.FloatTensor]:
         """
         Extract features from specific layers of the CogVideoX transformer.
@@ -373,7 +387,7 @@ class CogVideoXFeaturizer:
             prompt (`str`): The prompt to use for conditioning
             t (`int`): Timestep for feature extraction (0-1000)
             output_layer_indices (`List[int]`): Which transformer blocks to extract features from
-            ensemble_size (`int`): Number of repeated videos in batch for feature extraction
+            noise_generator (`torch.Generator`, optional): Sample-local generator for all stochastic latents
 
         Returns:
             `Dict[int, torch.FloatTensor]`: Dictionary mapping layer index to extracted features
@@ -400,6 +414,7 @@ class CogVideoXFeaturizer:
                 t=t,
                 output_layers=output_layer_indices,
                 prompt_embeds=prompt_embeds,
+                noise_generator=noise_generator,
             )
 
         # Get features from the specified layers

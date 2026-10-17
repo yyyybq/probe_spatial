@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - /experiment/inscene15k_streaming/direct_vlm_streaming_depth_v1
+  - _self_
+tags: ["train", "inscene15k_streaming", "direct_vlm", "streaming_prefix", "depth", "movement"]
+job_name: direct_vlm_streaming_movement_v1
+model:
+  probe:
+    active_heads: ["depth", "movement"]
+  loss_weights: {camera: 0.0, movement: 1.0}

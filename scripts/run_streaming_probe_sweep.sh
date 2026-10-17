@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Shared streaming-prefix sweep for A1/A2/B1/B2/C1/C2/C3.
+# Shared streaming-prefix training sweep for A1/A2/B1/B2/C1/C2.
+# C3 is evaluated from the frozen C1 head and is never a default train job.
 #
 # The streaming cache is probe-agnostic: each selected prefix [I_0..I_t] is
 # forwarded once and stored under prefix_<tail>. Training then sweeps one fixed
@@ -23,7 +24,7 @@
 #   LAYERS="default" bash scripts/run_streaming_probe_sweep.sh
 #
 #   PYTHON=/data/baiqiao/miniconda3/envs/vidfm3d/bin/python DEV=0 \
-#   PROBES="view_consistency ego_belief action_dynamics path_integration counterfactual" \
+#   PROBES="view_consistency ego_belief action_dynamics path_integration" \
 #   LAYERS="default" EXTRA_TRAIN="trainer.max_epochs=20 logger.wandb.offline=true" \
 #     bash scripts/run_streaming_probe_sweep.sh
 set -euo pipefail
@@ -48,12 +49,16 @@ fi
 PYTHON=${PYTHON:-python}
 VFM=${VFM:-wan}
 VFM_NAME=${VFM_NAME:-${VFM}}
-T=${T:-749}
+# Scheduler timestep of the cached diffusion features. The registry default is
+# 749 for Wan/CogVideoX/Aether and 250 for MiniMax-H3/LingBot; encoders ignore it.
+if [[ -z "${T:-}" ]]; then
+    T="$("${PYTHON}" scripts/resolve_feature_layers.py --vfm "${VFM}" --field default_timestep 2>/dev/null || printf '749')"
+fi
 DEV=${DEV:-0}
 DRY_RUN=${DRY_RUN:-0}
 SPLIT=${SPLIT:-val}
 
-PROBES=${PROBES:-"streaming_depth view_consistency ego_belief ego_belief_v2 action_dynamics path_integration counterfactual"}
+PROBES=${PROBES:-"streaming_depth streaming_movement view_consistency ego_belief ego_belief_v2 action_dynamics path_integration"}
 PREFIX_LENGTHS=${PREFIX_LENGTHS:-"8 12 16 24"}
 B_HIDDEN_PREFIX_LENGTHS=${B_HIDDEN_PREFIX_LENGTHS:-"8 12 16 24"}
 C_PREFIX_LENGTHS=${C_PREFIX_LENGTHS:-${PREFIX_LENGTHS}}
@@ -71,6 +76,12 @@ EXTRACT_STREAMING=${EXTRACT_STREAMING:-1}
 EXTRACT_TARGETS=${EXTRACT_TARGETS:-1}
 TRAIN=${TRAIN:-1}
 EVAL=${EVAL:-1}
+ALLOW_LEGACY_C3_TRAIN=${ALLOW_LEGACY_C3_TRAIN:-0}
+if [[ "${TRAIN}" == "1" && " ${PROBES} " == *" counterfactual "* && "${ALLOW_LEGACY_C3_TRAIN}" != "1" ]]; then
+    echo "[err] counterfactual/C3 is evaluation-only and reuses a C1 checkpoint; refusing a new C3 train job" >&2
+    echo "[err] set TRAIN=0 for historical C3 evaluation, or ALLOW_LEGACY_C3_TRAIN=1 only to reproduce an archived run" >&2
+    exit 1
+fi
 
 EXTRA_EXTRACT=${EXTRA_EXTRACT:-}
 EXTRA_TARGET_EXTRACT=${EXTRA_TARGET_EXTRACT:-}
@@ -418,7 +429,11 @@ for probe in ${PROBES}; do
                     continue
                 fi
                 echo "==== eval ${probe} prefix=${prefix_len} layer=${layer} ===="
-                cmd=("${PYTHON}" vidfm3d/eval_diag.py
+                eval_entrypoint=vidfm3d/eval_diag.py
+                if [[ "${probe}" == "streaming_movement" ]]; then
+                    eval_entrypoint=vidfm3d/eval_a1_streaming.py
+                fi
+                cmd=("${PYTHON}" "${eval_entrypoint}"
                     "experiment=${cfg}"
                     "vfm_name=${VFM}"
                     "video_channels=${video_channels}"
@@ -428,7 +443,7 @@ for probe in ${PROBES}; do
                     "prefix_len=${prefix_len}"
                     "job_name=${job}"
                     "paths.run_folder_name=${run_name}"
-                    "ckpt_path=${ckpt}"
+                    "ckpt_path='${ckpt}'"
                     "+eval_split=${SPLIT}"
                     "train=false"
                     "test=false"

@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, Optional
 
 from lightning import LightningDataModule
@@ -7,6 +8,18 @@ from torch.utils.data import DataLoader
 
 from vidfm3d.data.components.video_probe_dataset import VideoProbeDataset
 from vidfm3d.data.components.inscene15k_dataset import InsScene15KDataset
+from vidfm3d.data.components.c1_action_set_dataset import C1ActionSetDataset
+
+
+def _replace_dataset_kwarg(dataset_expr: str, key: str, value: Optional[str]) -> str:
+    if value is None:
+        return dataset_expr
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    pattern = rf"{re.escape(key)}='[^']*'"
+    replacement = f"{key}='{escaped}'"
+    if re.search(pattern, dataset_expr):
+        return re.sub(pattern, replacement, dataset_expr)
+    return dataset_expr
 
 
 def get_data_loader(
@@ -108,6 +121,7 @@ class VideoProbeDataModule(LightningDataModule):
         num_workers: int = 12,
         num_workers_val: int = 2,
         pin_memory: bool = True,
+        streaming_feat_root: Optional[str] = None,
     ) -> None:
         """Initialize a CustomDataModule.
 
@@ -126,6 +140,7 @@ class VideoProbeDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.num_workers_val = num_workers_val
         self.pin_memory = pin_memory
+        self.streaming_feat_root = streaming_feat_root
 
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
@@ -133,6 +148,13 @@ class VideoProbeDataModule(LightningDataModule):
 
         self.train_loader: Optional[DataLoader] = None
         self.val_loader: Optional[DataLoader] = None
+
+    def _dataset_expr(self, dataset: str) -> str:
+        dataset = _replace_dataset_kwarg(
+            dataset, "streaming_feat_root", self.streaming_feat_root
+        )
+        dataset = _replace_dataset_kwarg(dataset, "root_vfm", self.streaming_feat_root)
+        return dataset
 
     def prepare_data(self) -> None:
         """Download or prepare the dataset if needed."""
@@ -158,7 +180,9 @@ class VideoProbeDataModule(LightningDataModule):
         ), "All datasets must be strings"
 
         # Concatenate all train dataset strings into a single string with "+" separator
-        train_datasets_concat = " + ".join(self.hparams.train_datasets)
+        train_datasets_concat = " + ".join(
+            self._dataset_expr(dataset) for dataset in self.hparams.train_datasets
+        )
         print("Building train Data loader for dataset: ", train_datasets_concat)
         self.train_loader = get_data_loader(
             train_datasets_concat,
@@ -195,7 +219,10 @@ class VideoProbeDataModule(LightningDataModule):
         ), "All datasets must be strings"
 
         # Evaluate each string in the validation datasets list to get actual datasets
-        val_datasets = [eval(dataset) for dataset in self.hparams.validation_datasets]
+        val_datasets = [
+            eval(self._dataset_expr(dataset))
+            for dataset in self.hparams.validation_datasets
+        ]
 
         # Create individual validation data loaders for each dataset
         val_loaders = []
@@ -248,7 +275,10 @@ class VideoProbeDataModule(LightningDataModule):
         ), "All datasets must be strings"
 
         # Evaluate each string in the validation datasets list to get actual datasets
-        val_datasets = [eval(dataset) for dataset in self.hparams.validation_datasets]
+        val_datasets = [
+            eval(self._dataset_expr(dataset))
+            for dataset in self.hparams.validation_datasets
+        ]
 
         # Create individual validation data loaders for each dataset
         val_loaders = []

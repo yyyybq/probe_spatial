@@ -1,0 +1,77 @@
+{
+  "schema_version": 2,
+  "canonical_protocol": "inscene_streaming_canonical_v2_obs28_h124",
+  "canonical_protocol_sha256": "215c720c8537f4dfae6243bedcc7339fbb7e3ba8a6ca2dcaf04f49cd4b738e4f",
+  "source": "scannetpp",
+  "frame_index_schema": "image_mask_intersection_v1",
+  "canonical_window": {
+    "observations": 28,
+    "sampling": "motion_uniform",
+    "motion_step": 0.35,
+    "rotation_weight": 0.5,
+    "window_stride": 8,
+    "max_windows_per_scene": 4
+  },
+  "streaming": {
+    "prefix_lengths": [8, 12, 16, 24],
+    "input_rule": "canonical_window_indices[:prefix_length]"
+  },
+  "target": {
+    "prefix_lengths": [8, 12, 16, 24],
+    "future_horizons": [1, 2, 4],
+    "include_anchors": true,
+    "anchor_rule": "canonical_window_indices[prefix_length - 1]",
+    "future_rule": "canonical_window_indices[prefix_length - 1 + future_horizon]"
+  },
+  "feature_namespaces": {
+    "streaming": "FEAT_STREAMING_CANONICAL_V2_SEEDED_V1",
+    "target": "FEAT_TARGET_CANONICAL_V2_SEEDED_V1"
+  },
+  "feature_generation": {
+    "contract": "inscene_deterministic_noise_v1",
+    "wan_cogvideox_seed_scheme": "inscene_noise_seed_v1",
+    "seed_payload": "canonical_json_utf8_sorted_compact({noise_seed_scheme,identity})",
+    "seed_hash": "sha256_first_8_bytes_big_endian_mask_u63",
+    "seed_excludes": ["timestep", "layer", "process_rank", "sample_order"],
+    "streaming_identity": [
+      "canonical_protocol",
+      "canonical_protocol_sha256",
+      "vfm",
+      "model_id",
+      "scene_id",
+      "sample_kind=streaming_prefix",
+      "window_id",
+      "prefix_len"
+    ],
+    "target_identity": [
+      "canonical_protocol",
+      "canonical_protocol_sha256",
+      "vfm",
+      "model_id",
+      "scene_id",
+      "sample_kind=target_isolated",
+      "frame_index"
+    ],
+    "generator_scope": "fresh_torch_generator_per_logical_sample_on_model_device",
+    "wan_cogvideox_require_explicit_generator": true,
+    "minimax_h3_seed_scheme": "minimax_h3_fixed_seed_v1",
+    "minimax_h3_internal_seed": 0,
+    "minimax_h3_seed_scope": "reset_per_forward"
+  },
+  "expected_universe": {
+    "collected_scenes": 682,
+    "eligible_scenes": 681,
+    "ineligible_scenes": ["a003a6585e"],
+    "canonical_windows": 2721,
+    "streaming_prefix_units": 10884,
+    "target_scene_units": 681,
+    "layers_per_timestep": 3
+  },
+  "acceptance": {
+    "legacy_features_valid": false,
+    "deterministic_noise_provenance_required": true,
+    "manifest_must_match_prefix_index": true,
+    "target_indices_must_cover_anchor_and_future": true,
+    "audit_gate": "fail_closed"
+  }
+}

@@ -5,6 +5,7 @@ from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from vidfm3d.models.components.backbone_pixalign import BackbonePA
 from vidfm3d.models.components.dpt_head import DPTHead
+from vidfm3d.models.components.movement_head import RelativeMovementHead
 from vidfm3d.vggt.heads.camera_head import CameraHead
 
 
@@ -33,6 +34,11 @@ class ProbeModelPA(nn.Module, PyTorchModelHubMixin):
         )
         self.camera_head = (
             CameraHead(dim_in=embed_dim * 2) if "camera" in active_heads else None
+        )
+        self.movement_head = (
+            RelativeMovementHead(dim_in=embed_dim * 2)
+            if "movement" in active_heads
+            else None
         )
         self.point_head = (
             DPTHead(
@@ -93,6 +99,8 @@ class ProbeModelPA(nn.Module, PyTorchModelHubMixin):
         Returns:
             dict: A dictionary containing the following predictions:
                 - pose_enc (torch.Tensor): Camera pose encoding with shape [B, S, 9] (from the last iteration)
+                - movement (torch.Tensor): Adjacent relative camera movements with
+                  shape [B, S-1, 9] (from the last iteration)
                 - depth (torch.Tensor): Predicted depth maps with shape [B, S, H, W, 1]
                 - depth_conf (torch.Tensor): Confidence scores for depth predictions with shape [B, S, H, W]
                 - world_points (torch.Tensor): 3D world coordinates for each pixel with shape [B, S, H, W, 3]
@@ -114,6 +122,11 @@ class ProbeModelPA(nn.Module, PyTorchModelHubMixin):
                 pose_enc_list = self.camera_head(aggregated_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]
                 predictions["pose_enc_list"] = pose_enc_list
+
+            if self.movement_head is not None:
+                movement_list = self.movement_head(aggregated_tokens_list)
+                predictions["movement"] = movement_list[-1]
+                predictions["movement_list"] = movement_list
 
             if self.depth_head is not None:
                 depth, depth_conf = self.depth_head(

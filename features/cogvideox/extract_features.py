@@ -51,6 +51,7 @@ def forward_cogvideox(
     frames: List[Image.Image],
     t: int,
     layer_ids: List[int],
+    noise_generator: torch.Generator | None = None,
 ) -> Dict[int, torch.Tensor]:
     # 1.  Build 2 clips, each 49 frames:
     #     clip_0 = [0, 1, 3, 5, ..., 95]
@@ -72,6 +73,7 @@ def forward_cogvideox(
                 video=clip,
                 t=t,
                 output_layer_indices=layer_ids,
+                noise_generator=noise_generator,
             )
             all_features.append(feat)
 

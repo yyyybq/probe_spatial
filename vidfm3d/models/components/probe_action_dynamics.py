@@ -27,8 +27,18 @@ class ActionDynamicsProbe(nn.Module):
         num_heads: int = 8,
         max_seq_len: int = 16,
         dropout: float = 0.1,
+        conditioning: str = "full",
     ) -> None:
         super().__init__()
+        if conditioning not in {"full", "visual_only", "action_only"}:
+            raise ValueError(f"Unknown conditioning={conditioning!r}")
+        self.conditioning = conditioning
+        # These constants exist in every variant, keeping parameter counts
+        # matched while selectively removing information.
+        self.constant_context = nn.Parameter(torch.zeros(1, 1, in_channels))
+        self.constant_action = nn.Parameter(torch.zeros(1, action_dim))
+        nn.init.normal_(self.constant_context, std=0.02)
+        nn.init.normal_(self.constant_action, std=0.02)
         self.feat_proj = nn.Sequential(
             nn.LayerNorm(in_channels),
             nn.Linear(in_channels, hidden_dim),
@@ -69,6 +79,10 @@ class ActionDynamicsProbe(nn.Module):
     ) -> torch.Tensor:
         B, T = input_feat.shape[:2]
         z = input_feat.mean(dim=(2, 3))                # (B, T, C)
+        if self.conditioning == "action_only":
+            z = self.constant_context.expand(B, T, -1)
+        if self.conditioning == "visual_only":
+            action = self.constant_action.expand(B, -1)
         z = self.feat_proj(z)                          # (B, T, D)
 
         action_tok = self.action_proj(action).unsqueeze(1)        # (B, 1, D)

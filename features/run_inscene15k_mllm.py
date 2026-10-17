@@ -30,6 +30,21 @@ import numpy as np
 import torch
 from PIL import Image
 from safetensors.torch import save_file
+from features.noise_seed import (
+    DETERMINISTIC_NOISE_CONTRACT,
+    NO_NOISE_SEED_SCHEME,
+    deterministic_no_noise_metadata,
+    noise_metadata_matches,
+)
+from features.run_inscene15k import (
+    CANONICAL_STREAMING_OBS_LEN,
+    CANONICAL_STREAMING_PROTOCOL,
+    CANONICAL_STREAMING_PROTOCOL_SHA256,
+    canonical_protocol_metadata,
+    streaming_prefix_records_for_scene as canonical_streaming_prefix_records_for_scene,
+    target_selection_for_scene as canonical_target_selection_for_scene,
+    validate_canonical_window_args,
+)
 try:
     from vidfm3d.utils.feature_layers import parse_layers_arg
     from vidfm3d.utils.temporal_sampling import (
@@ -60,6 +75,34 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M",
 )
 log = logging.getLogger(__name__)
+
+
+SEEDED_STREAM_NAMESPACE = "FEAT_STREAMING_CANONICAL_V2_SEEDED_V1"
+SEEDED_TARGET_NAMESPACE = "FEAT_TARGET_CANONICAL_V2_SEEDED_V1"
+SEEDED_NAMESPACES = {SEEDED_STREAM_NAMESPACE, SEEDED_TARGET_NAMESPACE}
+GAP_NAMESPACES = {
+    "FEAT_STREAMING_CANONICAL_V2_GAP_DELTA_V1",
+    "FEAT_TARGET_CANONICAL_V2_GAP_DELTA_V1",
+}
+
+
+def merge_extra_metadata(manifest: dict, extra_metadata: dict | None) -> None:
+    """Merge gap metadata without allowing identity fields to be changed."""
+    if not extra_metadata:
+        return
+    conflicts = sorted(
+        key
+        for key, value in extra_metadata.items()
+        if key in manifest and manifest[key] != value
+    )
+    if conflicts:
+        raise RuntimeError(
+            "target delta metadata attempts to replace reserved fields: "
+            + ",".join(conflicts)
+        )
+    for key, value in extra_metadata.items():
+        if key not in manifest:
+            manifest[key] = value
 
 
 def collect_infinigen_scenes(source_path: str) -> list[dict]:
@@ -233,43 +276,9 @@ def prefix_dir_name(record: dict) -> str:
 
 
 def streaming_prefix_records_for_scene(scene: dict, args) -> list[dict]:
+    if args.mode == "streaming_prefix":
+        return canonical_streaming_prefix_records_for_scene(scene, args)
     num_frames = len(scene["img_files"])
-    max_record_len = max(args.prefix_lengths or [args.prefix_max_len])
-    max_record_len = min(int(max_record_len), int(args.prefix_max_len), num_frames)
-    if (
-        args.mode == "streaming_prefix"
-        and args.temporal_sampling == "motion_uniform"
-        and scene.get("source") == "scannetpp"
-        and "poses_c2w" in scene
-    ):
-        windows = temporal_windows_from_poses(
-            scene["poses_c2w"],
-            observations_per_window=max_record_len,
-            motion_step=args.streaming_motion_step,
-            rotation_weight=args.streaming_rotation_weight,
-            window_stride=args.streaming_window_stride,
-            max_windows_per_scene=args.streaming_max_windows_per_scene,
-        )
-        records = []
-        for window in windows:
-            indices = list(window["indices"])
-            lengths = args.prefix_lengths or list(range(args.prefix_min_len, len(indices) + 1, args.prefix_stride))
-            for length in lengths:
-                length = int(length)
-                if length < args.prefix_min_len or length > len(indices):
-                    continue
-                records.append({
-                    "tail": length - 1,
-                    "indices": indices[:length],
-                    "window_indices": indices,
-                    "window_id": int(window["window_id"]),
-                    "obs_start": int(window["obs_start"]),
-                    "valid_length": length,
-                    "sampling": window["sampling"],
-                    "motion_step": float(window["motion_step"]),
-                    "rotation_weight": float(window["rotation_weight"]),
-                })
-        return records
     return streaming_prefix_records(
         num_frames,
         min_len=args.prefix_min_len,
@@ -280,6 +289,9 @@ def streaming_prefix_records_for_scene(scene: dict, args) -> list[dict]:
 
 
 def streaming_target_indices_for_scene(scene: dict, args) -> list[int]:
+    if args.target_from_streaming_windows:
+        indices, _ = canonical_target_selection_for_scene(scene, args)
+        return indices
     prefixes = args.target_prefix_lengths or [8]
     horizons = args.target_horizons or [1, 2, 4]
     required_obs = max(
@@ -676,6 +688,7 @@ def main() -> None:
     parser.add_argument("--source", default="scannetpp", choices=["all", "infinigen", "scannetpp"])
     parser.add_argument("--backend", default="qwen2_5_vl", choices=["qwen2_5_vl", "bagel_hf", "generic_hf"])
     parser.add_argument("--model-id", default=None)
+    parser.add_argument("--t", type=int, default=749, help="Provenance timestep identity")
     parser.add_argument("--vfm-name", default=None, help="Output subdir name; defaults to backend.")
     parser.add_argument("--prompt", default="Describe the spatial layout of this scene.")
     parser.add_argument(
@@ -716,16 +729,57 @@ def main() -> None:
     parser.add_argument("--streaming-rotation-weight", type=float, default=0.5)
     parser.add_argument("--streaming-window-stride", type=int, default=8)
     parser.add_argument("--streaming-max-windows-per-scene", type=int, default=4)
+    parser.add_argument(
+        "--streaming-window-obs-len",
+        type=int,
+        default=CANONICAL_STREAMING_OBS_LEN,
+    )
     parser.add_argument("--context-len", type=int, default=76)
     parser.add_argument("--context-stride", type=int, default=1)
     parser.add_argument("--target-from-streaming-windows", action="store_true")
     parser.add_argument("--target-prefix-lengths", default="8,12,16,24")
     parser.add_argument("--target-horizons", default="1,2,4")
     parser.add_argument("--no-cache-checksum", action="store_true")
+    parser.add_argument("--canonical-gap-worklist", default=None)
+    parser.add_argument("--canonical-gap-worklist-sha256", default=None)
     args = parser.parse_args()
     args.prefix_lengths = parse_int_list(args.prefix_lengths)
     args.target_prefix_lengths = parse_int_list(args.target_prefix_lengths) or [8, 12, 16, 24]
     args.target_horizons = parse_int_list(args.target_horizons) or [1, 2, 4]
+    canonical_feature_mode = args.mode == "streaming_prefix" or (
+        args.mode == "target_isolated" and args.target_from_streaming_windows
+    )
+    feature_namespace = os.environ.get("FEATURE_NAMESPACE", "").strip()
+    if canonical_feature_mode:
+        if args.backend != "qwen2_5_vl":
+            raise SystemExit("canonical-v2 MLLM extraction currently supports qwen2_5_vl only")
+        if feature_namespace not in SEEDED_NAMESPACES and not (
+            args.canonical_gap_worklist and feature_namespace in GAP_NAMESPACES
+        ):
+            raise SystemExit(
+                "canonical-v2 Qwen extraction requires a seeded-v1 FEATURE_NAMESPACE"
+            )
+        if Path(args.out_root).resolve().name != feature_namespace:
+            raise SystemExit(
+                "canonical-v2 --out-root basename must exactly match FEATURE_NAMESPACE"
+            )
+        if args.no_cache_checksum:
+            raise SystemExit("canonical-v2 forbids --no-cache-checksum")
+        if os.environ.get("EXTRACT_DONE_INDEX", "").strip():
+            raise SystemExit(
+                "canonical-v2 forbids EXTRACT_DONE_INDEX key-only cache completion"
+            )
+        try:
+            validate_canonical_window_args(args)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        protocol = canonical_protocol_metadata(args)
+        if (
+            protocol["protocol"] != CANONICAL_STREAMING_PROTOCOL
+            or protocol["protocol_sha256"] != CANONICAL_STREAMING_PROTOCOL_SHA256
+            or int(args.streaming_window_obs_len) != CANONICAL_STREAMING_OBS_LEN
+        ):
+            raise SystemExit("Qwen runtime does not match the frozen canonical-v2 protocol")
     if (
         args.mode in {"normal", "shuffled", "context_segment"}
         and os.environ.get("ALLOW_NON_STREAMING") != "1"
@@ -764,6 +818,52 @@ def main() -> None:
     )
     log.info("Using output layers for %s: %s", vfm_name, args.output_layers)
 
+    if bool(args.canonical_gap_worklist) != bool(args.canonical_gap_worklist_sha256):
+        raise SystemExit(
+            "--canonical-gap-worklist and --canonical-gap-worklist-sha256 "
+            "must be supplied together"
+        )
+    gap_worklist = None
+    if args.canonical_gap_worklist:
+        if not canonical_feature_mode:
+            raise SystemExit("canonical gap worklists are valid only for canonical feature modes")
+        from features.canonical_gap_worklist import (
+            CanonicalGapWorklist,
+            GapWorklistError,
+            static_prefix_index_metadata,
+            streaming_worklist_preprocess_identity,
+            stream_unit_producer_metadata,
+            stream_unit_semantic_matches,
+            stream_unit_semantic_metadata,
+        )
+
+        protocol = canonical_protocol_metadata(args)
+        try:
+            gap_worklist = CanonicalGapWorklist.load(
+                args.canonical_gap_worklist,
+                expected_sha256=args.canonical_gap_worklist_sha256,
+                mode=args.mode,
+                vfm=vfm_name,
+                model_id=str(args.model_id),
+                timestep=int(args.t),
+                feature_namespace=feature_namespace,
+                output_layers=args.output_layers,
+                protocol_sha256=protocol["protocol_sha256"],
+                actual_prompt=str(args.prompt),
+                preprocess_identity=(
+                    streaming_worklist_preprocess_identity(
+                        vfm_name, args.resize, int(args.num_frames)
+                    )
+                    if args.mode == "streaming_prefix"
+                    else {
+                        "resize": [int(value) for value in args.resize],
+                        "num_frames": int(args.num_frames),
+                    }
+                ),
+            )
+        except GapWorklistError as exc:
+            raise SystemExit(f"invalid canonical gap worklist: {exc}") from exc
+
     scenes = []
     if args.source in ("all", "infinigen"):
         path = os.path.join(args.data_root, "processed_infinigen")
@@ -775,13 +875,144 @@ def main() -> None:
             scenes.extend(collect_scannetpp_scenes(path))
 
     scenes = scenes[args.start : args.end]
+    if gap_worklist is not None:
+        scenes = [scene for scene in scenes if scene_name(scene) in gap_worklist.scenes]
     log.info("Processing %d scenes", len(scenes))
 
     def out_fname(layer: int) -> str:
         return f"feature_layer{layer}.sft"
 
+    def requested_stream_layers(scene: str, record: dict) -> list[int]:
+        if gap_worklist is None:
+            return list(args.output_layers)
+        return sorted(
+            gap_worklist.stream_layers(
+                scene, int(record["window_id"]), int(record["valid_length"])
+            )
+        )
+
+    def requested_target_indices_by_layer(scene: str) -> dict[int, list[int]]:
+        if gap_worklist is None:
+            return {}
+        result = {int(layer): [] for layer in args.output_layers}
+        for frame_index in gap_worklist.target_frame_indices(scene):
+            for layer in gap_worklist.target_layers(scene, frame_index):
+                result[int(layer)].append(int(frame_index))
+        return {layer: values for layer, values in result.items() if values}
+
+    def target_delta_dir(base_dir: str) -> Path:
+        if gap_worklist is None:
+            raise RuntimeError("target_delta_dir requires a bound gap worklist")
+        return Path(base_dir) / ".canonical_v2_target_delta" / gap_worklist.file_sha256[:16]
+
+    def target_delta_feature_path(base_dir: str, layer: int) -> Path:
+        return target_delta_dir(base_dir) / f"feature_t{int(args.t)}_layer{int(layer)}.delta.sft"
+
+    def target_delta_index_path(base_dir: str, layer: int) -> Path:
+        return target_delta_dir(base_dir) / f"target_indices_layer{int(layer)}.npy"
+
+    extractor_source_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    no_noise_metadata = deterministic_no_noise_metadata()
+
     def cache_complete(path: str) -> bool:
-        return os.path.exists(path)
+        path_obj = Path(path)
+        if not canonical_feature_mode:
+            return path_obj.is_file()
+        sidecar = Path(f"{path_obj}.manifest.json")
+        if (
+            path_obj.is_symlink()
+            or sidecar.is_symlink()
+            or not path_obj.is_file()
+            or not sidecar.is_file()
+        ):
+            return False
+        try:
+            metadata = json.loads(sidecar.read_text())
+            digest = hashlib.sha256(path_obj.read_bytes()).hexdigest()
+            protocol = canonical_protocol_metadata(args)
+            expected = {
+                "schema_version": 1,
+                "frame_index_schema": "image_mask_intersection_v1",
+                "backend": args.backend,
+                "vfm": vfm_name,
+                "model_id": args.model_id,
+                "mode": args.mode,
+                "feature_namespace": feature_namespace,
+                "timestep": int(args.t),
+                "prompt": args.prompt,
+                "resize": list(args.resize) if args.resize else None,
+                "file": path_obj.name,
+                "size_bytes": path_obj.stat().st_size,
+                "sha256": digest,
+                "extractor_source_sha256": extractor_source_sha256,
+                "canonical_protocol": protocol["protocol"],
+                "canonical_protocol_sha256": protocol["protocol_sha256"],
+                "canonical_obs_len": int(args.streaming_window_obs_len),
+            }
+            return (
+                isinstance(metadata, dict)
+                and all(metadata.get(key) == value for key, value in expected.items())
+                and noise_metadata_matches(metadata, no_noise_metadata)
+            )
+        except Exception:
+            return False
+
+    def stream_gap_metadata(
+        scene: str,
+        record: dict,
+        layer: int,
+        _requested_layers: Sequence[int],
+    ) -> dict:
+        metadata = {
+            **stream_unit_semantic_metadata(
+                gap_worklist, scene, record, layer
+            ),
+            **stream_unit_producer_metadata(gap_worklist),
+        }
+        # ``save_feat`` owns these immutable base fields.  Keep them in the
+        # stable semantic expectation, but do not attempt to replace reserved
+        # manifest keys while publishing.  ``num_frames`` is *not* owned by
+        # ``save_feat``: Qwen is no-pad, so each prefix must keep its own
+        # frame count from ``stream_unit_semantic_metadata``.
+        for key in (
+            "frame_index_schema",
+            "resize",
+            "canonical_protocol",
+            "canonical_protocol_sha256",
+            "canonical_obs_len",
+        ):
+            metadata.pop(key, None)
+        return metadata
+
+    def stream_gap_complete(
+        path: str, scene: str, record: dict, layer: int, requested_layers: Sequence[int]
+    ) -> bool:
+        if gap_worklist is None:
+            return cache_complete(path)
+        path_obj = Path(path)
+        sidecar = Path(f"{path_obj}.manifest.json")
+        if path_obj.is_symlink() or sidecar.is_symlink() or not path_obj.is_file() or not sidecar.is_file():
+            return False
+        try:
+            metadata = json.loads(sidecar.read_text())
+            digest = hashlib.sha256(path_obj.read_bytes()).hexdigest()
+            expected = stream_unit_semantic_metadata(
+                gap_worklist, scene, record, layer
+            )
+            return (
+                cache_complete(str(path_obj))
+                and
+                metadata.get("sha256") == digest
+                and metadata.get("size_bytes") == path_obj.stat().st_size
+                and stream_unit_semantic_matches(metadata, expected)
+                and metadata.get("vfm") == vfm_name
+                and metadata.get("model_id") == args.model_id
+                and metadata.get("timestep") == int(args.t)
+                and metadata.get("prompt") == args.prompt
+                and metadata.get("resize") == list(args.resize)
+            )
+        except Exception:
+            return False
 
     def target_indices_for_scene(scene: dict) -> list[int]:
         if args.target_from_streaming_windows:
@@ -791,34 +1022,196 @@ def main() -> None:
         count = max(2, min(int(args.num_targets), len(scene["img_files"])))
         return np.linspace(0, len(scene["img_files"]) - 1, count).round().astype(int).tolist()
 
-    def target_index_complete(base_dir: str, expected_indices: Sequence[int]) -> bool:
-        if not expected_indices:
-            return True
-        path = os.path.join(base_dir, "target_indices.npy")
-        if not os.path.exists(path):
+    def target_provenance_for_scene(scene: dict) -> list[dict]:
+        if not args.target_from_streaming_windows:
+            return []
+        _, provenance = canonical_target_selection_for_scene(scene, args)
+        return provenance
+
+    def index_provenance() -> dict:
+        """Return the immutable canonical identity for structural indexes."""
+        protocol = canonical_protocol_metadata(args)
+        result = {
+            "canonical_protocol": protocol["protocol"],
+            "canonical_protocol_sha256": protocol["protocol_sha256"],
+            "canonical_obs_len": int(args.streaming_window_obs_len),
+            "extractor_source_sha256": extractor_source_sha256,
+            **no_noise_metadata,
+        }
+        if gap_worklist is not None:
+            result.update(static_prefix_index_metadata(gap_worklist))
+        return result
+
+    def _jsonable(value):
+        if isinstance(value, np.ndarray):
+            return [_jsonable(item) for item in value.tolist()]
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {str(key): _jsonable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_jsonable(item) for item in value]
+        return value
+
+    def prefix_index_complete(base_dir: str, expected_records: Sequence[dict]) -> bool:
+        """Require a byte-bound index whose records equal the canonical windows."""
+        path = Path(base_dir) / "prefix_index.npy"
+        sidecar_path = Path(f"{path}.manifest.json")
+        if (
+            path.is_symlink()
+            or sidecar_path.is_symlink()
+            or not path.is_file()
+            or not sidecar_path.is_file()
+        ):
             return False
         try:
-            cached = np.load(path).astype(np.int64).tolist()
+            cached = _jsonable(np.load(path, allow_pickle=True).tolist())
+            expected = _jsonable(list(expected_records))
+            sidecar = json.loads(sidecar_path.read_text())
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            provenance = index_provenance()
+            return (
+                cached == expected
+                and sidecar.get("schema_version") == 1
+                and sidecar.get("file") == path.name
+                and sidecar.get("feature_namespace") == feature_namespace
+                and sidecar.get("size_bytes") == path.stat().st_size
+                and sidecar.get("sha256") == digest
+                and sidecar.get("shape") == [len(expected)]
+                and sidecar.get("dtype") == "object"
+                and all(sidecar.get(key) == value for key, value in provenance.items())
+                and noise_metadata_matches(sidecar, no_noise_metadata)
+            )
         except Exception:
             return False
-        return cached == [int(v) for v in expected_indices]
+
+    def target_index_complete(
+        base_dir: str,
+        expected_indices: Sequence[int],
+        expected_provenance: Sequence[dict] | None = None,
+    ) -> bool:
+        if not expected_indices:
+            return True
+        path_obj = Path(base_dir) / "target_indices.npy"
+        sidecar_path = Path(f"{path_obj}.manifest.json")
+        target_meta_path = Path(base_dir) / "target_indices.meta.json"
+        if (
+            path_obj.is_symlink()
+            or sidecar_path.is_symlink()
+            or target_meta_path.is_symlink()
+            or not path_obj.is_file()
+            or not sidecar_path.is_file()
+            or not target_meta_path.is_file()
+        ):
+            return False
+        try:
+            cached = np.load(path_obj).astype(np.int64).tolist()
+        except Exception:
+            return False
+        if cached != [int(v) for v in expected_indices]:
+            return False
+        if not canonical_feature_mode:
+            return True
+        try:
+            sidecar = json.loads(sidecar_path.read_text())
+            target_meta = json.loads(target_meta_path.read_text())
+            protocol = canonical_protocol_metadata(args)
+            digest = hashlib.sha256(path_obj.read_bytes()).hexdigest()
+            return (
+                sidecar.get("schema_version") == 1
+                and sidecar.get("file") == path_obj.name
+                and sidecar.get("sha256") == digest
+                and sidecar.get("size_bytes") == path_obj.stat().st_size
+                and sidecar.get("feature_namespace") == feature_namespace
+                and sidecar.get("canonical_protocol") == protocol["protocol"]
+                and sidecar.get("canonical_protocol_sha256") == protocol["protocol_sha256"]
+                and sidecar.get("canonical_obs_len") == int(args.streaming_window_obs_len)
+                and sidecar.get("extractor_source_sha256") == extractor_source_sha256
+                and noise_metadata_matches(sidecar, no_noise_metadata)
+                and target_meta.get("schema_version") == 2
+                and target_meta.get("feature_namespace") == feature_namespace
+                and target_meta.get("protocol") == protocol["protocol"]
+                and target_meta.get("protocol_sha256") == protocol["protocol_sha256"]
+                and target_meta.get("obs_len") == int(args.streaming_window_obs_len)
+                and target_meta.get("prefixes") == [int(v) for v in args.target_prefix_lengths]
+                and target_meta.get("horizons") == [int(v) for v in args.target_horizons]
+                and target_meta.get("include_anchors") is True
+                and target_meta.get("target_count") == len(expected_indices)
+                and target_meta.get("target_indices_sha256") == digest
+                and target_meta.get("extractor_source_sha256") == extractor_source_sha256
+                and target_meta.get("provenance") == list(expected_provenance or [])
+                and noise_metadata_matches(target_meta, no_noise_metadata)
+            )
+        except Exception:
+            return False
+
+    def write_target_index_metadata(
+        path: str,
+        target_indices: Sequence[int],
+        target_provenance: Sequence[dict],
+    ) -> None:
+        path_obj = Path(path)
+        protocol = canonical_protocol_metadata(args)
+        metadata = {
+            "schema_version": 2,
+            "feature_namespace": feature_namespace,
+            "protocol": protocol["protocol"],
+            "protocol_sha256": protocol["protocol_sha256"],
+            "obs_len": int(args.streaming_window_obs_len),
+            "prefixes": [int(value) for value in args.target_prefix_lengths],
+            "horizons": [int(value) for value in args.target_horizons],
+            "include_anchors": True,
+            "target_count": len(target_indices),
+            "target_indices_sha256": hashlib.sha256(path_obj.read_bytes()).hexdigest(),
+            "extractor_source_sha256": extractor_source_sha256,
+            "provenance": list(target_provenance),
+            **no_noise_metadata,
+        }
+        target_meta = path_obj.with_name("target_indices.meta.json")
+        temporary = target_meta.with_name(f".{target_meta.name}.tmp-{os.getpid()}")
+        temporary.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, target_meta)
 
     def layer_paths_complete(base_dir: str, layers: Sequence[int]) -> bool:
         return all(cache_complete(os.path.join(base_dir, out_fname(l))) for l in layers)
 
-    def save_index(path: str, array) -> None:
+    def stored_prefix_record(record: dict) -> dict:
+        stored = dict(record)
+        stored["input_length"] = len(record["indices"])
+        stored["valid_length"] = len(record["indices"])
+        stored["pad_mode"] = "none"
+        return stored
+
+    def save_index(path: str, array, provenance: dict | None = None) -> None:
         path_obj = Path(path)
         path_obj.parent.mkdir(parents=True, exist_ok=True)
         tmp = path_obj.with_name(f".{path_obj.name}.tmp-{os.getpid()}")
         with open(tmp, "wb") as handle:
             np.save(handle, array)
+        digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
         os.replace(tmp, path_obj)
+        metadata = {
+            "schema_version": 1,
+            "file": path_obj.name,
+            "feature_namespace": feature_namespace or None,
+            "size_bytes": path_obj.stat().st_size,
+            "sha256": digest,
+            "shape": list(array.shape),
+            "dtype": str(array.dtype),
+        }
+        if provenance:
+            metadata.update(provenance)
+        sidecar = Path(f"{path_obj}.manifest.json")
+        sidecar_tmp = sidecar.with_name(f".{sidecar.name}.tmp-{os.getpid()}")
+        sidecar_tmp.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+        os.replace(sidecar_tmp, sidecar)
 
-    def save_feat(path: str, feat: torch.Tensor) -> None:
+    def save_feat(path: str | Path, feat: torch.Tensor, extra_metadata: dict | None = None) -> None:
         path_obj = Path(path)
         path_obj.parent.mkdir(parents=True, exist_ok=True)
         tmp = path_obj.with_name(f".{path_obj.name}.tmp-{os.getpid()}")
-        save_file({"feat": feat.half().contiguous()}, str(tmp))
+        saved_feat = feat.half().contiguous()
+        save_file({"feat": saved_feat}, str(tmp))
         digest = None
         if not args.no_cache_checksum:
             sha = hashlib.sha256()
@@ -834,17 +1227,81 @@ def main() -> None:
             "vfm": vfm_name,
             "model_id": args.model_id,
             "mode": args.mode,
+            "feature_namespace": feature_namespace or None,
+            "timestep": int(args.t),
             "prompt": args.prompt,
             "resize": list(args.resize) if args.resize else None,
+            "extractor_source_sha256": extractor_source_sha256,
             "file": path_obj.name,
             "size_bytes": path_obj.stat().st_size,
             "sha256": digest,
-            "tensors": {"feat": {"shape": list(feat.shape), "dtype": str(feat.dtype)}},
+            "tensors": {
+                "feat": {"shape": list(saved_feat.shape), "dtype": str(saved_feat.dtype)}
+            },
         }
+        if canonical_feature_mode:
+            protocol = canonical_protocol_metadata(args)
+            manifest.update(
+                {
+                    "canonical_protocol": protocol["protocol"],
+                    "canonical_protocol_sha256": protocol["protocol_sha256"],
+                    "canonical_obs_len": int(args.streaming_window_obs_len),
+                    **no_noise_metadata,
+                }
+            )
+        merge_extra_metadata(manifest, extra_metadata)
+        os.chmod(path_obj, 0o644)
         sidecar = Path(f"{path_obj}.manifest.json")
         sidecar_tmp = sidecar.with_name(f".{sidecar.name}.tmp-{os.getpid()}")
         sidecar_tmp.write_text(json.dumps(manifest, indent=2) + "\n")
+        os.chmod(sidecar_tmp, 0o644)
         os.replace(sidecar_tmp, sidecar)
+        os.chmod(sidecar, 0o644)
+
+    def target_delta_complete(base_dir: str, layer: int, expected_indices: Sequence[int]) -> bool:
+        if gap_worklist is None:
+            return False
+        feature_path = target_delta_feature_path(base_dir, layer)
+        index_path = target_delta_index_path(base_dir, layer)
+        feature_sidecar = Path(f"{feature_path}.manifest.json")
+        index_sidecar = Path(f"{index_path}.manifest.json")
+        if any(
+            path.is_symlink() or not path.is_file()
+            for path in (feature_path, index_path, feature_sidecar, index_sidecar)
+        ):
+            return False
+        try:
+            indices = np.load(index_path).astype(np.int64).tolist()
+            if indices != [int(value) for value in expected_indices]:
+                return False
+            feature_meta = json.loads(feature_sidecar.read_text())
+            index_meta = json.loads(index_sidecar.read_text())
+            feature_sha = hashlib.sha256(feature_path.read_bytes()).hexdigest()
+            index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+            shared = {
+                "gap_worklist_file_sha256": gap_worklist.file_sha256,
+                "gap_worklist_content_sha256": gap_worklist.content_sha256,
+                "canonical_source_sha256": gap_worklist.canonical_source_sha256,
+                "vfm": vfm_name,
+                "model_id": args.model_id,
+                "timestep": int(args.t),
+                "layer": int(layer),
+                "prompt": str(args.prompt),
+                "resize": list(args.resize),
+                "num_frames": int(args.num_frames),
+                "target_indices_sha256": index_sha,
+            }
+            return (
+                all(feature_meta.get(key) == value for key, value in shared.items())
+                and all(index_meta.get(key) == value for key, value in shared.items())
+                and feature_meta.get("sha256") == feature_sha
+                and index_meta.get("sha256") == index_sha
+                and feature_meta.get("tensors", {}).get("feat", {}).get("shape", [None])[0]
+                == len(indices)
+                and noise_metadata_matches(feature_meta, no_noise_metadata)
+            )
+        except Exception:
+            return False
 
     done = 0
     for scene in scenes:
@@ -860,24 +1317,66 @@ def main() -> None:
                     min_tail=0,
                 )
             )
-            all_exist = True
+            all_exist = (
+                True
+                if gap_worklist is not None
+                else
+                prefix_index_complete(
+                    out_dir,
+                    [stored_prefix_record(record) for record in records],
+                )
+                if args.mode == "streaming_prefix"
+                else True
+            )
             for record in records:
+                requested_layers = requested_stream_layers(scene_name(scene), record)
+                if not requested_layers:
+                    continue
                 subdir = prefix_dir_name(record) if args.mode == "streaming_prefix" else context_dir_name(record)
-                if not layer_paths_complete(os.path.join(out_dir, subdir), args.output_layers):
+                record_dir = os.path.join(out_dir, subdir)
+                if not all(
+                    stream_gap_complete(
+                        os.path.join(record_dir, out_fname(layer)),
+                        scene_name(scene), record, layer, requested_layers,
+                    )
+                    for layer in requested_layers
+                ):
                     all_exist = False
                     break
         elif args.mode == "target_isolated":
             expected_targets = target_indices_for_scene(scene)
-            all_exist = (
-                target_index_complete(out_dir, expected_targets)
-                and layer_paths_complete(out_dir, args.output_layers)
-            )
+            if gap_worklist is not None:
+                requested = requested_target_indices_by_layer(scene_name(scene))
+                invalid = sorted(
+                    set().union(*(set(values) for values in requested.values()), set())
+                    - set(expected_targets)
+                )
+                if invalid:
+                    raise RuntimeError(
+                        f"{scene_name(scene)}: target gap worklist escapes canonical union: {invalid[:8]}"
+                    )
+                all_exist = bool(requested) and all(
+                    target_delta_complete(out_dir, layer, indices)
+                    for layer, indices in requested.items()
+                )
+            else:
+                all_exist = (
+                    target_index_complete(
+                        out_dir,
+                        expected_targets,
+                        target_provenance_for_scene(scene),
+                    )
+                    and layer_paths_complete(out_dir, args.output_layers)
+                )
         else:
             all_exist = layer_paths_complete(out_dir, args.output_layers)
         if all_exist:
             done += 1
     log.info("Already done: %d/%d", done, len(scenes))
     if done == len(scenes):
+        return
+    if os.environ.get("EXTRACT_CACHE_CHECK_ONLY") == "1":
+        log.info("EXTRACT_CACHE_CHECK_ONLY=1; exiting before model load")
         return
 
     extractor = MLLMActivationExtractor(
@@ -920,14 +1419,15 @@ def main() -> None:
                 for record in records:
                     subdir = prefix_dir_name(record) if args.mode == "streaming_prefix" else context_dir_name(record)
                     record_dir = os.path.join(out_dir, subdir)
+                    requested_layers = requested_stream_layers(name, record)
                     missing_layers = [
-                        layer for layer in args.output_layers
-                        if not cache_complete(os.path.join(record_dir, out_fname(layer)))
+                        layer for layer in requested_layers
+                        if not stream_gap_complete(
+                            os.path.join(record_dir, out_fname(layer)),
+                            name, record, layer, requested_layers,
+                        )
                     ]
-                    record_meta = dict(record)
-                    record_meta["input_length"] = len(record["indices"])
-                    record_meta["valid_length"] = len(record["indices"])
-                    record_meta["pad_mode"] = "none"
+                    record_meta = stored_prefix_record(record)
                     meta.append(record_meta)
                     if not missing_layers:
                         skipped_records += 1
@@ -935,7 +1435,17 @@ def main() -> None:
                     frames = load_frames(scene["img_dir"], scene["img_files"], record["indices"], resize)
                     feats = extractor(frames, missing_layers)
                     for layer_id, feat in feats.items():
-                        save_feat(os.path.join(record_dir, out_fname(layer_id)), feat)
+                        save_feat(
+                            os.path.join(record_dir, out_fname(layer_id)),
+                            feat,
+                            extra_metadata=(
+                                stream_gap_metadata(
+                                    name, record, layer_id, requested_layers
+                                )
+                                if gap_worklist is not None
+                                else None
+                            ),
+                        )
                     processed_records += 1
 
                 save_index(
@@ -944,6 +1454,7 @@ def main() -> None:
                         "prefix_index.npy" if args.mode == "streaming_prefix" else "context_index.npy",
                     ),
                     np.array(meta, dtype=object),
+                    provenance=(index_provenance() if args.mode == "streaming_prefix" else None),
                 )
 
                 elapsed = time.time() - t0
@@ -970,11 +1481,34 @@ def main() -> None:
                 if not expected_targets:
                     log.warning("%s/%s: no streaming C target frames selected; skip target_isolated", scene["source"], name)
                     continue
-                target_ok = target_index_complete(out_dir, expected_targets)
-                missing_layers = [
-                    layer for layer in args.output_layers
-                    if not (target_ok and cache_complete(os.path.join(out_dir, out_fname(layer))))
-                ]
+                if gap_worklist is not None:
+                    requested_target_by_layer = requested_target_indices_by_layer(name)
+                    invalid = sorted(
+                        set().union(
+                            *(set(values) for values in requested_target_by_layer.values()),
+                            set(),
+                        )
+                        - set(expected_targets)
+                    )
+                    if invalid:
+                        raise RuntimeError(
+                            f"{name}: target gap worklist escapes canonical union: {invalid[:8]}"
+                        )
+                    missing_layers = [
+                        layer
+                        for layer, indices in requested_target_by_layer.items()
+                        if not target_delta_complete(out_dir, layer, indices)
+                    ]
+                else:
+                    target_ok = target_index_complete(
+                        out_dir,
+                        expected_targets,
+                        target_provenance_for_scene(scene),
+                    )
+                    missing_layers = [
+                        layer for layer in args.output_layers
+                        if not (target_ok and cache_complete(os.path.join(out_dir, out_fname(layer))))
+                    ]
             else:
                 missing_layers = [
                     layer for layer in args.output_layers
@@ -984,17 +1518,101 @@ def main() -> None:
                 continue
 
             if args.mode == "target_isolated":
-                target_indices = target_indices_for_scene(scene)
+                target_indices = (
+                    sorted(
+                        {
+                            frame_index
+                            for layer in missing_layers
+                            for frame_index in requested_target_by_layer[layer]
+                        }
+                    )
+                    if gap_worklist is not None
+                    else target_indices_for_scene(scene)
+                )
                 per_layer_collect = {layer: [] for layer in missing_layers}
                 for target_idx in target_indices:
+                    active_layers = (
+                        sorted(
+                            set(gap_worklist.target_layers(name, int(target_idx)))
+                            & set(missing_layers)
+                        )
+                        if gap_worklist is not None
+                        else list(missing_layers)
+                    )
+                    if not active_layers:
+                        continue
                     frames = load_frames(scene["img_dir"], scene["img_files"], [target_idx], resize)
-                    feats = extractor(frames, missing_layers)
+                    feats = extractor(frames, active_layers)
                     for layer_id, feat in feats.items():
                         per_layer_collect[layer_id].append(feat[0])
                 os.makedirs(out_dir, exist_ok=True)
-                for layer_id, values in per_layer_collect.items():
-                    save_feat(os.path.join(out_dir, out_fname(layer_id)), torch.stack(values, dim=0))
-                save_index(os.path.join(out_dir, "target_indices.npy"), np.array(target_indices, dtype=np.int64))
+                if gap_worklist is not None:
+                    target_delta_dir(out_dir).mkdir(parents=True, exist_ok=True)
+                    for layer_id, values in per_layer_collect.items():
+                        layer_indices = requested_target_by_layer[layer_id]
+                        if len(values) != len(layer_indices):
+                            raise RuntimeError(
+                                f"{name}/layer{layer_id}: target delta row count "
+                                f"{len(values)} != worklist {len(layer_indices)}"
+                            )
+                        index_path = target_delta_index_path(out_dir, layer_id)
+                        target_array = np.array(layer_indices, dtype=np.int64)
+                        save_index(str(index_path), target_array)
+                        index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+                        shared = {
+                            "gap_contract": "CANONICAL_V2_GAP_WORKLIST_V1",
+                            "gap_worklist_file_sha256": gap_worklist.file_sha256,
+                            "gap_worklist_content_sha256": gap_worklist.content_sha256,
+                            "canonical_source_sha256": gap_worklist.canonical_source_sha256,
+                            "vfm": vfm_name,
+                            "model_id": args.model_id,
+                            "timestep": int(args.t),
+                            "layer": int(layer_id),
+                            "prompt": str(args.prompt),
+                            "resize": list(args.resize),
+                            "num_frames": int(args.num_frames),
+                            "target_indices_sha256": index_sha,
+                        }
+                        index_sidecar = Path(f"{index_path}.manifest.json")
+                        index_meta = json.loads(index_sidecar.read_text())
+                        index_meta.update(shared)
+                        index_tmp = index_sidecar.with_name(
+                            f".{index_sidecar.name}.tmp-{os.getpid()}"
+                        )
+                        index_tmp.write_text(json.dumps(index_meta, indent=2, sort_keys=True) + "\n")
+                        os.replace(index_tmp, index_sidecar)
+                        save_feat(
+                            target_delta_feature_path(out_dir, layer_id),
+                            torch.stack(values, dim=0),
+                            extra_metadata={
+                                key: value
+                                for key, value in shared.items()
+                                if key
+                                not in {
+                                    "vfm",
+                                    "model_id",
+                                    "timestep",
+                                    "prompt",
+                                    "resize",
+                                }
+                            },
+                        )
+                else:
+                    for layer_id, values in per_layer_collect.items():
+                        save_feat(os.path.join(out_dir, out_fname(layer_id)), torch.stack(values, dim=0))
+                    target_index_path = os.path.join(out_dir, "target_indices.npy")
+                    target_array = np.array(target_indices, dtype=np.int64)
+                    target_provenance = target_provenance_for_scene(scene)
+                    save_index(
+                        target_index_path,
+                        target_array,
+                        provenance=index_provenance(),
+                    )
+                    write_target_index_metadata(
+                        target_index_path,
+                        target_array,
+                        target_provenance,
+                    )
             else:
                 indices = select_frames(scene["img_files"], args.num_frames)
                 while len(indices) < args.num_frames:
@@ -1019,6 +1637,8 @@ def main() -> None:
             log.error("[%d/%d] FAILED %s/%s: %s", done + processed + failed, len(scenes), scene["source"], name, exc)
 
     log.info("Done. Processed=%d Failed=%d Skipped=%d", processed, failed, done)
+    if failed:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

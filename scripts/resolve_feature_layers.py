@@ -24,7 +24,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--vfm", required=True)
     parser.add_argument("--model-id", default=None)
-    parser.add_argument("--field", choices=["default_layer", "last_layer", "feat_postfix", "in_channels"])
+    parser.add_argument(
+        "--field",
+        choices=["default_layer", "last_layer", "feat_postfix", "in_channels", "default_timestep"],
+    )
     parser.add_argument("--format", choices=["json", "list"], default="json")
     args = parser.parse_args()
 
@@ -44,7 +47,7 @@ def main() -> None:
         print(" ".join(str(layer) for layer in layers))
         return
 
-    print(json.dumps(spec.__dict__, indent=2))
+    print(json.dumps({**spec.__dict__, "default_timestep": spec.default_timestep}, indent=2))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - /experiment/inscene15k_streaming/streaming_depth_minimax_h3_v1
+  - _self_
+tags: ["train", "inscene15k_streaming", "minimax_h3", "streaming_prefix", "depth", "movement"]
+job_name: streaming_movement_minimax_h3_v1
+model:
+  probe:
+    active_heads: ["depth", "movement"]
+  loss_weights: {camera: 0.0, movement: 1.0}

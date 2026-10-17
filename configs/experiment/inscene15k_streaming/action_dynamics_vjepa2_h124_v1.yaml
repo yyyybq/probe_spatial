@@ -1,0 +1,9 @@
+# @package _global_
+# C1: equal-weight independent targets at canonical observation horizons 1/2/4.
+defaults:
+  - /experiment/inscene15k_streaming/action_dynamics_vjepa2_v1
+  - _self_
+
+job_name: action_dynamics_vjepa2_h124_v1
+autoresume: false
+action_horizons: [1, 2, 4]

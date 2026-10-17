@@ -50,6 +50,7 @@ class EgoBeliefProbeV2(nn.Module):
         dropout: float = 0.1,
         decoder_type: str = "transformer",
         num_frames: int = 4,
+        context_mode: str = "full",
     ) -> None:
         super().__init__()
         self.n_az_bins = n_az_bins
@@ -59,6 +60,12 @@ class EgoBeliefProbeV2(nn.Module):
             raise ValueError(f"Unknown decoder_type={decoder_type!r}")
         self.decoder_type = decoder_type
         self.num_frames = num_frames
+        if context_mode not in {"full", "query_only"}:
+            raise ValueError(f"Unknown context_mode={context_mode!r}")
+        self.context_mode = context_mode
+        # Present in both variants so the parameter count is identical.
+        self.constant_context = nn.Parameter(torch.zeros(1, 1, 1, 1, in_channels))
+        nn.init.normal_(self.constant_context, std=0.02)
 
         if decoder_type in {"linear", "mlp"}:
             # Fixed, attention-free summary: object query plus one global token
@@ -141,6 +148,8 @@ class EgoBeliefProbeV2(nn.Module):
     ) -> dict:
         feat = self._patchify(vfm_feat)                       # (B, S, Hp, Wp, C)
         B, S, Hp, Wp, _ = feat.shape
+        if self.context_mode == "query_only":
+            feat = self.constant_context.expand(B, S, Hp, Wp, -1)
         if self.decoder_type != "transformer" and S != self.num_frames:
             raise ValueError(f"Expected {self.num_frames} frames, got {S}")
 

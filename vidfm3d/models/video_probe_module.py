@@ -6,7 +6,6 @@ import cv2
 import numpy as np
 import torch
 import torchvision
-import trimesh
 from einops import rearrange
 from lightning import LightningModule
 from lightning.pytorch.loggers.wandb import WandbLogger
@@ -17,9 +16,14 @@ from torchmetrics import MeanMetric
 from torchmetrics.aggregation import BaseAggregator
 
 from vidfm3d.utils import pylogger
-from vidfm3d.utils.eval_utils import align_pmaps, build_mask, pmaps_to_pc
-from vidfm3d.utils.loss import camera_loss, depth_loss, identity_loss, point_loss
-from vidfm3d.utils.vis_utils import dump_viser_artifact, save_scene_glb, vfm_pca_images
+from vidfm3d.utils.loss import (
+    camera_loss,
+    depth_loss,
+    identity_loss,
+    point_loss,
+    relative_movement_loss,
+    require_finite_input,
+)
 from vidfm3d.vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 log = pylogger.RankedLogger(__name__, rank_zero_only=True)
@@ -134,6 +138,9 @@ class VideoProbeLitModule(LightningModule):
         if "pose_enc_list" in output:
             output_dict["pose_list"] = output["pose_enc_list"]
             output_dict["pose"] = output["pose_enc"]
+        if "movement_list" in output:
+            output_dict["movement_list"] = output["movement_list"]
+            output_dict["movement"] = output["movement"]
         if "identity" in output:
             output_dict["identity"] = output["identity"]  # (B, S, H, W, D)
             output_dict["identity_conf"] = output["identity_conf"]  # (B, S, H, W)
@@ -187,6 +194,11 @@ class VideoProbeLitModule(LightningModule):
         for key_name in batch:
             if isinstance(batch[key_name], torch.Tensor):
                 batch[key_name] = batch[key_name].to(device, non_blocking=True)
+
+        # A NaN/inf feature cache cannot produce a meaningful probe. The loss
+        # helpers clamp non-finite losses to zero, so without this check such a
+        # run trains to NaN weights while logging zero loss and TRAIN_COMPLETE.
+        require_finite_input(batch, "vfm_feat")
 
         # Forward pass to get the pmaps
         preds = self.forward(batch)
@@ -249,6 +261,18 @@ class VideoProbeLitModule(LightningModule):
             )
             loss += self.loss_weights["camera"] * cam_loss_dict["loss_camera"]
             loss_details.update(cam_loss_dict)
+        if "movement" in preds and self.loss_weights.get("movement", 0) > 0:
+            movement_loss_dict = relative_movement_loss(
+                preds["movement_list"],
+                batch["extrinsics"],
+                loss_type="huber",
+                return_metrics=return_metrics,
+            )
+            loss += (
+                self.loss_weights["movement"]
+                * movement_loss_dict["loss_movement"]
+            )
+            loss_details.update(movement_loss_dict)
         if "identity" in preds and self.loss_weights.get("identity", 0) > 0:
             id_loss_dict = identity_loss(
                 preds["identity"],  # (B, S, H, W, D)
@@ -264,7 +288,7 @@ class VideoProbeLitModule(LightningModule):
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
         data, preds, loss, loss_details = self.model_step(
-            batch, return_metrics=self.global_step % (self.train_viz_freq // 20) == 0
+            batch, return_metrics=self.global_step % max(self.train_viz_freq // 20, 1) == 0
         )
 
         if not isinstance(
@@ -295,7 +319,7 @@ class VideoProbeLitModule(LightningModule):
         )
         self.log(
             "trainer/lr",
-            self.trainer.lr_scheduler_configs[0].scheduler.get_last_lr()[0],
+            self.trainer.optimizers[0].param_groups[0]["lr"],
             on_step=True,
             on_epoch=False,
             prog_bar=True,
@@ -365,6 +389,8 @@ class VideoProbeLitModule(LightningModule):
                     )
                 # visualize the point cloud for each batch sample
                 if "pmaps" in preds:
+                    from vidfm3d.utils.eval_utils import align_pmaps, build_mask
+
                     mask_i = build_mask(
                         data["cmaps"][i],
                         data["masks"][i] if "masks" in data else None,
@@ -443,7 +469,7 @@ class VideoProbeLitModule(LightningModule):
         batch_size = data["image"].shape[0]
 
         # Log the overall validation loss
-        self.val_loss(loss)
+        self.val_loss(loss, weight=batch_size)
 
         # Log the details of the loss with dataset name and view number in the key
         if loss_details is not None:
@@ -465,6 +491,8 @@ class VideoProbeLitModule(LightningModule):
 
         # Log the aligned pmap mse if available
         if "pmaps" in preds:
+            from vidfm3d.utils.eval_utils import align_pmaps, build_mask
+
             aligned_mses = []
             aligned_preds = []
             for i in range(batch_size):
@@ -538,6 +566,8 @@ class VideoProbeLitModule(LightningModule):
                         name=f"val-viz/{batch_idx}-{i}:depth",
                     )
                     if "pmaps" in preds:
+                        from vidfm3d.utils.vis_utils import save_scene_glb
+
                         self.visualize_pmaps(
                             pmaps=aligned_preds[i],
                             images=data["image"][i],
@@ -601,6 +631,12 @@ class VideoProbeLitModule(LightningModule):
             sync_dist=True,
         )
 
+    def on_test_epoch_start(self) -> None:
+        self.val_loss.reset()
+
+    def on_test_epoch_end(self) -> None:
+        self.log("test/loss", self.val_loss, prog_bar=True)
+
     def test_step(
         self,
         batch: Dict[str, torch.Tensor],
@@ -614,14 +650,14 @@ class VideoProbeLitModule(LightningModule):
         # Extract the dataset name and batch size
         batch_size = data["image"].shape[0]
 
-        # Log the overall validation loss
-        self.val_loss(loss)
+        # Log the overall test loss
+        self.val_loss(loss, weight=batch_size)
 
         # Log the details of the loss with dataset name and view number in the key
         if loss_details is not None:
             for key, value in loss_details.items():
                 self.log(
-                    f"val/{key}",
+                    f"test/{key}",
                     value,
                     on_step=False,
                     on_epoch=True,
@@ -639,7 +675,7 @@ class VideoProbeLitModule(LightningModule):
             save_path = os.path.join(
                 self.output_path,
                 "viz",
-                "val",
+                "test",
                 f"epoch_{self.current_epoch}",
                 f"batch_{batch_idx}_sample_{i}",
             )
@@ -660,13 +696,16 @@ class VideoProbeLitModule(LightningModule):
                 gt_pmaps=data["pmaps"][i] if "pmaps" in data else None,
                 pca_map=pca_maps,
                 save_path=save_path + "_grid.png",
-                name=f"val-viz/{batch_idx}-{i}:grid",
+                name=f"test-viz/{batch_idx}-{i}:grid",
                 save_individual=True,
                 save_only=True,  # Don't log to wandb, just save the images
             )
 
         # Log the aligned pmap mse if available
         if "pmaps" in preds:
+            from vidfm3d.utils.eval_utils import align_pmaps, build_mask
+            from vidfm3d.utils.vis_utils import dump_viser_artifact
+
             aligned_mses = []
             aligned_preds = []
             for i in range(batch_size):
@@ -691,7 +730,7 @@ class VideoProbeLitModule(LightningModule):
                 aligned_preds.append(pred_aligned)
             aligned_mse_avg = np.mean(aligned_mses)
             self.log(
-                "val/pmap_mse_aligned",
+                "test/pmap_mse_aligned",
                 aligned_mse_avg,
                 on_step=False,
                 on_epoch=True,
@@ -715,7 +754,7 @@ class VideoProbeLitModule(LightningModule):
 
             for i in range(batch_size):
                 scene_dir_pred = os.path.join(
-                    self.output_path, "viser_viz", f"batch_{batch_idx}_sample_{i}_pred"
+                    self.output_path, "viser_viz", "test", f"batch_{batch_idx}_sample_{i}_pred"
                 )
                 dump_viser_artifact(
                     aligned_preds[i],
@@ -726,7 +765,7 @@ class VideoProbeLitModule(LightningModule):
                     max_pts=100_000,  # Keep more points since we can filter dynamically
                 )
                 scene_dir_gt = os.path.join(
-                    self.output_path, "viser_viz", f"batch_{batch_idx}_sample_{i}_gt"
+                    self.output_path, "viser_viz", "test", f"batch_{batch_idx}_sample_{i}_gt"
                 )
                 dump_viser_artifact(
                     data["pmaps"][i],
@@ -748,7 +787,7 @@ class VideoProbeLitModule(LightningModule):
                     save_path = os.path.join(
                         self.output_path,
                         "viz",
-                        "val",
+                        "test",
                         f"epoch_{self.current_epoch}",
                         f"batch_{batch_idx}_sample_{i}",
                     )
@@ -772,9 +811,11 @@ class VideoProbeLitModule(LightningModule):
                         gt_pmaps=data["pmaps"][i] if "pmaps" in data else None,
                         pca_map=pca_maps,
                         save_path=save_path + "_depth.png",
-                        name=f"val-viz/{batch_idx}-{i}:depth",
+                        name=f"test-viz/{batch_idx}-{i}:depth",
                     )
                     if "pmaps" in preds:
+                        from vidfm3d.utils.vis_utils import save_scene_glb
+
                         self.visualize_pmaps(
                             pmaps=aligned_preds[i],
                             images=data["image"][i],
@@ -783,7 +824,7 @@ class VideoProbeLitModule(LightningModule):
                             max_points=4096,
                             fg_masks=data["masks"][i] if "masks" in data else None,
                             save_path=save_path + "_pmaps_pred.ply",
-                            name=f"val-viz/{batch_idx}-{i}:pmaps-pred",
+                            name=f"test-viz/{batch_idx}-{i}:pmaps-pred",
                         )
                         self.visualize_pmaps(
                             pmaps=data["pmaps"][i],
@@ -793,7 +834,7 @@ class VideoProbeLitModule(LightningModule):
                             max_points=4096,
                             fg_masks=data["masks"][i] if "masks" in data else None,
                             save_path=save_path + "_pmaps_gt.ply",
-                            name=f"val-viz/{batch_idx}-{i}:pmaps-gt",
+                            name=f"test-viz/{batch_idx}-{i}:pmaps-gt",
                         )
                         self.visualize_pmaps(
                             pmaps=aligned_preds[i],
@@ -804,7 +845,7 @@ class VideoProbeLitModule(LightningModule):
                             max_points=2048,
                             fg_masks=data["masks"][i] if "masks" in data else None,
                             save_path=save_path + "_pmaps_overlay.ply",
-                            name=f"val-viz/{batch_idx}-{i}:pmaps-overlay",
+                            name=f"test-viz/{batch_idx}-{i}:pmaps-overlay",
                         )
                         save_scene_glb(
                             pmaps=preds["pmaps"][i],  # [S,3,H,W]  predicted points
@@ -834,6 +875,8 @@ class VideoProbeLitModule(LightningModule):
         return the PCA-RGB map **only for the requested frames** in `vfm_idx`.
         Output is float in [0,1] on the current device.
         """
+        from vidfm3d.utils.vis_utils import vfm_pca_images
+
         T, hp, wp, C = vfm_feat.shape
 
         # run PCA → list[ np.uint8 ]  (length = T)
@@ -890,9 +933,14 @@ class VideoProbeLitModule(LightningModule):
         if masks is not None:
             masks = masks > 0
 
-        # Subsample to 8 frames if more
+        # Subsample to 8 frames if more.
+        # NOTE: `arange(0, S, S // 8)` is wrong for S in (8, 16): e.g. S=12
+        # yields step=1 (all 12 frames) while the old code then forced S=8,
+        # breaking pca_map/mv_images length checks in validation viz.
+        # Keep indices on CPU: pca_map from _make_pca_tensor is CPU, while
+        # mv_images may be CUDA; CUDA indices cannot index CPU tensors.
         if S > 8:
-            indices = torch.arange(0, S, S // 8)
+            indices = torch.linspace(0, S - 1, steps=8).round().long()
             mv_images = mv_images[indices]
             conf_map = conf_map[indices]
             masks = masks[indices] if masks is not None else None
@@ -901,7 +949,7 @@ class VideoProbeLitModule(LightningModule):
             pred_pmaps = pred_pmaps[indices] if pred_pmaps is not None else None
             gt_pmaps = gt_pmaps[indices] if gt_pmaps is not None else None
             pca_map = pca_map[indices] if pca_map is not None else None
-            S = 8
+            S, C, H, W = mv_images.shape
 
         # Convert everything to CPU for min/max
         if pred_depths is not None and gt_depths is not None:
@@ -1023,11 +1071,7 @@ class VideoProbeLitModule(LightningModule):
 
             # PCA
             pca_bgr = None
-            if pca_map is not None:
-                assert pca_map.shape[:2] == (
-                    S,
-                    3,
-                ), f"expected (S,3,H,W) got {pca_map.shape}"
+            if pca_map is not None and i < pca_map.shape[0] and pca_map.shape[1] == 3:
                 pca_rgb = (pca_map[i].detach().cpu() * 255).byte()
                 pca_bgr = cv2.cvtColor(
                     pca_rgb.permute(1, 2, 0).numpy(), cv2.COLOR_RGB2BGR
@@ -1181,6 +1225,8 @@ class VideoProbeLitModule(LightningModule):
 
         Then delegates to visualize_point_cloud.
         """
+        from vidfm3d.utils.eval_utils import build_mask, pmaps_to_pc
+
         mask = build_mask(conf, fg_masks, thresh=conf_thresh).to(
             pmaps.device
         )  # [S,1,H,W]
@@ -1286,6 +1332,8 @@ class VideoProbeLitModule(LightningModule):
 
         # 2) Export to .ply if save_path is given
         if save_path is not None:
+            import trimesh
+
             # Create a point cloud via trimesh
             pc_trimesh = trimesh.PointCloud(vertices=xyz, colors=color_255)
             # Ensure directory exists
@@ -1360,7 +1408,7 @@ class VideoProbeLitModule(LightningModule):
     def _load_pretrained_weights(self) -> None:
         log.info(f"Loading pretrained: {self.pretrained}")
         log.info(f"Loading pretrained weights from {self.pretrained}")
-        checkpoint = torch.load(self.pretrained)
+        checkpoint = torch.load(self.pretrained, map_location="cpu", weights_only=False)
 
         # Load the probe weights
         filtered_state_dict = {

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "legacy_exact_reference_remote_gate_receipt_v1.schema.json",
+  "title": "LEGACY_EXACT_REFERENCE_REMOTE_GATE_RECEIPT_V1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema",
+    "unit_id",
+    "request_sha256",
+    "source_uri",
+    "source_index_uri",
+    "checked_at",
+    "status",
+    "reason_codes",
+    "payload_full_read_performed",
+    "byte_level_certified"
+  ],
+  "properties": {
+    "schema": {
+      "const": "LEGACY_EXACT_REFERENCE_REMOTE_GATE_RECEIPT_V1"
+    },
+    "unit_id": {"type": "string", "minLength": 1},
+    "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_uri": {"type": "string", "minLength": 1},
+    "source_index_uri": {"type": "string", "minLength": 1},
+    "checked_at": {"type": "string", "minLength": 1},
+    "status": {
+      "enum": [
+        "REFERENCE_SOURCE_READ_ONLY",
+        "REEXTRACT_UNVERIFIED",
+        "PENDING_REMOTE_GATE"
+      ]
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "payload_full_read_performed": {"const": false},
+    "byte_level_certified": {"const": false},
+    "checks": {"type": "object", "additionalProperties": {"type": "boolean"}},
+    "evidence": {"type": "object"},
+    "error": {"type": "string"}
+  }
+}

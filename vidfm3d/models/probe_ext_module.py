@@ -23,10 +23,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lightning import LightningModule
-from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
-from torchmetrics import MeanMetric
 
 from vidfm3d.utils import pylogger
+from vidfm3d.utils.loss import require_finite_input
 
 log = pylogger.RankedLogger(__name__, rank_zero_only=True)
 
@@ -77,6 +76,11 @@ class ProbeExtensionLitModule(LightningModule):
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        if compile:
+            raise ValueError(
+                "ProbeExtensionLitModule does not support compile=True; use compile=False "
+                "to preserve checkpoint compatibility with the diagnostic evaluator."
+            )
         if probe_type not in self.PROBE_TYPES:
             raise ValueError(
                 f"Unknown probe_type {probe_type!r}; must be one of {self.PROBE_TYPES}"
@@ -87,12 +91,15 @@ class ProbeExtensionLitModule(LightningModule):
         self.probe_type = probe_type
         self.kwargs = kwargs
 
-        self.val_loss = MeanMetric()
-
     def _zero_loss(self) -> torch.Tensor:
         """Return a zero loss that is connected to the parameter graph so backward() is safe."""
         p = next(self.probe.parameters())
         return p.sum() * 0.0
+
+    def _empty_metrics(self, *names: str) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Keep the metric schema identical on ranks with no valid targets."""
+        zero = self._zero_loss()
+        return zero, {name: zero.detach() for name in names}
 
     # ------------------------------------------------------------------ A2
     def _step_view_consistency(
@@ -141,7 +148,7 @@ class ProbeExtensionLitModule(LightningModule):
             "loss_overlap": loss.detach(),
             "overlap_mae": mae,
             "overlap_acc": acc,
-            "overlap_n_used": n_used.detach(),
+            "overlap_n_used": (n_pos + n_neg).detach(),
             "overlap_pos_frac": n_pos / n_used,
             "overlap_neg_frac": n_neg / n_used,
         }
@@ -161,9 +168,7 @@ class ProbeExtensionLitModule(LightningModule):
         n_valid = int(valid.sum().item())
         device = batch["vfm_feat"].device
         if n_valid == 0:
-            zero = self._zero_loss()
-            return zero, {"loss_abnormal": zero.detach(),
-                          "abnormal_n_valid": torch.tensor(0.0, device=device)}
+            return self._empty_metrics("loss_abnormal", "abnormal_acc", "abnormal_n_valid")
 
         feat_normal = batch["vfm_feat"][valid]                 # (B', S, H_f, W_f, C)
         feat_shuf = batch["vfm_feat_shuffled"][valid]
@@ -196,8 +201,9 @@ class ProbeExtensionLitModule(LightningModule):
         valid = batch["hidden_obj_valid"]              # (B,) bool
         device = batch["vfm_feat"].device
         if valid.sum() == 0:
-            zero = self._zero_loss()
-            return zero, {"loss_ego": zero.detach(), "ego_n_valid": torch.tensor(0.0, device=device)}
+            return self._empty_metrics(
+                "loss_ego", "ego_az_err_deg", "ego_el_err_deg", "ego_logd_err", "ego_n_valid"
+            )
 
         vfm_feat = batch["vfm_feat"][valid]            # (B', S, H_f, W_f, C)
         per_pix = batch["hidden_obj_mask"][valid]      # (B', S, H, W)
@@ -239,8 +245,10 @@ class ProbeExtensionLitModule(LightningModule):
         valid = batch["hidden_obj_valid"]
         device = batch["vfm_feat"].device
         if valid.sum() == 0:
-            zero = self._zero_loss()
-            return zero, {"loss_belief": zero.detach(), "belief_n_valid": torch.tensor(0.0, device=device)}
+            return self._empty_metrics(
+                "loss_belief", "belief_ce", "belief_top1", "belief_top3",
+                "belief_ang_err_deg", "belief_logd_err", "belief_n_valid",
+            )
 
         vfm_feat = batch["vfm_feat"][valid]                 # (B', S, H_f, W_f, C)
         query_feat = batch["belief_query_feat"][valid]      # (B', C)
@@ -304,9 +312,10 @@ class ProbeExtensionLitModule(LightningModule):
         n_valid = int(valid.sum().item())
         device = batch["input_feat"].device
         if n_valid == 0:
-            zero = self._zero_loss()
-            return zero, {"loss_dyn": zero.detach(),
-                          "dyn_n_valid": torch.tensor(0.0, device=device)}
+            return self._empty_metrics(
+                "loss_dyn", "dyn_mse", "dyn_cos", "dyn_inbatch_R@1",
+                "dyn_inbatch_mean_rank", "dyn_n_valid",
+            )
 
         input_feat = batch["input_feat"][valid]        # (B', T, H_f, W_f, C)
         action = batch["action"][valid]                # (B', 9)
@@ -359,11 +368,10 @@ class ProbeExtensionLitModule(LightningModule):
         n_valid = int(valid.sum().item())
         device = pred.device
         if n_valid == 0:
-            zero = self._zero_loss()
-            return zero, {
-                f"loss_{prefix}": zero.detach(),
-                f"{prefix}_n_valid": torch.tensor(0.0, device=device),
-            }
+            return self._empty_metrics(
+                f"loss_{prefix}", f"{prefix}_mse", f"{prefix}_cos",
+                f"{prefix}_R@1", f"{prefix}_mean_rank", f"{prefix}_n_valid",
+            )
 
         pred_v = pred[valid]
         target_v = target[valid]
@@ -458,29 +466,45 @@ class ProbeExtensionLitModule(LightningModule):
             B, S = overlap_gt.shape[:2]
             logits = self.probe.predict_overlap(frame_sparse)
             eye = torch.eye(S, dtype=torch.bool, device=logits.device).unsqueeze(0).expand(B, -1, -1)
-            bce = F.binary_cross_entropy_with_logits(
-                logits[~eye], overlap_gt[~eye].float()
-            )
-            loss = loss + self.hparams.sae_overlap_weight * bce
-            with torch.no_grad():
-                prob = torch.sigmoid(logits)
-                mae = (prob[~eye] - overlap_gt[~eye]).abs().mean()
+            n_pairs = B * S * (S - 1)
+            if n_pairs:
+                bce = F.binary_cross_entropy_with_logits(
+                    logits[~eye], overlap_gt[~eye].float()
+                )
+                loss = loss + self.hparams.sae_overlap_weight * bce
+                with torch.no_grad():
+                    prob = torch.sigmoid(logits)
+                    mae = (prob[~eye] - overlap_gt[~eye]).abs().mean()
+            else:
+                # A single frame has no distinct view pair. Its reconstruction
+                # remains trainable, while overlap metrics are undefined.
+                bce = mae = logits.detach().new_full((), float("nan"))
             metrics.update({
                 "sae_overlap_bce": bce.detach(),
                 "sae_overlap_mae": mae,
+                "sae_overlap_n_pairs": logits.detach().new_tensor(n_pairs),
             })
 
         if getattr(self.probe, "use_ego_readout", True) and "hidden_obj_valid" in batch:
             valid = batch["hidden_obj_valid"].bool()
+            metrics.update({
+                name: loss.detach().new_zeros(()) for name in (
+                    "sae_ego_loss", "sae_ego_az_err_deg", "sae_ego_el_err_deg",
+                    "sae_ego_logd_err", "sae_ego_n_valid",
+                )
+            })
             if valid.any():
                 query = batch.get("belief_query_feat")
                 query = query[valid] if query is not None else None
                 pred = self.probe.predict_ego(frame_sparse[valid], query)
                 target = batch["hidden_obj_polar"][valid]
-                ego_loss = F.smooth_l1_loss(pred, target)
+                delta = pred - target
+                delta_az = torch.atan2(torch.sin(delta[:, 0]), torch.cos(delta[:, 0]))
+                delta = torch.cat([delta_az.unsqueeze(1), delta[:, 1:]], dim=1)
+                ego_loss = F.smooth_l1_loss(delta, torch.zeros_like(delta))
                 loss = loss + self.hparams.sae_ego_weight * ego_loss
                 with torch.no_grad():
-                    ang_err = torch.abs(pred[:, :2] - target[:, :2]) * (180.0 / 3.14159265)
+                    ang_err = torch.abs(delta[:, :2]) * (180.0 / 3.14159265)
                     logd_err = torch.abs(pred[:, 2] - target[:, 2]).mean()
                 metrics.update({
                     "sae_ego_loss": ego_loss.detach(),
@@ -500,6 +524,10 @@ class ProbeExtensionLitModule(LightningModule):
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=True)
+
+        # Corrupt (NaN/inf) feature caches must stop the run instead of being
+        # trained into NaN weights; see vidfm3d.utils.loss.require_finite_input.
+        require_finite_input(batch, "vfm_feat", "input_feat", "input_feat_seq", "target_feat", "target_feat_seq")
 
         if self.probe_type == "view_consistency":
             return self._step_view_consistency(batch, train)
@@ -527,16 +555,23 @@ class ProbeExtensionLitModule(LightningModule):
             self.log(f"train/{k}", v, on_step=True, on_epoch=False, prog_bar=False)
         self.log(
             "trainer/lr",
-            self.trainer.lr_scheduler_configs[0].scheduler.get_last_lr()[0],
+            self.trainer.optimizers[0].param_groups[0]["lr"],
             on_step=True, on_epoch=False, prog_bar=True,
         )
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, metrics = self.model_step(batch, train=False)
-        self.val_loss(loss)
+        self._log_evaluation_metrics("val", batch, loss, metrics)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        loss, metrics = self.model_step(batch, train=False)
+        self._log_evaluation_metrics("test", batch, loss, metrics)
+        return loss
+
+    def _log_evaluation_metrics(self, stage, batch, loss, metrics):
         count_keys = {
-            "view_consistency": "overlap_n_used",
             "abnormal": "abnormal_n_valid",
             "ego_belief": "ego_n_valid",
             "ego_belief_v2": "belief_n_valid",
@@ -550,29 +585,27 @@ class ProbeExtensionLitModule(LightningModule):
              if isinstance(value, torch.Tensor) and value.ndim > 0),
             1,
         )
-        batch_weight = max(int(count.item()), 1) if count is not None else fallback_weight
-        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True,
+        batch_weight = int(count.item()) if count is not None else fallback_weight
+        self.log(f"{stage}/loss", loss, on_step=False, on_epoch=True, prog_bar=True,
                  sync_dist=True, batch_size=batch_weight)
         for k, v in metrics.items():
-            self.log(f"val/{k}", v, on_step=False, on_epoch=True, prog_bar=False,
-                     sync_dist=True, batch_size=batch_weight)
-        return loss
-
-    def test_step(self, batch, batch_idx):
-        loss, metrics = self.model_step(batch, train=False)
-        fallback_weight = next(
-            (int(value.shape[0]) for value in batch.values()
-             if isinstance(value, torch.Tensor) and value.ndim > 0),
-            1,
-        )
-        batch_weight = max(int(next((v.item() for k, v in metrics.items()
-                                    if k.endswith("_n_valid")), fallback_weight)), 1)
-        self.log("test/loss", loss, on_step=False, on_epoch=True, prog_bar=True,
-                 sync_dist=True, batch_size=batch_weight)
-        for k, v in metrics.items():
-            self.log(f"test/{k}", v, on_step=False, on_epoch=True, prog_bar=False,
-                     sync_dist=True, batch_size=batch_weight)
-        return loss
+            is_count = k.endswith(("_n_valid", "_n_pairs")) or k == "overlap_n_used"
+            weight = batch_weight
+            if k.startswith("sae_ego_"):
+                weight = int(metrics["sae_ego_n_valid"].item())
+            elif k.startswith("sae_overlap_"):
+                weight = int(metrics["sae_overlap_n_pairs"].item())
+            elif k in {"overlap_acc", "overlap_pos_frac", "overlap_neg_frac"}:
+                weight = int(metrics["overlap_n_used"].item())
+            # Small retrieval batches have no defined rank metric. They must
+            # contribute neither a NaN numerator nor a positive denominator.
+            if ("R@" in k or k.endswith("mean_rank")) and not bool(torch.isfinite(v)):
+                v, weight = torch.zeros_like(v), 0
+            if not is_count and weight == 0:
+                v = torch.zeros_like(v)
+            self.log(f"{stage}/{k}", v, on_step=False, on_epoch=True, prog_bar=False,
+                     sync_dist=True, batch_size=weight,
+                     reduce_fx="sum" if is_count else "mean")
 
     def on_train_epoch_start(self) -> None:
         if hasattr(self.trainer.train_dataloader, "dataset") and hasattr(
@@ -585,7 +618,6 @@ class ProbeExtensionLitModule(LightningModule):
             self.trainer.train_dataloader.sampler.set_epoch(self.current_epoch)
 
     def on_validation_epoch_start(self) -> None:
-        self.val_loss.reset()
         for loader in self.trainer.val_dataloaders:
             if hasattr(loader, "dataset") and hasattr(loader.dataset, "set_epoch"):
                 loader.dataset.set_epoch(0)

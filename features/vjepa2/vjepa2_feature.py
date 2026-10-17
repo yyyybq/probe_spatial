@@ -21,6 +21,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from features.offline_hf import resolve_offline_snapshot
+
 
 class VJEPA2Featurizer:
     """Wraps a HuggingFace V-JEPA 2 model for patch-level feature extraction."""
@@ -32,9 +34,17 @@ class VJEPA2Featurizer:
     ) -> None:
         from transformers import AutoModel, AutoVideoProcessor
 
-        self.processor = AutoVideoProcessor.from_pretrained(model_id)
-        self.model = AutoModel.from_pretrained(
+        model_load_id, _provenance = resolve_offline_snapshot(
             model_id,
+            required_paths=(
+                "config.json",
+                "video_preprocessor_config.json",
+                "model.safetensors",
+            ),
+        )
+        self.processor = AutoVideoProcessor.from_pretrained(model_load_id)
+        self.model = AutoModel.from_pretrained(
+            model_load_id,
             torch_dtype=torch.float16,
             attn_implementation="sdpa",
         ).to(device).eval()

@@ -1,0 +1,4 @@
+# Canonical-v2 has no excluded scene/window/prefix units.
+#
+# The two legacy 48da625e8c exclusions were caused by cross-protocol window
+# mismatch and must not be inherited by inscene_streaming_canonical_v2_obs28_h124.

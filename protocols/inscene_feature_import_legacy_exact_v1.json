@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "contract": "LEGACY_EXACT_IMPORT_V1",
+  "canonical_temporal_protocol": "inscene_streaming_canonical_v2_obs28_h124",
+  "scope": "feature_payload_import_overlay_only",
+  "does_not_modify_temporal_protocol": true,
+  "destination_namespaces": {
+    "streaming": "FEAT_STREAMING_CANONICAL_V2_MIXED_V1",
+    "target": "FEAT_TARGET_CANONICAL_V2_MIXED_V1"
+  },
+  "namespace_separation": {
+    "seeded_namespaces_are_never_written": true,
+    "legacy_paths_are_never_modified": true,
+    "mixed_namespace_must_record_generation_contract_per_payload": true
+  },
+  "exact_import_requirements": [
+    "canonical_raw_ids_equal_source_raw_ids_in_order",
+    "vfm_equal",
+    "model_id_equal",
+    "layer_equal",
+    "timestep_equal",
+    "prompt_equal",
+    "preprocessing_identity_equal",
+    "tensor_shape_equal",
+    "tensor_dtype_equal",
+    "safetensors_header_and_payload_readable",
+    "source_payload_sha256_recomputed_at_import"
+  ],
+  "historical_fields_not_required": [
+    "random_seed",
+    "extractor_git_commit",
+    "extractor_provenance",
+    "historical_payload_sha256"
+  ],
+  "fail_closed": {
+    "missing_identity_evidence": "REEXTRACT",
+    "raw_id_mismatch": "REEXTRACT",
+    "valid_historical_sha_mismatch": "REEXTRACT",
+    "unreadable_payload": "REEXTRACT",
+    "remote_payload_not_read_and_hashed": "UNVERIFIED"
+  },
+  "import_receipt_required_fields": [
+    "contract",
+    "canonical_protocol",
+    "canonical_protocol_file_sha256",
+    "source_path",
+    "source_payload_sha256",
+    "source_size_bytes",
+    "destination_path",
+    "raw_ids",
+    "vfm",
+    "model_id",
+    "layer",
+    "timestep",
+    "prompt",
+    "preprocess_identity"
+  ]
+}

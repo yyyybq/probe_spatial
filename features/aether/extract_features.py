@@ -5,8 +5,8 @@ save **one safetensor per requested layer**:
 
     <out_dir>/feature_t{start_idx}_layer{layer_id}.sft
 
-Each file holds a single key  ``"feat"``  whose value is shaped
-**(T, H, W, C)** and stored in **FP16**.
+Each file holds a single key ``"feat"`` whose value is shaped
+**(2 clips, T, H, W, C)** and stored in **FP16**.
 
 Typical wrapper call
 --------------------
@@ -51,7 +51,14 @@ def forward_aether(
     frames: List[Image.Image],
     t: int,
     layer_ids: List[int],
+    noise_generator: torch.Generator | None = None,
 ) -> Dict[int, torch.Tensor]:
+    if len(frames) != 81:
+        raise ValueError(
+            f"Aether's two-clip protocol requires exactly 81 input frames, "
+            f"found {len(frames)}"
+        )
+
     # 1.  Build 2 clips, each 41 frames:
     #     clip_0 = [0, 1, 3, 5, ..., 77]
     #     clip_1 = [0, 2, 4, 6, ..., 78]
@@ -72,6 +79,7 @@ def forward_aether(
                 video=clip,
                 t=t,
                 output_layer_indices=layer_ids,
+                noise_generator=noise_generator,
             )
             all_features.append(feat)
 

@@ -5,7 +5,7 @@
 # Sweep dimensions: VFM × layer × probe × prefix_len
 #
 # ── Quick start ───────────────────────────────────────────────────────────────
-# Default (wan + vjepa2, default layer each, all streaming probes):
+# Default (wan + vjepa2 + cogvideox, default layer each, five streaming probes):
 #   INSCENE_BASE=/data/InsScene-15K bash scripts/reproduce_streaming.sh
 #
 # Layer sweep — same layers for all VFMs:
@@ -33,7 +33,7 @@
 #   EVAL       1=eval checkpoints (default: 1)
 #
 # ── Model + layer config ──────────────────────────────────────────────────────
-#   VFMS          Space-separated VFM names      (default: "wan vjepa2")
+#   VFMS          Space-separated VFM names      (default: "wan vjepa2 cogvideox")
 #                 Supported: wan | vjepa2 | cogvideox
 #
 #   LAYERS        Layers for all VFMs            (default: "default")
@@ -56,13 +56,13 @@
 #   GPU_COGVIDEOX GPU for cogvideox              (default: GPU_DEFAULT)
 #
 # ── Probe config ──────────────────────────────────────────────────────────────
-#   PROBES          Space-separated probe names  (default: all 6 streaming probes)
+#   PROBES          Space-separated trainable probe names (default: 5 probes)
 #                     streaming_depth → A1 Depth & Camera
 #                     view_consistency → A2 View Consistency
 #                     ego_belief_v2   → B2 Object-Query Localization
 #                     action_dynamics → C1 Latent Dynamics
 #                     path_integration→ C2 Path Integration
-#                     counterfactual  → C3 Counterfactual Action
+#                   C3 is evaluation-only and reuses the trained C1 checkpoint.
 #   PREFIX_LENGTHS  Space-separated prefix lengths (default: "8 12 16 24")
 #   C_TARGET_HORIZONS
 #                   Space-separated C target horizons (default: "1 2 4")
@@ -80,7 +80,7 @@ set -euo pipefail
 INSCENE_BASE="${INSCENE_BASE:?Please set INSCENE_BASE=/path/to/InsScene-15K}"
 
 VFMS="${VFMS:-wan vjepa2 cogvideox}"
-PROBES="${PROBES:-streaming_depth view_consistency ego_belief_v2 action_dynamics path_integration counterfactual}"
+PROBES="${PROBES:-streaming_depth view_consistency ego_belief_v2 action_dynamics path_integration}"
 PREFIX_LENGTHS="${PREFIX_LENGTHS:-8 12 16 24}"
 C_TARGET_HORIZONS="${C_TARGET_HORIZONS:-1 2 4}"
 STREAMING_MOTION_STEP="${STREAMING_MOTION_STEP:-0.35}"
@@ -130,8 +130,7 @@ vfm_model_id() {
 }
 
 vfm_in_channels() {
-    "${PYTHON}" scripts/resolve_feature_layers.py --vfm "$1" --field in_channels 2>/dev/null \
-        || case "$1" in wan) printf '1536';; cogvideox) printf '3072';; vjepa2) printf '1024';; esac
+    "${PYTHON}" "${SCRIPT_DIR}/resolve_feature_layers.py" --vfm "$1" --field in_channels
 }
 
 vfm_timestep() {
@@ -159,35 +158,39 @@ resolve_layers_for_vfm() {
     local raw="${!per_model_var:-${LAYERS}}"
 
     local result=()
+    local resolved field
     for token in ${raw}; do
         case "${token}" in
-            default)
-                local dl
-                dl="$("${PYTHON}" scripts/resolve_feature_layers.py --vfm "${vfm}" \
-                        --field default_layer 2>/dev/null)" \
-                    || dl="$(case "${vfm}" in wan|cogvideox) printf '20';; vjepa2) printf '23';; *) printf '0';; esac)"
-                result+=("${dl}")
+            default|last)
+                field="${token}_layer"
+                resolved="$("${PYTHON}" "${SCRIPT_DIR}/resolve_feature_layers.py" \
+                    --vfm "${vfm}" --field "${field}")" || return 1
+                result+=("${resolved}")
                 ;;
-            last)
-                local ll
-                ll="$("${PYTHON}" scripts/resolve_feature_layers.py --vfm "${vfm}" \
-                        --field last_layer 2>/dev/null)" || ll="default"
-                result+=("${ll}")
+            all)
+                resolved="$("${PYTHON}" "${SCRIPT_DIR}/resolve_feature_layers.py" \
+                    --vfm "${vfm}" --format list)" || return 1
+                # The registry emits only space-separated integer layer ids.
+                read -r -a result <<< "${result[*]} ${resolved}"
                 ;;
             *)
-                # Numeric literal
+                if [[ ! "${token}" =~ ^-?[0-9]+$ ]]; then
+                    echo "[err] invalid layer: ${token}" >&2
+                    return 1
+                fi
                 result+=("${token}")
                 ;;
         esac
     done
 
     # Deduplicate while preserving order
-    local seen=()
+    local -A seen=()
     local unique=()
     for l in "${result[@]}"; do
-        local found=0
-        for s in "${seen[@]+"${seen[@]}"}"; do [[ "${s}" == "${l}" ]] && found=1; done
-        if (( ! found )); then unique+=("${l}"); seen+=("${l}"); fi
+        if [[ -z "${seen[${l}]+present}" ]]; then
+            unique+=("${l}")
+            seen[${l}]=1
+        fi
     done
 
     printf '%s' "${unique[*]}"

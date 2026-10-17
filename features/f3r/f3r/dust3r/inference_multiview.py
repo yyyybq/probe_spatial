@@ -29,6 +29,7 @@ def loss_of_one_batch(
     use_amp=False,
     ret=None,
     profiling=False,
+    random_generator=None,
 ):
     """
     Args:
@@ -58,16 +59,26 @@ def loss_of_one_batch(
 
     with torch.autocast(**autocast_dict):
         if profiling:
-            preds, profiling_info = model(views, profiling=profiling)
+            preds, profiling_info = model(
+                views, profiling=profiling, random_generator=random_generator
+            )
         else:
-            preds = model(views, profiling=profiling)
+            preds = model(
+                views, profiling=profiling, random_generator=random_generator
+            )
 
     return preds
 
 
 @torch.no_grad()
 def inference(
-    multiple_views_in_one_sample, model, device, dtype, verbose=True, profiling=False
+    multiple_views_in_one_sample,
+    model,
+    device,
+    dtype,
+    verbose=True,
+    profiling=False,
+    random_generator=None,
 ):
     if verbose:
         print(f">> Inference with model on {len(multiple_views_in_one_sample)} images")
@@ -86,6 +97,7 @@ def inference(
         device,
         dtype,
         profiling=profiling,
+        random_generator=random_generator,
     )
 
     return res

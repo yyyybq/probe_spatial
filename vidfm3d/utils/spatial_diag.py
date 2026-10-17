@@ -94,6 +94,187 @@ def _world_centroid_of_object(
     return centroid, float(n_pix)
 
 
+def robust_past_only_world_centroid(
+    obj_id: int,
+    identity_ids: torch.Tensor,
+    pmaps_world: torch.Tensor,
+    confmaps: torch.Tensor,
+    target_frame_idx: int = -1,
+    min_visible_pixels: int = 200,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Estimate an object's world centroid without reading target-frame pixels.
+
+    Only history frames whose *raw* instance-mask area reaches
+    ``min_visible_pixels`` contribute.  Valid-depth object points from all such
+    frames are concatenated and aggregated with a coordinate-wise median.  The
+    median is deliberately used instead of a mean so that one noisy depth tail
+    or one unusually large view cannot dominate the label.
+
+    This helper intentionally does not enforce target-frame invisibility.  The
+    strict sample constructor below performs that independent eligibility check;
+    keeping the operations separate makes the past-only invariant directly
+    testable.
+    """
+    S = int(identity_ids.shape[0])
+    target_idx = target_frame_idx if target_frame_idx >= 0 else S + target_frame_idx
+    if target_idx < 0 or target_idx >= S:
+        raise IndexError(f"target_frame_idx={target_frame_idx} outside sequence of length {S}")
+
+    history_points = []
+    history_counts = []
+    visible_indices = []
+    for frame_idx in range(S):
+        if frame_idx == target_idx:
+            continue
+        raw_mask = identity_ids[frame_idx] == int(obj_id)
+        raw_count = int(raw_mask.sum().item())
+        if raw_count < int(min_visible_pixels):
+            continue
+        point_mask = raw_mask & (confmaps[frame_idx] > 0)
+        points = pmaps_world[frame_idx][point_mask]
+        if points.numel() == 0:
+            continue
+        finite = torch.isfinite(points).all(dim=-1)
+        points = points[finite]
+        if points.numel() == 0:
+            continue
+        history_points.append(points)
+        history_counts.append(raw_count)
+        visible_indices.append(frame_idx)
+
+    if not history_points:
+        raise ValueError("object has no qualifying finite past-only 3D points")
+
+    points = torch.cat(history_points, dim=0)
+    centroid = points.median(dim=0).values
+    metadata = {
+        "visible_history_indices": torch.as_tensor(
+            visible_indices, dtype=torch.long, device=identity_ids.device
+        ),
+        "visible_history_raw_pixels": torch.as_tensor(
+            history_counts, dtype=torch.long, device=identity_ids.device
+        ),
+        "n_history_points": torch.tensor(
+            int(points.shape[0]), dtype=torch.long, device=identity_ids.device
+        ),
+    }
+    return centroid, metadata
+
+
+def polar_from_world_centroid(
+    centroid_world: torch.Tensor,
+    world_to_camera: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert one world centroid to evaluator-compatible polar coordinates."""
+    dtype = centroid_world.dtype
+    R = world_to_camera[:3, :3].to(dtype)
+    t = world_to_camera[:3, 3].to(dtype)
+    centroid_cam = R @ centroid_world + t
+    x, y, z = centroid_cam.unbind(0)
+    dist = torch.linalg.norm(centroid_cam).clamp(min=1e-3)
+    azimuth = torch.atan2(x, z)
+    elevation = torch.asin(((-y) / dist).clamp(-1.0, 1.0))
+    return torch.stack([azimuth, elevation, torch.log(dist)]).to(torch.float32), centroid_cam
+
+
+def compute_strict_hidden_object_target_for_id(
+    obj_id: int,
+    identity_ids: torch.Tensor,
+    pmaps_world: torch.Tensor,
+    confmaps: torch.Tensor,
+    extrinsics: torch.Tensor,
+    min_visible_pixels: int = 200,
+    target_frame_idx: int = -1,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Construct a B2 strict-zero-hidden, past-only target for a fixed object.
+
+    Eligibility uses raw masks: the target frame must contain exactly zero
+    pixels of ``obj_id`` and at least one earlier frame must contain at least
+    ``min_visible_pixels``.  Neither target RGB/depth/mask pixels nor target
+    point-map values participate in centroid estimation.  The target camera
+    extrinsic is used only to express the past-only world centroid in the label
+    coordinate system.
+    """
+    S, H, W = identity_ids.shape
+    target_idx = target_frame_idx if target_frame_idx >= 0 else S + target_frame_idx
+    if target_idx < 0 or target_idx >= S:
+        return None
+    target_raw_pixels = int((identity_ids[target_idx] == int(obj_id)).sum().item())
+    if target_raw_pixels != 0:
+        return None
+
+    try:
+        centroid_world, centroid_meta = robust_past_only_world_centroid(
+            obj_id=obj_id,
+            identity_ids=identity_ids,
+            pmaps_world=pmaps_world,
+            confmaps=confmaps,
+            target_frame_idx=target_idx,
+            min_visible_pixels=min_visible_pixels,
+        )
+    except ValueError:
+        return None
+
+    per_frame_mask = torch.zeros(
+        S, H, W, dtype=torch.bool, device=identity_ids.device
+    )
+    for frame_idx in centroid_meta["visible_history_indices"].tolist():
+        per_frame_mask[frame_idx] = identity_ids[frame_idx] == int(obj_id)
+
+    polar, centroid_cam = polar_from_world_centroid(
+        centroid_world, extrinsics[target_idx]
+    )
+    visible_indices = centroid_meta["visible_history_indices"]
+    pixel_counts = centroid_meta["visible_history_raw_pixels"]
+    last_visible_frame = int(visible_indices.max().item())
+    no_update_polar, _ = polar_from_world_centroid(
+        centroid_world, extrinsics[last_visible_frame]
+    )
+    camera_centers = []
+    for pose in extrinsics[last_visible_frame : target_idx + 1]:
+        rotation = pose[:3, :3].to(centroid_world.dtype)
+        translation = pose[:3, 3].to(centroid_world.dtype)
+        camera_centers.append(-(rotation.T @ translation))
+    camera_centers = torch.stack(camera_centers)
+    if camera_centers.shape[0] > 1:
+        accumulated_translation = torch.linalg.norm(
+            camera_centers[1:] - camera_centers[:-1], dim=-1
+        ).sum()
+        accumulated_rotation = centroid_world.new_zeros(())
+        pose_slice = extrinsics[last_visible_frame : target_idx + 1]
+        for idx in range(pose_slice.shape[0] - 1):
+            relative = pose_slice[idx + 1, :3, :3] @ pose_slice[idx, :3, :3].T
+            cosine = ((torch.trace(relative) - 1.0) / 2.0).clamp(-1.0, 1.0)
+            accumulated_rotation = accumulated_rotation + torch.acos(cosine)
+    else:
+        accumulated_translation = centroid_world.new_zeros(())
+        accumulated_rotation = centroid_world.new_zeros(())
+    return {
+        "valid": torch.ones((), dtype=torch.bool, device=identity_ids.device),
+        "polar": polar,
+        "delta_world": centroid_world.to(torch.float32),
+        "centroid_cam": centroid_cam.to(torch.float32),
+        "per_frame_mask": per_frame_mask,
+        "obj_id": torch.tensor(int(obj_id), dtype=torch.long, device=identity_ids.device),
+        "target_raw_pixels": torch.tensor(
+            target_raw_pixels, dtype=torch.long, device=identity_ids.device
+        ),
+        "visible_history_indices": visible_indices,
+        "visible_history_raw_pixels": pixel_counts,
+        "n_history_points": centroid_meta["n_history_points"],
+        "last_visible_frame": torch.tensor(
+            last_visible_frame, dtype=torch.long, device=identity_ids.device
+        ),
+        "last_visible_pixel_area": pixel_counts[visible_indices.argmax()],
+        "no_update_polar": no_update_polar,
+        "hidden_duration": torch.tensor(
+            target_idx - last_visible_frame, dtype=torch.long, device=identity_ids.device
+        ),
+        "accumulated_camera_translation": accumulated_translation.to(torch.float32),
+        "accumulated_camera_rotation": accumulated_rotation.to(torch.float32),
+    }
+
+
 def compute_hidden_object_target(
     identity_ids: torch.Tensor,    # (S, H, W) long
     pmaps_world: torch.Tensor,     # (S, H, W, 3) world coords
@@ -279,6 +460,46 @@ def select_streaming_hidden_object_id(
         score = n_frames * 1_000_000 + visible_pixels_total[oid]
         candidates.append((score, oid))
 
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return int(candidates[0][1])
+
+
+def select_strict_zero_hidden_object_id(
+    identity_ids: torch.Tensor,
+    target_frame_idx: int = -1,
+    min_visible_pixels: int = 200,
+    history_start_idx: int = 0,
+) -> Optional[int]:
+    """Select a deterministic object that is visible in history and zero at target.
+
+    Counts deliberately use the raw instance mask rather than depth-valid pixels.
+    Positive instance ids only are eligible, avoiding the background-id shortcut.
+    """
+    S = int(identity_ids.shape[0])
+    target_idx = target_frame_idx if target_frame_idx >= 0 else S + target_frame_idx
+    history_start_idx = max(0, int(history_start_idx))
+    if target_idx <= history_start_idx or target_idx >= S:
+        return None
+
+    candidates = []
+    ids = torch.unique(identity_ids[history_start_idx:target_idx])
+    for obj_tensor in ids:
+        obj_id = int(obj_tensor.item())
+        if obj_id <= 0:
+            continue
+        if int((identity_ids[target_idx] == obj_id).sum().item()) != 0:
+            continue
+        counts = [
+            int((identity_ids[i] == obj_id).sum().item())
+            for i in range(history_start_idx, target_idx)
+        ]
+        qualifying = [count for count in counts if count >= int(min_visible_pixels)]
+        if not qualifying:
+            continue
+        score = len(qualifying) * 1_000_000_000 + max(qualifying) * 1_000 + sum(qualifying)
+        candidates.append((score, obj_id))
     if not candidates:
         return None
     candidates.sort(reverse=True)

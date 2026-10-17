@@ -347,7 +347,13 @@ class Fast3R(
         # expose this to user to control the number of views processed in parallel in the head
         self.max_parallel_views_for_head = max_parallel_views_for_head
 
-    def forward(self, views, profiling=False, return_feature=True):
+    def forward(
+        self,
+        views,
+        profiling=False,
+        return_feature=True,
+        random_generator=None,
+    ):
         """
         Args:
             views (list[dict]): a list of views, each view is a dict of tensors, the tensors are batched
@@ -413,7 +419,12 @@ class Fast3R(
         if profiling:
             torch.cuda.synchronize()
             decoder_start_time = time.time()
-        dec_output = self.decoder(encoded_feats, positions, image_ids)
+        dec_output = self.decoder(
+            encoded_feats,
+            positions,
+            image_ids,
+            random_generator=random_generator,
+        )
         if profiling:
             torch.cuda.synchronize()
             decoder_time = time.time() - decoder_start_time
@@ -831,7 +842,13 @@ class Fast3RDecoder(nn.Module):
         return per_rank_generator
 
     def _get_random_image_pos(
-        self, encoded_feats, batch_size, num_views, max_image_idx, device
+        self,
+        encoded_feats,
+        batch_size,
+        num_views,
+        max_image_idx,
+        device,
+        random_generator=None,
     ):
         """
         Generates non-repeating random image indices for each sample, retrieves corresponding
@@ -854,7 +871,11 @@ class Fast3RDecoder(nn.Module):
         image_ids[:, 0] = 0
 
         # Get a generator that is unique to each rank, while also being deterministic based on the global across numbers of forward passes
-        per_rank_generator = self._generate_per_rank_generator()
+        per_rank_generator = (
+            random_generator
+            if random_generator is not None
+            else self._generate_per_rank_generator()
+        )
 
         # Generate random non-repeating IDs for the remaining views using the generator
         for b in range(batch_size):
@@ -892,7 +913,9 @@ class Fast3RDecoder(nn.Module):
 
         return image_pos
 
-    def forward(self, encoded_feats, positions, image_ids):
+    def forward(
+        self, encoded_feats, positions, image_ids, random_generator=None
+    ):
         """Forward pass through the decoder.
 
         Args:
@@ -917,6 +940,7 @@ class Fast3RDecoder(nn.Module):
                 num_views=len(encoded_feats),
                 max_image_idx=self.image_idx_emb.shape[0] - 1,
                 device=x.device,
+                random_generator=random_generator,
             )
         else:
             # Use default image IDs from input
@@ -1020,7 +1044,13 @@ class LlamaDecoder(nn.Module):
         return per_rank_generator
 
     def _get_random_freqs_cis(
-        self, encoded_feats, batch_size, num_views, max_image_idx, device
+        self,
+        encoded_feats,
+        batch_size,
+        num_views,
+        max_image_idx,
+        device,
+        random_generator=None,
     ):
         """
         Generates freqs_cis for each patch based on random image indices.
@@ -1042,7 +1072,11 @@ class LlamaDecoder(nn.Module):
         image_ids[:, 0] = 0
 
         # Get a generator that is unique to each rank
-        per_rank_generator = self._generate_per_rank_generator()
+        per_rank_generator = (
+            random_generator
+            if random_generator is not None
+            else self._generate_per_rank_generator()
+        )
 
         # Generate random IDs for the remaining views
         for b in range(batch_size):
@@ -1081,7 +1115,9 @@ class LlamaDecoder(nn.Module):
 
         return freqs_cis
 
-    def forward(self, encoded_feats, positions, image_ids):
+    def forward(
+        self, encoded_feats, positions, image_ids, random_generator=None
+    ):
         x = torch.cat(encoded_feats, dim=1)  # Concatenate along the patch dimension
         pos = torch.cat(positions, dim=1)
         batch_size = x.shape[0]
@@ -1097,6 +1133,7 @@ class LlamaDecoder(nn.Module):
                 num_views=len(encoded_feats),
                 max_image_idx=self.precomputed_freqs_cis.shape[0] - 1,
                 device=device,
+                random_generator=random_generator,
             )
         else:
             # Use image_ids to index into precomputed_freqs_cis

@@ -1,5 +1,7 @@
 
 
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 from torch.nn.functional import huber_loss
@@ -9,6 +11,41 @@ from vidfm3d.vggt.utils.pose_enc import (
     extri_intri_to_pose_encoding,
     pose_encoding_to_extri_intri,
 )
+
+
+class NonFiniteInputError(ValueError):
+    """A probe batch contained NaN/inf features."""
+
+
+def require_finite_input(batch, *keys):
+    """Raise ``NonFiniteInputError`` when any listed feature tensor is non-finite.
+
+    ``check_and_fix_inf_nan`` below silently replaces NaN/inf *losses* by zero.
+    With a corrupt feature cache that turns a diverged probe into a run that
+    logs zero loss, saves NaN weights and still writes TRAIN_COMPLETE (observed
+    for MiniMax-H3 timestep layers 20/25). Inputs are therefore validated
+    before the forward pass; keys absent from the batch are ignored.
+    """
+    for key in keys:
+        value = batch.get(key)
+        if not torch.is_tensor(value) or not value.is_floating_point() or value.numel() == 0:
+            continue
+        finite = torch.isfinite(value)
+        if bool(finite.all()):
+            continue
+        bad = int((~finite).sum().item())
+        sample_flags = (~finite).reshape(value.shape[0], -1).any(dim=1)
+        bad_rows = torch.nonzero(sample_flags).flatten().tolist()
+        scenes = batch.get("scene_path")
+        where = ""
+        if isinstance(scenes, (list, tuple)) and scenes:
+            where = "; scene_path=" + ", ".join(str(scenes[i]) for i in bad_rows[:4])
+        raise NonFiniteInputError(
+            f"batch['{key}'] has {bad} non-finite values in {len(bad_rows)} of "
+            f"{int(value.shape[0])} samples{where}. Repair or re-extract the feature "
+            "cache; training on NaN/inf features yields NaN weights while the loss "
+            "helpers report zero loss."
+        )
 
 
 def check_and_fix_inf_nan(loss_tensor, loss_name, hard_max=100):
@@ -36,6 +73,215 @@ def check_and_fix_inf_nan(loss_tensor, loss_name, hard_max=100):
     loss_tensor = torch.clamp(loss_tensor, min=-hard_max, max=hard_max)
 
     return loss_tensor
+
+
+def relative_movements_from_extrinsics(extrinsics: torch.Tensor) -> torch.Tensor:
+    """Encode adjacent world-to-camera extrinsics as ordered 9-D movements.
+
+    For each adjacent pair the returned transform maps coordinates in camera
+    ``i`` into camera ``i + 1``. The encoding matches
+    :func:`vidfm3d.utils.spatial_diag.encode_relative_pose`: the first two rows
+    of the relative rotation followed by its translation.
+    """
+    if extrinsics.ndim != 4 or extrinsics.shape[-2:] not in {(3, 4), (4, 4)}:
+        raise ValueError(
+            "extrinsics must have shape (B,S,3,4) or (B,S,4,4), "
+            f"got {tuple(extrinsics.shape)}"
+        )
+    if extrinsics.shape[1] < 2:
+        raise ValueError("at least two camera extrinsics are required")
+
+    rotations = extrinsics[..., :3, :3]
+    translations = extrinsics[..., :3, 3]
+    rotation_from = rotations[:, :-1]
+    rotation_to = rotations[:, 1:]
+    translation_from = translations[:, :-1]
+    translation_to = translations[:, 1:]
+
+    rotation_relative = rotation_to @ rotation_from.transpose(-1, -2)
+    translation_relative = translation_to - (
+        rotation_relative @ translation_from.unsqueeze(-1)
+    ).squeeze(-1)
+    rotation_6d = rotation_relative[..., :2, :].reshape(
+        *rotation_relative.shape[:-2], 6
+    )
+    return torch.cat((rotation_6d, translation_relative), dim=-1).float()
+
+
+def movement_6d_to_rotation_matrix(rotation_6d: torch.Tensor) -> torch.Tensor:
+    """Project the repository's row-major 6-D encoding onto SO(3)."""
+    if rotation_6d.shape[-1] != 6:
+        raise ValueError(f"expected a final dimension of 6, got {rotation_6d.shape}")
+
+    eps = 1e-8
+    row_1_raw, row_2_raw = rotation_6d[..., :3], rotation_6d[..., 3:]
+    row_1_norm = row_1_raw.norm(dim=-1, keepdim=True)
+    fallback_1 = torch.zeros_like(row_1_raw)
+    fallback_1[..., 0] = 1.0
+    row_1 = torch.where(
+        row_1_norm > eps,
+        row_1_raw / row_1_norm.clamp_min(eps),
+        fallback_1,
+    )
+
+    row_2_orthogonal = row_2_raw - (row_2_raw * row_1).sum(
+        dim=-1, keepdim=True
+    ) * row_1
+    row_2_norm = row_2_orthogonal.norm(dim=-1, keepdim=True)
+    basis_y = torch.zeros_like(row_1)
+    basis_y[..., 1] = 1.0
+    basis_z = torch.zeros_like(row_1)
+    basis_z[..., 2] = 1.0
+    fallback_basis = torch.where(
+        (row_1 * basis_y).sum(dim=-1, keepdim=True).abs() < 0.9,
+        basis_y,
+        basis_z,
+    )
+    fallback_2 = fallback_basis - (fallback_basis * row_1).sum(
+        dim=-1, keepdim=True
+    ) * row_1
+    fallback_2 = F.normalize(fallback_2, dim=-1, eps=eps)
+    row_2 = torch.where(
+        row_2_norm > eps,
+        row_2_orthogonal / row_2_norm.clamp_min(eps),
+        fallback_2,
+    )
+    row_3 = torch.cross(row_1, row_2, dim=-1)
+    return torch.stack((row_1, row_2, row_3), dim=-2)
+
+
+@torch.no_grad()
+def relative_movement_metrics(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    prefix: str = "adjacent_movement_",
+) -> dict[str, torch.Tensor]:
+    """Compute common adjacent-edge metrics for direct and pose-derived motion."""
+    if predicted.shape != target.shape or predicted.shape[-1] != 9:
+        raise ValueError(
+            "predicted and target movements must share shape (B,S-1,9), "
+            f"got {tuple(predicted.shape)} and {tuple(target.shape)}"
+        )
+
+    pred_flat = predicted.float().reshape(-1, 9)
+    target_flat = target.float().reshape(-1, 9)
+    pred_rotation = movement_6d_to_rotation_matrix(pred_flat[:, :6])
+    target_rotation = movement_6d_to_rotation_matrix(target_flat[:, :6])
+    rotation_delta = pred_rotation @ target_rotation.transpose(-1, -2)
+    rotation_cos = (
+        (
+            rotation_delta.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+            - 1.0
+        )
+        * 0.5
+    ).clamp(-1.0, 1.0)
+    rotation_error = torch.acos(rotation_cos) * (180.0 / torch.pi)
+
+    pred_translation = pred_flat[:, 6:]
+    target_translation = target_flat[:, 6:]
+    pred_norm = pred_translation.norm(dim=-1)
+    target_norm = target_translation.norm(dim=-1)
+    denominator = pred_norm * target_norm
+    translation_cos = (
+        (pred_translation * target_translation).sum(dim=-1)
+        / denominator.clamp_min(1e-8)
+    ).clamp(-1.0, 1.0)
+    # A zero prediction for a non-zero GT edge is maximally wrong in direction;
+    # a genuinely stationary GT edge is assessed through magnitude/L2 instead.
+    translation_cos = torch.where(
+        (target_norm > 1e-8) & (pred_norm <= 1e-8),
+        torch.full_like(translation_cos, -1.0),
+        translation_cos,
+    )
+    translation_error = torch.acos(translation_cos) * (180.0 / torch.pi)
+    translation_error = torch.where(
+        target_norm <= 1e-8,
+        torch.zeros_like(translation_error),
+        translation_error,
+    )
+
+    metrics = {
+        f"{prefix}RotErr_deg": rotation_error.mean(),
+        f"{prefix}TransAngle_deg": translation_error.mean(),
+        f"{prefix}TransL2": (pred_translation - target_translation)
+        .norm(dim=-1)
+        .mean(),
+        f"{prefix}TransMagErr": (pred_norm - target_norm).abs().mean(),
+    }
+    for threshold in (5, 15):
+        metrics[f"{prefix}Rac_{threshold}"] = (
+            rotation_error < threshold
+        ).float().mean()
+        metrics[f"{prefix}Tac_{threshold}"] = (
+            translation_error < threshold
+        ).float().mean()
+
+    _, histogram = calculate_auc(
+        rotation_error, translation_error, max_threshold=30, return_list=True
+    )
+    cumulative = torch.cumsum(histogram, dim=0)
+    for threshold in (3, 5, 10, 30):
+        metrics[f"{prefix}Auc_{threshold}"] = cumulative[:threshold].mean()
+    return metrics
+
+
+def relative_movement_loss(
+    predicted_movement_list,
+    gt_extrinsic: torch.Tensor,
+    loss_type: str = "huber",
+    gamma: float = 0.6,
+    weight_rotation: float = 1.0,
+    weight_translation: float = 1.0,
+    return_metrics: bool = False,
+):
+    """A1-style iterative regression loss for adjacent relative movement."""
+    if not predicted_movement_list:
+        raise ValueError("predicted_movement_list must not be empty")
+    target = relative_movements_from_extrinsics(gt_extrinsic)
+    num_predictions = len(predicted_movement_list)
+    loss_rotation = target.new_zeros(())
+    loss_translation = target.new_zeros(())
+
+    for index, prediction in enumerate(predicted_movement_list):
+        if prediction.shape != target.shape:
+            raise ValueError(
+                f"movement prediction shape {tuple(prediction.shape)} does not "
+                f"match target shape {tuple(target.shape)}"
+            )
+        iteration_weight = gamma ** (num_predictions - index - 1)
+        if loss_type == "huber":
+            rotation_term = huber_loss(
+                prediction[..., :6], target[..., :6], reduction="none"
+            )
+            translation_term = huber_loss(
+                prediction[..., 6:], target[..., 6:], reduction="none"
+            )
+        elif loss_type == "l1":
+            rotation_term = (prediction[..., :6] - target[..., :6]).abs()
+            translation_term = (prediction[..., 6:] - target[..., 6:]).abs()
+        elif loss_type == "l2":
+            rotation_term = (prediction[..., :6] - target[..., :6]).square()
+            translation_term = (prediction[..., 6:] - target[..., 6:]).square()
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+        loss_rotation += iteration_weight * check_and_fix_inf_nan(
+            rotation_term, "loss_movement_rotation"
+        ).mean()
+        loss_translation += iteration_weight * check_and_fix_inf_nan(
+            translation_term, "loss_movement_translation"
+        ).mean()
+
+    loss_rotation = loss_rotation / num_predictions
+    loss_translation = loss_translation / num_predictions
+    loss = weight_rotation * loss_rotation + weight_translation * loss_translation
+    result = {
+        "loss_movement": loss,
+        "loss_movement_R": loss_rotation,
+        "loss_movement_T": loss_translation,
+    }
+    if return_metrics:
+        result.update(relative_movement_metrics(predicted_movement_list[-1], target))
+    return result
 
 
 def camera_loss(
@@ -115,6 +361,19 @@ def camera_loss(
         for auc_threshold in auc_thresholds:
             cur_auc = torch.cumsum(normalized_histogram[:auc_threshold], dim=0).mean()
             loss_dict[f"Auc_{auc_threshold}"] = cur_auc
+
+        # Protocol-matched comparison for A1 relative-movement experiments:
+        # evaluate only the same S-1 adjacent, ordered edges used by the direct
+        # movement head. These metrics do not alter the historical camera loss.
+        predicted_movements = relative_movements_from_extrinsics(
+            last_pred_extrinsic.float()
+        )
+        target_movements = relative_movements_from_extrinsics(
+            gt_extrinsic.float()
+        )
+        loss_dict.update(
+            relative_movement_metrics(predicted_movements, target_movements)
+        )
 
     return loss_dict
 

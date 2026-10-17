@@ -1,15 +1,32 @@
-name: ci
+name: CPU tests
 on:
   push:
   pull_request:
+permissions:
+  contents: read
 jobs:
   unit:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      HF_HUB_OFFLINE: "1"
+      WANDB_MODE: disabled
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install torch==2.6.0 lightning==2.6.1 lightning-bolts==0.7.0 torchmetrics==1.9.0 hydra-core==1.3.2 rootutils safetensors numpy pytest
-      - run: pip install -e .
-      - run: pytest -q
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements-dev.txt
+          python -m pip install -e . --no-deps
+      - name: Run portable tests
+        run: python -m pytest -q
+      - name: Validate public shell entrypoints
+        run: bash -n scripts/reproduce_streaming.sh scripts/run_streaming_probe_sweep.sh scripts/run_direct_vlm_probe_sweep.sh

@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import numpy as np
 import torch
+from features.noise_seed import randn_like_local
 from diffusers import WanImageToVideoPipeline
 from diffusers.models import AutoencoderKLWan, WanTransformer3DModel
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -173,6 +174,7 @@ class OneStepWanPipeline(WanImageToVideoPipeline):
         output_layers: List[int],
         negative_prompt: Optional[Union[str, List[str]]] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        noise_generator: Optional[torch.Generator] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
@@ -225,6 +227,9 @@ class OneStepWanPipeline(WanImageToVideoPipeline):
         image = self.video_processor.preprocess(image, height=height, width=width).to(
             device, dtype=torch.float32
         )
+        sample_generator = (
+            noise_generator if noise_generator is not None else generator
+        )
         _, condition = self.prepare_latents(
             image,
             1,
@@ -234,14 +239,17 @@ class OneStepWanPipeline(WanImageToVideoPipeline):
             num_frames,
             torch.float32,
             device,
-            generator,
+            sample_generator,
             latents,
         )
 
         # Convert timestep to tensor and prepare noise
         t_idx = torch.tensor([t], dtype=torch.long, device=device)
         t_input = self.scheduler.timesteps[t_idx].to(device)
-        noise = torch.randn_like(latents).to(device)
+        noise = randn_like_local(
+            latents,
+            generator=sample_generator,
+        )
         latents_noisy = self.scheduler.add_noise(latents, noise, t_input)
 
         # Ensure the transformer supports feature output
@@ -346,6 +354,7 @@ class WanFeaturizerI2V:
         t: int = 261,
         output_layer_indices: List[int] = [1],
         ensemble_size: int = 1,
+        noise_generator: Optional[torch.Generator] = None,
     ) -> Dict[int, torch.FloatTensor]:
         """
         Extract features from specific layers of the Wan transformer.
@@ -356,6 +365,7 @@ class WanFeaturizerI2V:
             t (`int`): Timestep for feature extraction (0-1000)
             output_layer_indices (`List[int]`): Which transformer blocks to extract features from
             ensemble_size (`int`): Number of repeated videos in batch for feature extraction
+            noise_generator (`torch.Generator`, optional): Sample-local generator for all stochastic latents
 
         Returns:
             `Dict[int, torch.FloatTensor]`: Dictionary mapping layer index to extracted features
@@ -398,6 +408,7 @@ class WanFeaturizerI2V:
                 t=t,
                 output_layers=output_layer_indices,
                 prompt_embeds=prompt_embeds,
+                noise_generator=noise_generator,
             )
 
         # Get features from the specified layers

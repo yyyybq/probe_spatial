@@ -33,7 +33,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from f3r.dust3r.inference_multiview import inference
 from f3r.dust3r.utils.image import load_images
-from f3r.models.vidfm3d import Fast3R
+from f3r.models.fast3r import Fast3R
 
 # # add sys.path to import vidfm3d
 # import sys
@@ -56,21 +56,26 @@ C = 1024  # channel dim in your demo reshape
 
 
 def list_frames(scene_dir: str, ext: str = "png") -> List[str]:
-    """Return sorted list of frame paths (frame_00001.<ext>, …)."""
+    """Return sorted list of frame paths (frame_00001.<ext>, ...)."""
     return sorted(glob.glob(os.path.join(scene_dir, f"frame_*.{ext}")))
 
 
 @lru_cache(maxsize=None)
 def load_model(model_id: str, device: str) -> Fast3R:
     """Load Fast3R once (cached across calls)."""
-    logging.debug("Loading model %s on %s …", model_id, device)
+    logging.debug("Loading model %s on %s ...", model_id, device)
     model = Fast3R.from_pretrained(model_id).to(device).eval()
     return model
 
 
 @torch.no_grad()
-def vidfm3d_forward(filelist: Sequence[str], model: Fast3R, device: torch.device):
-    """Exactly your demo path: load_images → inference(bfloat16) → return."""
+def vidfm3d_forward(
+    filelist: Sequence[str],
+    model: Fast3R,
+    device: torch.device,
+    random_generator: torch.Generator | None = None,
+):
+    """Exactly your demo path: load_images -> inference(bfloat16) -> return."""
     imgs = load_images(filelist, size=LONG_SIDE, verbose=False)
     ret = inference(
         imgs,
@@ -79,6 +84,7 @@ def vidfm3d_forward(filelist: Sequence[str], model: Fast3R, device: torch.device
         dtype=torch.bfloat16,  # stay hardcoded
         verbose=False,
         profiling=False,
+        random_generator=random_generator,
     )
     # Handle accidentally returning (features, profiling)
     if isinstance(ret, tuple):
@@ -153,7 +159,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---------- load model (cached) ----------
     device = torch.device(args.device)
-    logging.debug("Loading %s …", args.model_id)
+    logging.debug("Loading %s ...", args.model_id)
     model = load_model(args.model_id, str(device))
 
     # ---------- forward ----------
@@ -189,13 +195,13 @@ def main(argv: list[str] | None = None) -> None:
         raw = feats[L]
         if raw.numel() != expected_numel:
             raise RuntimeError(
-                f"Layer {L}: numel={raw.numel()} != T*Ht*Wt*C={expected_numel} — reshape will fail."
+                f"Layer {L}: numel={raw.numel()} != T*Ht*Wt*C={expected_numel} - reshape will fail."
             )
         feat_spatial = raw.reshape(T, HTOK, WTOK, C).contiguous()
         out_path = target[L]
         save_file({"feat": feat_spatial.half()}, out_path)
         logging.debug(
-            "[FAST3R] saved layer %d → %s  shape=%s",
+            "[FAST3R] saved layer %d -> %s  shape=%s",
             L,
             out_path,
             tuple(feat_spatial.shape),

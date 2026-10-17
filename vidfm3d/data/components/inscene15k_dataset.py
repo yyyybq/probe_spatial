@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from safetensors.torch import load_file
+from vidfm3d.utils import aoss_fs
 
 from vidfm3d.data.components.video_probe_dataset import invert_pose_ref_and_scale
 from vidfm3d.dust3r.datasets.base.easy_dataset import EasyDataset
@@ -29,12 +30,49 @@ from vidfm3d.utils.feature_layers import (
     default_feature_hw,
     feature_filename,
 )
+from vidfm3d.utils.owner_catalog import (
+    OwnerCatalogError,
+    load_owner_catalog,
+    resolve_owner,
+    streaming_key,
+)
 from vidfm3d.utils.temporal_sampling import (
     sort_frame_names,
     temporal_windows_from_poses,
 )
 
 logger = logging.getLogger(__name__)
+
+# When enabled, precomputed VFM features stay in their on-disk dtype (fp16)
+# through DataLoader workers, IPC and pin-memory; the training module widens
+# them to fp32 on GPU after H2D. fp16->fp32 widening is exact, so results are
+# bit-identical while worker CPU time and IPC bytes are roughly halved.
+_FP16_PASSTHROUGH = os.environ.get("PROBE_FP16_PASSTHROUGH", "0") == "1"
+
+
+def _feat_cast(feat: torch.Tensor) -> torch.Tensor:
+    return feat if _FP16_PASSTHROUGH else feat.float()
+
+
+def canonical_streaming_sample_id(
+    scene_info: dict,
+    task: str,
+    target_indices=None,
+    object_id: int | None = None,
+) -> str:
+    """Return a stable, model-independent ID for one streaming sample."""
+    targets = [int(v) for v in (target_indices or [])]
+    parts = [
+        str(task),
+        str(scene_info.get("source", "unknown")),
+        str(scene_info.get("scene_id") or os.path.basename(str(scene_info["scene_dir"]).rstrip("/"))),
+        f"window={int(scene_info.get('streaming_window_id', -1))}",
+        f"tail={int(scene_info.get('streaming_tail_raw', scene_info.get('streaming_tail', -1)))}",
+        "targets=" + ",".join(str(v) for v in targets),
+    ]
+    if object_id is not None:
+        parts.append(f"object={int(object_id)}")
+    return "|".join(parts)
 
 
 @torch.no_grad()
@@ -105,6 +143,7 @@ class InsScene15KDataset(EasyDataset):
         target_w: int = 512,
         train_ratio: float = 0.9,
         split_manifest: str = None,
+        scene_manifest: str = None,
         max_identity_classes: int = 256,
         window_size: int = 0,
         include_pmaps: bool = True,
@@ -135,17 +174,21 @@ class InsScene15KDataset(EasyDataset):
         streaming_hidden_min_query_pixels: int = 1024,
         streaming_hidden_min_border_px: int = 16,
         streaming_hidden_strict_post_history: bool = False,
+        strict_zero_hidden_b2: bool = False,
         diag_action: bool = False,         # C1: load target_feat + emit action
         diag_abnormal: bool = False,       # A3: load shuffled vfm features
         diag_path_integration: bool = False,  # C2: recurrent multi-action feature prediction
         diag_counterfactual: bool = False,    # C3: multi-horizon action intervention prediction
         target_feat_root: str = None,      # root for C1/C2/C3 isolated target features
+        target_index_root: str = None,     # optional local/AOSS root for target_indices.npy
+        target_layout: str = "auto",       # auto|flat|per_prefix
         shuffled_feat_root: str = None,    # root for A3 shuffled features
         action_horizons: list = None,      # frame offsets from action-reference frame, e.g. [1, 10, 30]
         counterfactual_min_overlap: float = 0.05,
         streaming_target_from_prefix: bool = False,
         scramble_feat: bool = False,       # Control: replace VFM feat with randn (same shape)
         allow_missing_vfm: bool = False,   # Debug only: use dummy zeros if a normal VFM feature is missing
+        owner_catalog: str = None,         # READY fail-closed overlay; required for 816 probing
         no_obj_mask: bool = False,         # Ablation: replace obj mask with all-ones (global pool)
         pose_only: bool = False,           # Deprecated alias for unconditional_baseline
         unconditional_baseline: bool = False,  # zero visual/object conditions
@@ -164,14 +207,20 @@ class InsScene15KDataset(EasyDataset):
             window_size: If > 0, split long videos into overlapping windows of this size.
                          Stride = window_size // 2.  0 or negative disables windowing.
         """
+        if split not in {"train", "val", "test", "all"}:
+            raise ValueError(f"Unknown dataset split {split!r}; expected train, val, test, or all")
         # Site-specific storage is supplied by the scheduler/environment. This
         # keeps historical YAMLs runnable without baking one cluster's mount
         # points into the scientific configuration.
         root = os.environ.get("INSCENE_DATA_ROOT", root)
         root_vfm = os.environ.get("INSCENE_FEAT_ROOT", root_vfm)
         target_feat_root = os.environ.get("INSCENE_TARGET_FEAT_ROOT", target_feat_root)
+        target_index_root = os.environ.get("INSCENE_TARGET_INDEX_ROOT", target_index_root)
+        target_layout = os.environ.get("INSCENE_TARGET_LAYOUT", target_layout)
         shuffled_feat_root = os.environ.get("INSCENE_SHUFFLED_FEAT_ROOT", shuffled_feat_root)
         context_feat_root = os.environ.get("INSCENE_CONTEXT_FEAT_ROOT", context_feat_root)
+        streaming_feat_root = os.environ.get("INSCENE_STREAMING_FEAT_ROOT", streaming_feat_root)
+        owner_catalog = os.environ.get("INSCENE_OWNER_CATALOG", owner_catalog)
         if sources is None:
             sources = ["processed_scannetpp_v2"]
 
@@ -196,6 +245,16 @@ class InsScene15KDataset(EasyDataset):
         self.target_w = target_w
         self.max_identity_classes = max_identity_classes
         self.split_manifest = split_manifest or os.environ.get("INSCENE_SPLIT_MANIFEST")
+        self.scene_manifest = scene_manifest or os.environ.get("INSCENE_MANIFEST")
+        exclusions_path = os.environ.get("INSCENE_STREAMING_EXCLUSIONS")
+        self.streaming_excluded_units = set()
+        if exclusions_path:
+            with open(exclusions_path, encoding="utf-8") as handle:
+                self.streaming_excluded_units = {
+                    line.strip()
+                    for line in handle
+                    if line.strip() and not line.lstrip().startswith("#")
+                }
         self.window_size = window_size
         self.include_pmaps = include_pmaps
         self.streaming_prefix = streaming_prefix
@@ -239,17 +298,29 @@ class InsScene15KDataset(EasyDataset):
         self.streaming_hidden_min_query_pixels = int(streaming_hidden_min_query_pixels)
         self.streaming_hidden_min_border_px = int(streaming_hidden_min_border_px)
         self.streaming_hidden_strict_post_history = bool(streaming_hidden_strict_post_history)
+        self.strict_zero_hidden_b2 = bool(strict_zero_hidden_b2)
         self.diag_action = diag_action
         self.diag_abnormal = diag_abnormal
         self.diag_path_integration = diag_path_integration
         self.diag_counterfactual = diag_counterfactual
         self.target_feat_root = target_feat_root
+        self.target_index_root = target_index_root
+        if target_layout not in {"auto", "flat", "per_prefix"}:
+            raise ValueError(f"target_layout must be auto|flat|per_prefix, got {target_layout!r}")
+        self.target_layout = target_layout
         self.shuffled_feat_root = shuffled_feat_root
         self.action_horizons = sorted({int(h) for h in (action_horizons or []) if int(h) > 0})
         self.counterfactual_min_overlap = counterfactual_min_overlap
         self.streaming_target_from_prefix = bool(streaming_target_from_prefix)
         self.scramble_feat = scramble_feat
         self.allow_missing_vfm = allow_missing_vfm
+        self.owner_catalog = None
+        if owner_catalog:
+            if allow_missing_vfm:
+                raise OwnerCatalogError(
+                    "owner catalog forbids allow_missing_vfm dummy features"
+                )
+            self.owner_catalog = load_owner_catalog(owner_catalog)
         self.no_obj_mask = no_obj_mask
         self.pose_only = pose_only or unconditional_baseline
         # A2/B1/C1 all need extrinsics normalized via pointmap-based scale
@@ -265,24 +336,44 @@ class InsScene15KDataset(EasyDataset):
             self.include_pmaps = True
         self.kwargs = kwargs
 
-        # Collect all scenes
+        # Collect all scenes. When INSCENE_MANIFEST is supplied, trust the local
+        # manifest and avoid remote directory exploration during training startup.
         self.scenes = []
-        for source in sources:
-            source_path = os.path.join(root, source)
-            if not os.path.isdir(source_path):
-                logger.warning(f"Source path {source_path} not found, skipping.")
-                continue
+        loaded_from_scene_manifest = bool(self.scene_manifest)
+        manifest_records_are_expanded = False
+        if loaded_from_scene_manifest:
+            self.scenes = self._load_scene_manifest(self.scene_manifest, split)
+            manifest_records_are_expanded = any(
+                "streaming_tail" in scene for scene in self.scenes
+            )
+            if manifest_records_are_expanded and self.streaming_excluded_units:
+                self.scenes = [
+                    scene
+                    for scene in self.scenes
+                    if self._streaming_unit_key(scene)
+                    not in self.streaming_excluded_units
+                ]
+        else:
+            for source in sources:
+                source_path = aoss_fs.join(root, source)
+                if not aoss_fs.isdir(source_path):
+                    logger.warning(f"Source path {source_path} not found, skipping.")
+                    continue
 
-            if source == "processed_infinigen":
-                self._collect_infinigen_scenes(source_path)
-            elif source == "processed_scannetpp_v2":
-                self._collect_scannetpp_scenes(source_path)
+                if source == "processed_infinigen":
+                    self._collect_infinigen_scenes(source_path)
+                elif source == "processed_scannetpp_v2":
+                    self._collect_scannetpp_scenes(source_path)
 
         # Split at scene level before window expansion. A frozen manifest is
         # required for a genuine test set and strongly recommended otherwise.
-        if self.split_manifest:
-            with open(self.split_manifest) as f:
-                manifest = json.load(f)
+        if loaded_from_scene_manifest:
+            if not self.scenes:
+                raise ValueError(
+                    f"Scene manifest {self.scene_manifest} yielded no records for split={split!r}"
+                )
+        elif self.split_manifest:
+            manifest = aoss_fs.load_json(self.split_manifest)
             splits = manifest.get("splits", manifest)
             if split not in splits:
                 raise ValueError(f"Split {split!r} missing from {self.split_manifest}")
@@ -308,16 +399,173 @@ class InsScene15KDataset(EasyDataset):
 
         # Expand scenes with windowing for long videos. Streaming prefix uses
         # shared ScanNet++ temporal windows by default; each probe sees prefixes
-        # cut from the same motion-normalized observation sequence.
-        if getattr(self, "streaming_prefix", False):
+        # cut from the same motion-normalized observation sequence. Sample-level
+        # manifests are already expanded and skip this remote-free computation.
+        if getattr(self, "streaming_prefix", False) and not manifest_records_are_expanded:
             self._expand_scenes_with_streaming_prefix()
-        elif self.window_size > 0:
+        elif self.window_size > 0 and not manifest_records_are_expanded:
             self._expand_scenes_with_windows()
+
+        # Pre-expanded C manifests may request windows/prefixes that this VFM
+        # never extracted. Keep only (window, tail) pairs present on disk.
+        trust_expanded_manifest = (
+            os.environ.get("INSCENE_TRUST_EXPANDED_MANIFEST", "0") == "1"
+        )
+        if (
+            getattr(self, "streaming_prefix", False)
+            and (self.streaming_feat_root or self.root_vfm)
+            and not (
+                loaded_from_scene_manifest
+                and manifest_records_are_expanded
+                and trust_expanded_manifest
+            )
+        ):
+            self._filter_streaming_samples_to_prefix_index()
+
+        # Assign C1 horizons only after prefix/owner filtering, preserving the
+        # original training budget and covering every horizon in evaluation.
+        self._expand_c1_horizon_samples()
 
         logger.info(
             f"InsScene15KDataset: {len(self.scenes)} samples for {split} split "
             f"from sources {sources} (window_size={self.window_size}, "
             f"streaming_prefix={self.streaming_prefix})"
+        )
+
+    def _expand_c1_horizon_samples(self):
+        """Balance training horizons without increasing the prefix count.
+
+        Training assigns one horizon per prefix by a seeded random partition;
+        counts differ by at most one. The assignment is fixed across epochs and
+        independent of worker access order. Evaluation expands every prefix to
+        all horizons. The parent manifest ID stays unchanged; emitted C1 sample
+        IDs include the selected target. Single-horizon behavior is unchanged.
+        """
+        if not (self.streaming_prefix and self.diag_action):
+            return
+        horizons = self.action_horizons or [1]
+        if len(horizons) == 1:
+            return
+        if any((self.diag_overlap, self.diag_hidden_obj, self.diag_visible_obj,
+                self.diag_abnormal, self.diag_path_integration, self.diag_counterfactual)):
+            raise ValueError("Mixed-horizon C1 requires a dedicated diag_action dataset")
+        if self.streaming_target_from_prefix:
+            raise ValueError("Mixed-horizon C1 requires target-isolated features")
+        assigned = []
+        if self.split == "train":
+            # Construct in the parent process, before persistent workers start.
+            # Explicit dataset seed wins; otherwise use the experiment's torch
+            # seed, not a worker's sampling RNG or Python's randomized hash.
+            seed = self.seed if self.seed is not None else torch.initial_seed()
+            order = np.random.default_rng(seed).permutation(len(self.scenes))
+            horizon_by_index = np.empty(len(self.scenes), dtype=np.int64)
+            horizon_by_index[order] = np.asarray(horizons)[np.arange(len(order)) % len(horizons)]
+        for index, scene in enumerate(self.scenes):
+            window = scene.get("streaming_window_indices")
+            tail = int(scene["streaming_tail"])
+            if window is None or tail + max(horizons) >= len(window):
+                raise ValueError(
+                    "Mixed-horizon C1 requires explicit canonical window indices "
+                    f"covering all horizons {horizons}: {scene.get('sample_id', scene['scene_dir'])}"
+                )
+            selected = [int(horizon_by_index[index])] if self.split == "train" else horizons
+            for horizon in selected:
+                assigned.append({**scene, "c1_target_horizon": int(horizon)})
+        self.scenes = assigned
+
+    def _load_scene_manifest(self, manifest_path: str, split: str):
+        """Load precomputed scene/sample records without scanning storage.
+
+        JSONL is preferred for large manifests. JSON files may contain either a
+        list of records or {"samples": [...]} / {"scenes": [...]}. Records can
+        be scene-level or already-expanded streaming samples. Sample-level
+        records include ``streaming_tail`` and are consumed directly.
+        """
+        if aoss_fs.is_remote(manifest_path):
+            payload = aoss_fs.read_bytes(manifest_path).decode("utf-8")
+        else:
+            with open(manifest_path, "r") as f:
+                payload = f.read()
+
+        records = []
+        if manifest_path.endswith(".jsonl"):
+            for line in payload.splitlines():
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        else:
+            data = json.loads(payload)
+            if isinstance(data, dict):
+                records = data.get("samples") or data.get("scenes") or data.get("records") or []
+            elif isinstance(data, list):
+                records = data
+            else:
+                raise ValueError(f"Unsupported manifest payload in {manifest_path}")
+
+        scenes = []
+        for record in records:
+            if split != "all" and "split" in record and record["split"] != split:
+                continue
+            scenes.append(self._normalize_scene_manifest_record(record))
+
+        logger.info(
+            f"Loaded {len(scenes)} records from scene manifest {manifest_path} "
+            f"for split={split}"
+        )
+        return scenes
+
+    def _normalize_scene_manifest_record(self, record: dict):
+        scene = dict(record)
+        if "scene_dir" not in scene and "data_prefix" in scene:
+            scene["scene_dir"] = scene["data_prefix"]
+        if "scene_dir" not in scene:
+            raise ValueError("Manifest record must contain scene_dir or data_prefix")
+        scene.setdefault("source", "scannetpp")
+        scene.setdefault("scene_id", os.path.basename(str(scene["scene_dir"]).rstrip("/")))
+
+        # Frozen manifests may have been authored against AOSS raw-data paths.
+        # Training nodes normally have the same ScanNet++ tree on UMM, so allow
+        # an explicit, environment-scoped remap without duplicating large JSONL
+        # manifests. Feature roots remain untouched and can still point at AOSS.
+        local_scene_root = os.environ.get("INSCENE_LOCAL_SCENE_ROOT")
+        if local_scene_root and scene["source"] == "scannetpp":
+            scene["scene_dir"] = aoss_fs.join(local_scene_root, scene["scene_id"])
+
+        int_fields = [
+            "num_frames",
+            "streaming_tail",
+            "streaming_tail_raw",
+            "streaming_window_id",
+            "streaming_obs_start",
+            "strict_object_id",
+        ]
+        for key in int_fields:
+            if key in scene and scene[key] is not None:
+                scene[key] = int(scene[key])
+
+        int_list_fields = [
+            "valid_pose_indices",
+            "streaming_indices",
+            "streaming_window_indices",
+        ]
+        for key in int_list_fields:
+            if key in scene and scene[key] is not None:
+                scene[key] = [int(v) for v in scene[key]]
+
+        if "valid_frames" in scene and scene["valid_frames"] is not None:
+            scene["valid_frames"] = [str(v) for v in scene["valid_frames"]]
+        if "poses_c2w" in scene and scene["poses_c2w"] is not None:
+            scene["poses_c2w"] = np.asarray(scene["poses_c2w"], dtype=np.float32)
+        return scene
+
+    def _streaming_unit_key(self, scene_info: dict) -> str:
+        scene = str(
+            scene_info.get("scene_id")
+            or os.path.basename(str(scene_info["scene_dir"]).rstrip("/"))
+        )
+        return (
+            f"{scene}/window_{int(scene_info.get('streaming_window_id', 0)):04d}/"
+            f"prefix_{int(scene_info['streaming_tail']):06d}"
         )
 
     def _streaming_window_obs_len(self):
@@ -487,16 +735,16 @@ class InsScene15KDataset(EasyDataset):
 
     def _try_add_infinigen_scene(self, candidate_dir):
         """Try to register one infinigen scene/subscene directory."""
-        frames_dir = os.path.join(candidate_dir, "frames")
-        img_dir = os.path.join(frames_dir, "Image", "camera_0")
-        mask_dir = os.path.join(frames_dir, "ObjectSegmentation", "camera_0")
-        cam_dir = os.path.join(frames_dir, "camview", "camera_0")
+        frames_dir = aoss_fs.join(candidate_dir, "frames")
+        img_dir = aoss_fs.join(frames_dir, "Image", "camera_0")
+        mask_dir = aoss_fs.join(frames_dir, "ObjectSegmentation", "camera_0")
+        cam_dir = aoss_fs.join(frames_dir, "camview", "camera_0")
 
-        if not all(os.path.isdir(d) for d in [img_dir, mask_dir, cam_dir]):
+        if not all(aoss_fs.isdir(d) for d in [img_dir, mask_dir, cam_dir]):
             return False
 
         img_files = sort_frame_names(
-            [f for f in os.listdir(img_dir) if f.endswith(".png")]
+            [f for f in aoss_fs.listdir(img_dir) if f.endswith(".png")]
         )
         if len(img_files) < self.num_views:
             return False
@@ -517,13 +765,13 @@ class InsScene15KDataset(EasyDataset):
           - Flat:     source_path/scene_XXX/frames/...  (sample data)
           - Nested:   source_path/scene_XXX/<subscene_hash>/frames/...  (full dataset)
         """
-        for scene_dir in sorted(glob(os.path.join(source_path, "scene_*"))):
+        for scene_dir in sorted(aoss_fs.glob(aoss_fs.join(source_path, "scene_*"))):
             # Try flat layout first (scene_dir itself has frames/)
             if self._try_add_infinigen_scene(scene_dir):
                 continue
             # Try nested layout (subscene dirs inside scene_dir)
-            for sub_dir in sorted(glob(os.path.join(scene_dir, "*"))):
-                if os.path.isdir(sub_dir):
+            for sub_dir in sorted(aoss_fs.glob(aoss_fs.join(scene_dir, "*"))):
+                if aoss_fs.isdir(sub_dir):
                     self._try_add_infinigen_scene(sub_dir)
 
     def _collect_scannetpp_scenes(self, source_path):
@@ -533,29 +781,29 @@ class InsScene15KDataset(EasyDataset):
           source_path/processed_scannetpp_v2/<scene_id>/...
         """
         # Handle nested directory from zip extraction
-        nested = os.path.join(source_path, "processed_scannetpp_v2")
-        if os.path.isdir(nested):
+        nested = aoss_fs.join(source_path, "processed_scannetpp_v2")
+        if aoss_fs.isdir(nested):
             source_path = nested
 
-        for scene_id in sorted(os.listdir(source_path)):
-            scene_dir = os.path.join(source_path, scene_id)
-            if not os.path.isdir(scene_dir):
+        for scene_id in sorted(aoss_fs.listdir(source_path)):
+            scene_dir = aoss_fs.join(source_path, scene_id)
+            if not aoss_fs.isdir(scene_dir):
                 continue
 
-            img_dir = os.path.join(scene_dir, "images")
-            mask_dir = os.path.join(scene_dir, "refined_ins_ids")
-            meta_path = os.path.join(scene_dir, "scene_iphone_metadata.npz")
+            img_dir = aoss_fs.join(scene_dir, "images")
+            mask_dir = aoss_fs.join(scene_dir, "refined_ins_ids")
+            meta_path = aoss_fs.join(scene_dir, "scene_iphone_metadata.npz")
 
             if not all(
-                os.path.exists(p) for p in [img_dir, mask_dir, meta_path]
+                aoss_fs.exists(p) for p in [img_dir, mask_dir, meta_path]
             ):
                 continue
 
             # Keep ScanNet++ in metadata/video order.  Frame names are already
             # zero-padded, but using metadata order also gives direct pose rows.
-            img_files = set(f for f in os.listdir(img_dir) if f.endswith(".jpg"))
-            mask_files = set(os.listdir(mask_dir))
-            meta = np.load(meta_path)
+            img_files = set(f for f in aoss_fs.listdir(img_dir) if f.endswith(".jpg"))
+            mask_files = set(aoss_fs.listdir(mask_dir))
+            meta = aoss_fs.load_npy(meta_path)
             meta_images = [str(f) for f in meta["images"].tolist()]
             valid_frames = []
             valid_pose_indices = []
@@ -618,15 +866,15 @@ class InsScene15KDataset(EasyDataset):
 
     def _load_infinigen_scene(self, scene_info, sel_indices):
         """Load frames from an infinigen scene."""
-        frames_dir = os.path.join(scene_info["scene_dir"], "frames")
-        img_dir = os.path.join(frames_dir, "Image", "camera_0")
-        mask_dir = os.path.join(frames_dir, "ObjectSegmentation", "camera_0")
-        cam_dir = os.path.join(frames_dir, "camview", "camera_0")
-        depth_dir = os.path.join(frames_dir, "Depth", "camera_0")
+        frames_dir = aoss_fs.join(scene_info["scene_dir"], "frames")
+        img_dir = aoss_fs.join(frames_dir, "Image", "camera_0")
+        mask_dir = aoss_fs.join(frames_dir, "ObjectSegmentation", "camera_0")
+        cam_dir = aoss_fs.join(frames_dir, "camview", "camera_0")
+        depth_dir = aoss_fs.join(frames_dir, "Depth", "camera_0")
 
         # Get sorted list of frame indices from filenames
         img_files = sorted(
-            [f for f in os.listdir(img_dir) if f.endswith(".png")]
+            [f for f in aoss_fs.listdir(img_dir) if f.endswith(".png")]
         )
 
         images = []
@@ -644,16 +892,16 @@ class InsScene15KDataset(EasyDataset):
             frame_id = img_name.replace("Image_", "").replace(".png", "")
 
             # Load image
-            img_path = os.path.join(img_dir, img_name)
-            img = np.array(Image.open(img_path).convert("RGB"))
+            img_path = aoss_fs.join(img_dir, img_name)
+            img = np.array(aoss_fs.load_image(img_path).convert("RGB"))
             images.append(torch.from_numpy(img).float().permute(2, 0, 1))
 
             # Load identity mask
-            mask_path = os.path.join(
+            mask_path = aoss_fs.join(
                 mask_dir, f"ObjectSegmentation_{frame_id}.npy"
             )
-            if os.path.exists(mask_path):
-                mask = np.load(mask_path).astype(np.int64)
+            if aoss_fs.exists(mask_path):
+                mask = aoss_fs.load_npy(mask_path).astype(np.int64)
             else:
                 mask = np.zeros(
                     (images[-1].shape[1], images[-1].shape[2]), dtype=np.int64
@@ -661,9 +909,9 @@ class InsScene15KDataset(EasyDataset):
             masks.append(torch.from_numpy(mask).long())
 
             # Load depth (float32, meters; 1e10 = invalid/sky)
-            depth_path = os.path.join(depth_dir, f"Depth_{frame_id}.npy")
-            if os.path.exists(depth_path):
-                depth = np.load(depth_path).astype(np.float32)
+            depth_path = aoss_fs.join(depth_dir, f"Depth_{frame_id}.npy")
+            if aoss_fs.exists(depth_path):
+                depth = aoss_fs.load_npy(depth_path).astype(np.float32)
                 depth[depth > 1e6] = 0.0  # mark invalid
             else:
                 depth = np.zeros(
@@ -672,8 +920,8 @@ class InsScene15KDataset(EasyDataset):
             depthmaps.append(torch.from_numpy(depth))
 
             # Load camera parameters
-            cam_path = os.path.join(cam_dir, f"camview_{frame_id}.npz")
-            cam = np.load(cam_path)
+            cam_path = aoss_fs.join(cam_dir, f"camview_{frame_id}.npz")
+            cam = aoss_fs.load_npy(cam_path)
             K = torch.from_numpy(cam["K"].astype(np.float32))
             T = torch.from_numpy(cam["T"].astype(np.float32))
             intrinsics.append(K)
@@ -690,13 +938,13 @@ class InsScene15KDataset(EasyDataset):
     def _load_scannetpp_scene(self, scene_info, sel_indices):
         """Load frames from a scannetpp scene."""
         scene_dir = scene_info["scene_dir"]
-        img_dir = os.path.join(scene_dir, "images")
-        mask_dir = os.path.join(scene_dir, "refined_ins_ids")
-        depth_dir = os.path.join(scene_dir, "depth")
-        meta_path = os.path.join(scene_dir, "scene_iphone_metadata.npz")
+        img_dir = aoss_fs.join(scene_dir, "images")
+        mask_dir = aoss_fs.join(scene_dir, "refined_ins_ids")
+        depth_dir = aoss_fs.join(scene_dir, "depth")
+        meta_path = aoss_fs.join(scene_dir, "scene_iphone_metadata.npz")
 
         valid_frames = scene_info["valid_frames"]
-        meta = np.load(meta_path)
+        meta = aoss_fs.load_npy(meta_path)
         valid_pose_indices = scene_info.get("valid_pose_indices")
 
         images = []
@@ -713,20 +961,20 @@ class InsScene15KDataset(EasyDataset):
             frame_name = valid_frames[idx]
 
             # Load image
-            img_path = os.path.join(img_dir, frame_name)
-            img = np.array(Image.open(img_path).convert("RGB"))
+            img_path = aoss_fs.join(img_dir, frame_name)
+            img = np.array(aoss_fs.load_image(img_path).convert("RGB"))
             images.append(torch.from_numpy(img).float().permute(2, 0, 1))
 
             # Load identity mask
-            mask_path = os.path.join(mask_dir, f"{frame_name}.npy")
-            mask = np.load(mask_path).astype(np.int64)
+            mask_path = aoss_fs.join(mask_dir, f"{frame_name}.npy")
+            mask = aoss_fs.load_npy(mask_path).astype(np.int64)
             masks.append(torch.from_numpy(mask).long())
 
             # Load depth (uint16 PNG in millimeters -> convert to meters)
             depth_stem = os.path.splitext(frame_name)[0]
-            depth_path = os.path.join(depth_dir, f"{depth_stem}.png")
-            if os.path.exists(depth_path):
-                depth = np.array(Image.open(depth_path)).astype(np.float32) / 1000.0
+            depth_path = aoss_fs.join(depth_dir, f"{depth_stem}.png")
+            if aoss_fs.exists(depth_path):
+                depth = np.array(aoss_fs.load_image(depth_path)).astype(np.float32) / 1000.0
             else:
                 depth = np.zeros(
                     (images[-1].shape[1], images[-1].shape[2]), dtype=np.float32
@@ -756,31 +1004,31 @@ class InsScene15KDataset(EasyDataset):
         """Load only raw instance masks for the requested frame indices."""
         masks = []
         if scene_info["source"] == "infinigen":
-            frames_dir = os.path.join(scene_info["scene_dir"], "frames")
-            img_dir = os.path.join(frames_dir, "Image", "camera_0")
-            mask_dir = os.path.join(frames_dir, "ObjectSegmentation", "camera_0")
-            img_files = sort_frame_names([f for f in os.listdir(img_dir) if f.endswith(".png")])
+            frames_dir = aoss_fs.join(scene_info["scene_dir"], "frames")
+            img_dir = aoss_fs.join(frames_dir, "Image", "camera_0")
+            mask_dir = aoss_fs.join(frames_dir, "ObjectSegmentation", "camera_0")
+            img_files = sort_frame_names([f for f in aoss_fs.listdir(img_dir) if f.endswith(".png")])
             for idx in sel_indices:
                 idx = min(int(idx.item()), len(img_files) - 1)
                 img_name = img_files[idx]
                 frame_id = img_name.replace("Image_", "").replace(".png", "")
-                mask_path = os.path.join(mask_dir, f"ObjectSegmentation_{frame_id}.npy")
-                if os.path.exists(mask_path):
-                    mask = np.load(mask_path).astype(np.int64)
+                mask_path = aoss_fs.join(mask_dir, f"ObjectSegmentation_{frame_id}.npy")
+                if aoss_fs.exists(mask_path):
+                    mask = aoss_fs.load_npy(mask_path).astype(np.int64)
                 else:
-                    with Image.open(os.path.join(img_dir, img_name)) as img:
+                    with aoss_fs.load_image(aoss_fs.join(img_dir, img_name)) as img:
                         w, h = img.size
                     mask = np.zeros((h, w), dtype=np.int64)
                 masks.append(torch.from_numpy(mask).long())
         elif scene_info["source"] == "scannetpp":
             scene_dir = scene_info["scene_dir"]
-            mask_dir = os.path.join(scene_dir, "refined_ins_ids")
+            mask_dir = aoss_fs.join(scene_dir, "refined_ins_ids")
             valid_frames = scene_info["valid_frames"]
             for idx in sel_indices:
                 idx = min(int(idx.item()), len(valid_frames) - 1)
                 frame_name = valid_frames[idx]
-                mask_path = os.path.join(mask_dir, f"{frame_name}.npy")
-                masks.append(torch.from_numpy(np.load(mask_path).astype(np.int64)).long())
+                mask_path = aoss_fs.join(mask_dir, f"{frame_name}.npy")
+                masks.append(torch.from_numpy(aoss_fs.load_npy(mask_path).astype(np.int64)).long())
         else:
             raise ValueError(f"Unknown source: {scene_info['source']}")
         return torch.stack(masks)
@@ -792,49 +1040,49 @@ class InsScene15KDataset(EasyDataset):
         extrinsics = []
 
         if scene_info["source"] == "infinigen":
-            frames_dir = os.path.join(scene_info["scene_dir"], "frames")
-            img_dir = os.path.join(frames_dir, "Image", "camera_0")
-            cam_dir = os.path.join(frames_dir, "camview", "camera_0")
-            depth_dir = os.path.join(frames_dir, "Depth", "camera_0")
-            img_files = sort_frame_names([f for f in os.listdir(img_dir) if f.endswith(".png")])
+            frames_dir = aoss_fs.join(scene_info["scene_dir"], "frames")
+            img_dir = aoss_fs.join(frames_dir, "Image", "camera_0")
+            cam_dir = aoss_fs.join(frames_dir, "camview", "camera_0")
+            depth_dir = aoss_fs.join(frames_dir, "Depth", "camera_0")
+            img_files = sort_frame_names([f for f in aoss_fs.listdir(img_dir) if f.endswith(".png")])
 
             for idx in sel_indices:
                 idx = min(int(idx.item()), len(img_files) - 1)
                 frame_id = img_files[idx].replace("Image_", "").replace(".png", "")
 
-                depth_path = os.path.join(depth_dir, f"Depth_{frame_id}.npy")
-                if os.path.exists(depth_path):
-                    depth = np.load(depth_path).astype(np.float32)
+                depth_path = aoss_fs.join(depth_dir, f"Depth_{frame_id}.npy")
+                if aoss_fs.exists(depth_path):
+                    depth = aoss_fs.load_npy(depth_path).astype(np.float32)
                     depth[depth > 1e6] = 0.0
                 else:
                     # Rare fallback; use the RGB size without keeping the image.
-                    img_path = os.path.join(img_dir, img_files[idx])
-                    with Image.open(img_path) as img:
+                    img_path = aoss_fs.join(img_dir, img_files[idx])
+                    with aoss_fs.load_image(img_path) as img:
                         w, h = img.size
                     depth = np.zeros((h, w), dtype=np.float32)
                 depthmaps.append(torch.from_numpy(depth))
 
-                cam_path = os.path.join(cam_dir, f"camview_{frame_id}.npz")
-                cam = np.load(cam_path)
+                cam_path = aoss_fs.join(cam_dir, f"camview_{frame_id}.npz")
+                cam = aoss_fs.load_npy(cam_path)
                 intrinsics.append(torch.from_numpy(cam["K"].astype(np.float32)))
                 T = torch.from_numpy(cam["T"].astype(np.float32))
                 extrinsics.append(camera_to_world_to_extrinsic(T))
 
         elif scene_info["source"] == "scannetpp":
             scene_dir = scene_info["scene_dir"]
-            depth_dir = os.path.join(scene_dir, "depth")
-            meta_path = os.path.join(scene_dir, "scene_iphone_metadata.npz")
+            depth_dir = aoss_fs.join(scene_dir, "depth")
+            meta_path = aoss_fs.join(scene_dir, "scene_iphone_metadata.npz")
             valid_frames = scene_info["valid_frames"]
-            meta = np.load(meta_path)
+            meta = aoss_fs.load_npy(meta_path)
             valid_pose_indices = scene_info.get("valid_pose_indices")
 
             for idx in sel_indices:
                 idx = min(int(idx.item()), len(valid_frames) - 1)
                 frame_name = valid_frames[idx]
                 depth_stem = os.path.splitext(frame_name)[0]
-                depth_path = os.path.join(depth_dir, f"{depth_stem}.png")
-                if os.path.exists(depth_path):
-                    depth = np.array(Image.open(depth_path)).astype(np.float32) / 1000.0
+                depth_path = aoss_fs.join(depth_dir, f"{depth_stem}.png")
+                if aoss_fs.exists(depth_path):
+                    depth = np.array(aoss_fs.load_image(depth_path)).astype(np.float32) / 1000.0
                 else:
                     depth = np.zeros((self.target_h, self.target_w), dtype=np.float32)
                 depthmaps.append(torch.from_numpy(depth))
@@ -981,7 +1229,7 @@ class InsScene15KDataset(EasyDataset):
 
     def _streaming_prefix_dir_name(self, scene_info) -> str:
         if "streaming_window_id" in scene_info and "{window" not in self.streaming_prefix_dir_fmt:
-            return os.path.join(
+            return aoss_fs.join(
                 f"window_{int(scene_info['streaming_window_id']):04d}",
                 self.streaming_prefix_dir_fmt.format(
                     tail=int(scene_info["streaming_tail"]),
@@ -994,11 +1242,105 @@ class InsScene15KDataset(EasyDataset):
             window=int(scene_info.get("streaming_window_id", 0)),
         )
 
+
+    def _filter_streaming_samples_to_prefix_index(self):
+        """Keep only streaming samples present in this VFM's prefix_index.npy.
+
+        Feature extraction can emit fewer windows/prefixes than the shared
+        motion-window manifest (different input_length / obs_len). Probe jobs
+        must follow the on-disk index for the active VFM, otherwise DataLoader
+        hits FileNotFound on the first missing window/prefix and aborts.
+        When a READY owner catalog is bound, keep a sample only if that catalog
+        has a unique owner for it. Prefix-index lookup is not an owner source.
+        """
+        before = len(self.scenes)
+        kept = []
+        dropped = 0
+        missing_index = 0
+        catalog_miss = 0
+        for scene in self.scenes:
+            if "streaming_tail" not in scene:
+                kept.append(scene)
+                continue
+            if self.owner_catalog is not None:
+                key = self._streaming_owner_key(scene)
+                if key in self.owner_catalog["owners"]:
+                    kept.append(scene)
+                else:
+                    catalog_miss += 1
+                    dropped += 1
+                continue
+            scene_dir = self._streaming_prefix_scene_dir(scene)
+            if scene_dir is None:
+                kept.append(scene)
+                continue
+            meta_path = aoss_fs.join(scene_dir, "prefix_index.npy")
+            # Ensure cache is populated.
+            self._streaming_prefix_record(scene)
+            records = self._streaming_prefix_meta_cache.get(meta_path) or {}
+            if not records:
+                missing_index += 1
+                feat_path = aoss_fs.join(
+                    scene_dir,
+                    self._streaming_prefix_dir_name(scene),
+                    self._feat_filename(),
+                )
+                if aoss_fs.exists(feat_path):
+                    kept.append(scene)
+                else:
+                    dropped += 1
+                continue
+            window_id = int(scene.get("streaming_window_id", -1))
+            tail = int(scene["streaming_tail"])
+            if (window_id, tail) in records or tail in records:
+                kept.append(scene)
+            else:
+                dropped += 1
+        self.scenes = kept
+        if dropped or missing_index or catalog_miss:
+            logger.info(
+                f"Streaming prefix_index filter ({self.vfm_name}): "
+                f"{before} -> {len(kept)} samples "
+                f"(dropped={dropped}, scenes_without_index={missing_index}, "
+                f"catalog_miss={catalog_miss})"
+            )
+
+
+    def _streaming_owner_key(self, scene_info):
+        prefix = scene_info.get("streaming_prefix_len", scene_info.get("feature_prefix", self.feature_prefix))
+        if prefix is None and "streaming_indices" in scene_info:
+            prefix = len(scene_info["streaming_indices"])
+        return streaming_key(
+            vfm=self.vfm_name,
+            source=scene_info["source"],
+            scene_id=self._feat_scene_name(scene_info),
+            feature_layer=int(self.feature_layer if self.feature_layer is not None else -1),
+            timestep=None if self.feature_timestep is None else int(self.feature_timestep),
+            window_id=int(scene_info.get("streaming_window_id", -1)),
+            prefix=int(prefix if prefix is not None else -1),
+        )
+
+    def _streaming_feature_uri(self, scene_info) -> str:
+        if self.owner_catalog is not None:
+            return resolve_owner(
+                self.owner_catalog,
+                self._streaming_owner_key(scene_info),
+                label="streaming",
+            )
+        scene_dir = self._streaming_prefix_scene_dir(scene_info)
+        if scene_dir is None:
+            return ""
+        return aoss_fs.join(
+            scene_dir,
+            self._streaming_prefix_dir_name(scene_info),
+            self._feat_filename(),
+        )
+
     def _streaming_prefix_scene_dir(self, scene_info) -> str | None:
         root = self.streaming_feat_root or self.root_vfm
         if root is None:
             return None
-        return os.path.join(
+        return aoss_fs.join(
             root,
             self.vfm_name,
             scene_info["source"],
@@ -1010,12 +1352,12 @@ class InsScene15KDataset(EasyDataset):
         if scene_dir is None:
             return None
 
-        meta_path = os.path.join(scene_dir, "prefix_index.npy")
+        meta_path = aoss_fs.join(scene_dir, "prefix_index.npy")
         if meta_path not in self._streaming_prefix_meta_cache:
             records_by_key = {}
-            if os.path.exists(meta_path):
+            if aoss_fs.exists(meta_path):
                 try:
-                    records = np.load(meta_path, allow_pickle=True).tolist()
+                    records = aoss_fs.load_npy(meta_path, allow_pickle=True).tolist()
                     if isinstance(records, dict):
                         records = records.values()
                     for record in records:
@@ -1041,7 +1383,7 @@ class InsScene15KDataset(EasyDataset):
         root = self.context_feat_root
         if root is None:
             return None
-        return os.path.join(
+        return aoss_fs.join(
             root,
             self.vfm_name,
             scene_info["source"],
@@ -1053,12 +1395,12 @@ class InsScene15KDataset(EasyDataset):
         if scene_dir is None:
             return {}
 
-        meta_path = os.path.join(scene_dir, "context_index.npy")
+        meta_path = aoss_fs.join(scene_dir, "context_index.npy")
         if meta_path not in self._context_segment_meta_cache:
             records_by_key = {}
-            if os.path.exists(meta_path):
+            if aoss_fs.exists(meta_path):
                 try:
-                    records = np.load(meta_path, allow_pickle=True).tolist()
+                    records = aoss_fs.load_npy(meta_path, allow_pickle=True).tolist()
                     if isinstance(records, dict):
                         records = records.values()
                     for record in records:
@@ -1084,20 +1426,34 @@ class InsScene15KDataset(EasyDataset):
     def _target_feat_dir(self, scene_info) -> str:
         """Return the directory containing target features for a scene.
 
-        For streaming_prefix mode, the targets are stored per prefix under
-        ``prefix_{tail:06d}/`` sub-directories (matching streaming_target
-        extraction layout).  For non-streaming mode the directory is the
-        plain per-scene feature directory.
+        Two on-disk layouts are supported:
+          * Per-prefix layout: targets stored under ``prefix_{tail:06d}/``
+            sub-directories (older streaming_target extraction layout).
+          * Flat layout: a single ``feature.sft`` per scene holding every
+            target frame, selected by ``target_indices.npy``. Here the prefix
+            length is already encoded in ``target_feat_root`` (e.g.
+            ``dino_prefix_8_m0p35_r0p5``), so no per-prefix sub-directory
+            exists.
+
+        We prefer the per-prefix sub-directory when it is present and fall
+        back to the flat per-scene directory otherwise. This keeps both
+        extraction layouts loadable without breaking existing runs.
         """
-        scene_dir = os.path.join(
+        scene_dir = aoss_fs.join(
             self.target_feat_root,
             self.vfm_name,
             scene_info["source"],
             self._feat_scene_name(scene_info),
         )
-        if getattr(self, "streaming_prefix", False) and "streaming_tail" in scene_info:
+        if (
+            getattr(self, "target_layout", "auto") != "flat"
+            and getattr(self, "streaming_prefix", False)
+            and "streaming_tail" in scene_info
+        ):
             tail = int(scene_info["streaming_tail"])
-            return os.path.join(scene_dir, f"prefix_{tail:06d}")
+            prefixed = aoss_fs.join(scene_dir, f"prefix_{tail:06d}")
+            if getattr(self, "target_layout", "auto") == "per_prefix" or aoss_fs.isdir(prefixed):
+                return prefixed
         return scene_dir
 
     def _target_indices(self, scene_info):
@@ -1106,11 +1462,26 @@ class InsScene15KDataset(EasyDataset):
             return None
         # Cache key includes streaming tail so different prefixes stay separate.
         tail = int(scene_info["streaming_tail"]) if (getattr(self, "streaming_prefix", False) and "streaming_tail" in scene_info) else None
-        cache_key = (scene_info["scene_dir"], self.vfm_name, tail)
+        cache_key = (
+            scene_info["scene_dir"],
+            self.vfm_name,
+            tail,
+            getattr(self, "target_index_root", None),
+        )
         if cache_key in self._target_index_cache:
             return self._target_index_cache[cache_key]
-        path = os.path.join(self._target_feat_dir(scene_info), "target_indices.npy")
-        indices = torch.from_numpy(np.load(path)).long() if os.path.exists(path) else None
+        target_index_root = getattr(self, "target_index_root", None)
+        if target_index_root:
+            path = aoss_fs.join(
+                target_index_root,
+                self.vfm_name,
+                scene_info["source"],
+                self._feat_scene_name(scene_info),
+                "target_indices.npy",
+            )
+        else:
+            path = aoss_fs.join(self._target_feat_dir(scene_info), "target_indices.npy")
+        indices = torch.from_numpy(aoss_fs.load_npy(path)).long() if aoss_fs.exists(path) else None
         self._target_index_cache[cache_key] = indices
         return indices
 
@@ -1187,15 +1558,15 @@ class InsScene15KDataset(EasyDataset):
         """
         if self.target_feat_root is None:
             return None
-        path = os.path.join(self._target_feat_dir(scene_info), self._feat_filename())
-        if not os.path.exists(path):
+        path = aoss_fs.join(self._target_feat_dir(scene_info), self._feat_filename())
+        if not aoss_fs.exists(path):
             return None
         try:
-            data = load_file(path)
+            data = aoss_fs.load_safetensors(path)
         except Exception as e:
             logger.warning(f"Failed to read target feat {path}: {e}")
             return None
-        feat = data["feat"].float()                            # (M, H_f, W_f, C)
+        feat = _feat_cast(data["feat"])                        # (M, H_f, W_f, C)
         tgt_idx = self._target_indices(scene_info)
         if tgt_idx is None:
             return None
@@ -1206,16 +1577,16 @@ class InsScene15KDataset(EasyDataset):
         """Load multiple isolated frame features with one safetensors read."""
         if self.target_feat_root is None:
             return [None for _ in target_global_indices]
-        path = os.path.join(self._target_feat_dir(scene_info), self._feat_filename())
-        if not os.path.exists(path):
+        path = aoss_fs.join(self._target_feat_dir(scene_info), self._feat_filename())
+        if not aoss_fs.exists(path):
             return [None for _ in target_global_indices]
         try:
-            data = load_file(path)
+            data = aoss_fs.load_safetensors(path)
         except Exception as e:
             logger.warning(f"Failed to read target feat {path}: {e}")
             return [None for _ in target_global_indices]
 
-        feat = data["feat"].float()
+        feat = _feat_cast(data["feat"])
         tgt_idx = self._target_indices(scene_info)
         if tgt_idx is None:
             return [None for _ in target_global_indices]
@@ -1235,14 +1606,14 @@ class InsScene15KDataset(EasyDataset):
                 torch.arange(self.num_views),
             )
 
-        vfm_feat_path = os.path.join(
+        vfm_feat_path = aoss_fs.join(
             self.root_vfm,
             self.vfm_name,
             scene_info["source"],
             self._feat_scene_name(scene_info),
             self._feat_filename(),
         )
-        if not os.path.exists(vfm_feat_path):
+        if not aoss_fs.exists(vfm_feat_path):
             msg = f"VFM feature not found at {vfm_feat_path}"
             if not self.allow_missing_vfm:
                 raise FileNotFoundError(
@@ -1255,7 +1626,7 @@ class InsScene15KDataset(EasyDataset):
                 torch.arange(self.num_views),
             )
 
-        vfm_feat = load_file(vfm_feat_path)["feat"].float()
+        vfm_feat = _feat_cast(aoss_fs.load_safetensors(vfm_feat_path)["feat"])
         if self.vfm_name == "cogvideox":
             vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
 
@@ -1282,22 +1653,21 @@ class InsScene15KDataset(EasyDataset):
     def _load_streaming_prefix_feat(self, scene_info, sel_global):
         """Load the precomputed VFM feature for one online prefix sample."""
         dummy_h, dummy_w = default_feature_hw(self.vfm_name)
-        scene_dir = self._streaming_prefix_scene_dir(scene_info)
-        if scene_dir is None:
+        vfm_feat_path = self._streaming_feature_uri(scene_info)
+        if not vfm_feat_path:
+            if self.owner_catalog is not None:
+                raise OwnerCatalogError("owner catalog returned an empty streaming URI")
             return (
                 torch.zeros(len(sel_global), dummy_h, dummy_w, default_feature_channels(self.vfm_name), dtype=torch.float32),
                 torch.arange(len(sel_global)),
             )
 
-        vfm_feat_path = os.path.join(
-            scene_dir,
-            self._streaming_prefix_dir_name(scene_info),
-            self._feat_filename(),
-        )
-        if not os.path.exists(vfm_feat_path):
+        if not aoss_fs.exists(vfm_feat_path):
             msg = f"Streaming prefix VFM feature not found at {vfm_feat_path}"
-            if not self.allow_missing_vfm:
+            if self.owner_catalog is not None or not self.allow_missing_vfm:
                 raise FileNotFoundError(
+                    msg + "; owner catalog and unverified/dummy sources are forbidden"
+                    if self.owner_catalog is not None else
                     msg + "; run feature extraction with --mode streaming_prefix first "
                     "or set allow_missing_vfm=True for debugging"
                 )
@@ -1308,7 +1678,7 @@ class InsScene15KDataset(EasyDataset):
                 torch.arange(len(sel_global)),
             )
 
-        vfm_feat = load_file(vfm_feat_path)["feat"].float()
+        vfm_feat = _feat_cast(aoss_fs.load_safetensors(vfm_feat_path)["feat"])
         if self.vfm_name == "cogvideox":
             vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
         if vfm_feat.ndim != 4:
@@ -1386,16 +1756,16 @@ class InsScene15KDataset(EasyDataset):
 
         context_start = int(context_start)
         context_tail = int(context_tail)
-        segment_dir = os.path.join(
+        segment_dir = aoss_fs.join(
             scene_dir,
             self._context_segment_dir_name(context_start, context_tail),
         )
-        path = os.path.join(segment_dir, self._feat_filename())
-        if not os.path.exists(path):
+        path = aoss_fs.join(segment_dir, self._feat_filename())
+        if not aoss_fs.exists(path):
             return None, None
 
         try:
-            vfm_feat = load_file(path)["feat"].float()
+            vfm_feat = _feat_cast(aoss_fs.load_safetensors(path)["feat"])
         except Exception as e:
             logger.warning(f"Failed to read context segment feat {path}: {e}")
             return None, None
@@ -1515,6 +1885,18 @@ class InsScene15KDataset(EasyDataset):
 
         target_global = sel_global[1:]
         K = int(target_global.numel())
+        target_global_list = [int(target_idx.item()) for target_idx in target_global]
+        sample_task = "c1" if getattr(self, "diag_action", False) else "c2"
+        sample_id = canonical_streaming_sample_id(
+            scene_info,
+            sample_task,
+            target_indices=target_global_list,
+        )
+        paired_sample_id = (
+            str(scene_info.get("paired_sample_id"))
+            if scene_info.get("paired_sample_id") is not None
+            else canonical_streaming_sample_id(scene_info, f"{sample_task}_pair")
+        )
 
         if getattr(self, "streaming_prefix", False):
             prefix_global = torch.as_tensor(
@@ -1545,7 +1927,6 @@ class InsScene15KDataset(EasyDataset):
             if not input_valid:
                 input_feat = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
 
-        target_global_list = [int(target_idx.item()) for target_idx in target_global]
         loaded_target_feats = (
             self._load_streaming_target_feats_from_prefix(scene_info, target_global_list)
             if getattr(self, "streaming_prefix", False) and self.streaming_target_from_prefix
@@ -1571,9 +1952,29 @@ class InsScene15KDataset(EasyDataset):
                 target_feats.append(target_feat)
                 target_valid.append(True)
 
+        # Same-domain persistence control.  This is intentionally loaded from
+        # target_isolated, never sliced from the contextual prefix forward.
+        anchor_global_idx = int(sel_global[0].item())
+        anchor_isolated_feat = self._load_target_feats(
+            scene_info, [anchor_global_idx], num_frames
+        )[0]
+        anchor_isolated_valid = anchor_isolated_feat is not None
+        if anchor_isolated_feat is None:
+            anchor_isolated_feat = torch.zeros_like(input_feat[0])
+
         if getattr(self, "diag_action", False):
+            if K != 1:
+                raise ValueError("C1 must receive exactly one selected future target per sample")
             target_feat = target_feats[0] if target_feats else torch.zeros_like(input_feat[0])
             target_ok = bool(target_valid[0]) if target_valid else False
+            if "c1_target_horizon" in scene_info and not target_ok:
+                raise FileNotFoundError(
+                    "Missing mixed-horizon C1 isolated target: "
+                    f"sample={sample_id}, horizon={scene_info['c1_target_horizon']}"
+                )
+            horizon = int(scene_info.get(
+                "c1_target_horizon", (getattr(self, "action_horizons", None) or [1])[0]
+            ))
             return {
                 "vfm_feat": output_vfm_feat,
                 "vfm_idx": vfm_idx,
@@ -1583,10 +1984,24 @@ class InsScene15KDataset(EasyDataset):
                 if K > 0 else torch.zeros(9, dtype=torch.float32),
                 "target_frame_idx": target_global[0].to(torch.long).cpu()
                 if K > 0 else torch.tensor(-1, dtype=torch.long),
+                "anchor_frame_idx": torch.tensor(anchor_global_idx, dtype=torch.long),
+                "action_horizon": torch.tensor(horizon, dtype=torch.long),
+                "raw_frame_offset": (target_global[0] - sel_global[0]).to(torch.long).cpu(),
+                "anchor_isolated_feat": anchor_isolated_feat,
+                "anchor_isolated_valid": torch.tensor(anchor_isolated_valid, dtype=torch.bool),
                 "dyn_valid": torch.tensor(bool(input_valid and target_ok), dtype=torch.bool),
                 "rng": int.from_bytes(self._rng.bytes(4), "big"),
                 "scene_path": scene_info["scene_dir"],
                 "vfm_name": self.vfm_name,
+                "manifest_sample_id": str(scene_info.get("sample_id", "")),
+                "sample_id": sample_id,
+                "paired_sample_id": paired_sample_id,
+                "streaming_window_id": torch.tensor(
+                    int(scene_info.get("streaming_window_id", -1)), dtype=torch.long
+                ),
+                "streaming_tail_raw": torch.tensor(
+                    int(scene_info.get("streaming_tail_raw", anchor_global_idx)), dtype=torch.long
+                ),
             }
 
         if K > 0:
@@ -1642,6 +2057,18 @@ class InsScene15KDataset(EasyDataset):
             "rng": int.from_bytes(self._rng.bytes(4), "big"),
             "scene_path": scene_info["scene_dir"],
             "vfm_name": self.vfm_name,
+            "manifest_sample_id": str(scene_info.get("sample_id", "")),
+            "sample_id": sample_id,
+            "paired_sample_id": paired_sample_id,
+            "anchor_frame_idx": torch.tensor(anchor_global_idx, dtype=torch.long),
+            "anchor_isolated_feat": anchor_isolated_feat,
+            "anchor_isolated_valid": torch.tensor(anchor_isolated_valid, dtype=torch.bool),
+            "streaming_window_id": torch.tensor(
+                int(scene_info.get("streaming_window_id", -1)), dtype=torch.long
+            ),
+            "streaming_tail_raw": torch.tensor(
+                int(scene_info.get("streaming_tail_raw", anchor_global_idx)), dtype=torch.long
+            ),
         }
 
     def _load_shuffled_feat(self, scene_info, num_frames, sel_global):
@@ -1654,17 +2081,17 @@ class InsScene15KDataset(EasyDataset):
         """
         if self.shuffled_feat_root is None:
             return None
-        path = os.path.join(
+        path = aoss_fs.join(
             self.shuffled_feat_root,
             self.vfm_name,
             scene_info["source"],
             self._feat_scene_name(scene_info),
             self._feat_filename(),
         )
-        if not os.path.exists(path):
+        if not aoss_fs.exists(path):
             return None
         try:
-            shuf = load_file(path)["feat"].float()
+            shuf = _feat_cast(aoss_fs.load_safetensors(path)["feat"])
         except Exception as e:
             logger.warning(f"Failed to read shuffled feat {path}: {e}")
             return None
@@ -1694,6 +2121,8 @@ class InsScene15KDataset(EasyDataset):
                 scene_info["streaming_indices"], dtype=torch.long
             )
             future_horizons = self._streaming_future_horizons(default=[])
+            if "c1_target_horizon" in scene_info:
+                future_horizons = [int(scene_info["c1_target_horizon"])]
             if (
                 future_horizons
                 and (self.diag_action or self.diag_path_integration or self.diag_counterfactual)
@@ -1822,6 +2251,12 @@ class InsScene15KDataset(EasyDataset):
         else:
             pointmaps = None
 
+        # Preserve the metric world frame for strict B2 labels.  The ordinary
+        # probe tensors below are subsequently rebased/scaled for historical
+        # compatibility, but strict centroids must be past-only world geometry.
+        extrinsics_metric = extrinsics.clone()
+        pointmaps_metric = pointmaps
+
         # Normalize scene. Streaming prefix uses the current tail frame as ego;
         # standard sampled clips keep the historical first-frame reference.
         # If point maps are disabled, scale by depth instead of points.
@@ -1850,6 +2285,7 @@ class InsScene15KDataset(EasyDataset):
 
         # Prepare output
         output = {}
+        output["manifest_sample_id"] = str(scene_info.get("sample_id", ""))
         output["image"] = images  # (S, 3, H, W)
         output["identity_ids"] = masks  # (S, H, W) - integer identity IDs
         output["intrinsics"] = intrinsics  # (S, 3, 3)
@@ -1869,20 +2305,20 @@ class InsScene15KDataset(EasyDataset):
         elif self.root_vfm is not None:
             source_name = scene_info["source"]
             feat_scene_name = self._feat_scene_name(scene_info)
-            vfm_feat_path = os.path.join(
+            vfm_feat_path = aoss_fs.join(
                 self.root_vfm,
                 self.vfm_name,
                 source_name,
                 feat_scene_name,
                 self._feat_filename(),
             )
-            if os.path.exists(vfm_feat_path):
+            if aoss_fs.exists(vfm_feat_path):
                 # NOTE: cast to fp32 to match `_load_shuffled_feat` which does
                 # `.float()`. A dtype mismatch (fp16 vs fp32) between the two
                 # branches lets a probe trivially detect the dtype quantization
                 # signature instead of using content — see A3 ctrl dtype-leak
                 # finding in PROGRESS_REPORT.md.
-                vfm_feat = load_file(vfm_feat_path)["feat"].float()
+                vfm_feat = _feat_cast(aoss_fs.load_safetensors(vfm_feat_path)["feat"])
                 if self.vfm_name == "cogvideox":
                     # CogVideoX: (2, T_clip, H, W, C) → merge clips → (2*T_clip, H, W, C)
                     vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
@@ -1944,6 +2380,12 @@ class InsScene15KDataset(EasyDataset):
             output["streaming_tail"] = torch.tensor(
                 int(scene_info["streaming_tail"]), dtype=torch.long
             )
+            output["streaming_window_id"] = torch.tensor(
+                int(scene_info.get("streaming_window_id", -1)), dtype=torch.long
+            )
+            output["streaming_tail_raw"] = torch.tensor(
+                int(scene_info.get("streaming_tail_raw", scene_info["streaming_tail"])), dtype=torch.long
+            )
             output["prefix_indices"] = sel_global.cpu()
 
         # ------------------------------------------------------------ Spatial Diagnostic Suite
@@ -1962,6 +2404,9 @@ class InsScene15KDataset(EasyDataset):
                 compute_hidden_object_target,
                 compute_visible_object_target,
                 compute_object_target_for_id,
+                compute_strict_hidden_object_target_for_id,
+                select_strict_zero_hidden_object_id,
+                polar_from_world_centroid,
                 encode_relative_pose,
             )
 
@@ -1983,6 +2428,37 @@ class InsScene15KDataset(EasyDataset):
                     min_visible_pixels=self.hidden_obj_min_visible_pixels,
                     last_frame_idx=-1,
                 )
+            elif self.strict_zero_hidden_b2:
+                obj_id = scene_info.get("strict_object_id")
+                if obj_id is None:
+                    obj_id = select_strict_zero_hidden_object_id(
+                        identity_ids=raw_identity_ids,
+                        target_frame_idx=-1,
+                        min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    )
+                target = None if obj_id is None else compute_strict_hidden_object_target_for_id(
+                    obj_id=obj_id,
+                    identity_ids=raw_identity_ids,
+                    pmaps_world=pointmaps_metric,
+                    confmaps=confmaps,
+                    extrinsics=extrinsics_metric,
+                    min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    target_frame_idx=-1,
+                )
+                if target is not None and scene_info.get("strict_polar") is not None:
+                    # The builder creates one model-independent label at the
+                    # fixed target moment and copies it across all prefixes.
+                    target["polar"] = torch.as_tensor(
+                        scene_info["strict_polar"], dtype=torch.float32
+                    )
+                    if scene_info.get("strict_centroid_world") is not None:
+                        target["delta_world"] = torch.as_tensor(
+                            scene_info["strict_centroid_world"], dtype=torch.float32
+                        )
+                        last_visible = int(target["last_visible_frame"].item())
+                        target["no_update_polar"], _ = polar_from_world_centroid(
+                            target["delta_world"], extrinsics_metric[last_visible]
+                        )
             elif self._use_shared_streaming_hidden_obj():
                 obj_id = self._shared_streaming_hidden_obj_id(scene_info)
                 target = None if obj_id is None else compute_object_target_for_id(
@@ -2022,11 +2498,47 @@ class InsScene15KDataset(EasyDataset):
                 output["hidden_obj_id"] = torch.tensor(-1, dtype=torch.long)
                 output["belief_query_feat"] = torch.zeros(C, dtype=vfm_feat_cur.dtype)
                 output["belief_query_frame"] = torch.tensor(-1, dtype=torch.long)
+                output["target_raw_object_pixels"] = torch.tensor(-1, dtype=torch.long)
+                output["visible_history_frames"] = torch.tensor(0, dtype=torch.long)
+                output["last_visible_frame"] = torch.tensor(-1, dtype=torch.long)
+                output["last_visible_pixel_area"] = torch.tensor(0, dtype=torch.long)
+                output["no_update_polar"] = torch.zeros(3, dtype=torch.float32)
+                output["hidden_duration"] = torch.tensor(0, dtype=torch.long)
+                output["accumulated_camera_translation"] = torch.tensor(0.0)
+                output["accumulated_camera_rotation"] = torch.tensor(0.0)
+                sample_obj_id = int(scene_info.get("strict_object_id", -1))
             else:
                 output["hidden_obj_valid"] = target["valid"].cpu()
                 output["hidden_obj_polar"] = target["polar"].cpu()
                 per_frame_mask = target["per_frame_mask"].cpu()
                 output["hidden_obj_id"] = target["obj_id"].cpu()
+                sample_obj_id = int(target["obj_id"].item())
+                output["target_raw_object_pixels"] = target.get(
+                    "target_raw_pixels", torch.tensor(-1, dtype=torch.long)
+                ).cpu()
+                visible_history_indices = target.get("visible_history_indices")
+                output["visible_history_frames"] = torch.tensor(
+                    int(visible_history_indices.numel()) if visible_history_indices is not None else 0,
+                    dtype=torch.long,
+                )
+                output["last_visible_frame"] = target.get(
+                    "last_visible_frame", torch.tensor(-1, dtype=torch.long)
+                ).cpu()
+                output["last_visible_pixel_area"] = target.get(
+                    "last_visible_pixel_area", torch.tensor(0, dtype=torch.long)
+                ).cpu()
+                output["no_update_polar"] = target.get(
+                    "no_update_polar", torch.zeros(3, dtype=torch.float32)
+                ).cpu()
+                output["hidden_duration"] = target.get(
+                    "hidden_duration", torch.tensor(0, dtype=torch.long)
+                ).cpu()
+                output["accumulated_camera_translation"] = target.get(
+                    "accumulated_camera_translation", torch.tensor(0.0)
+                ).cpu()
+                output["accumulated_camera_rotation"] = target.get(
+                    "accumulated_camera_rotation", torch.tensor(0.0)
+                ).cpu()
 
                 # B2: build the object query token BEFORE any mask ablation.
                 # Hidden-object targets use the prefix frame with the most
@@ -2050,6 +2562,22 @@ class InsScene15KDataset(EasyDataset):
                 if self.no_obj_mask:
                     per_frame_mask = torch.ones_like(per_frame_mask)  # B1 ablation only
                 output["hidden_obj_mask"] = per_frame_mask
+            b2_sample_id = canonical_streaming_sample_id(
+                scene_info,
+                "b2_strict" if self.strict_zero_hidden_b2 else "b2_standard",
+                target_indices=[int(sel_global[-1].item())],
+                object_id=sample_obj_id,
+            )
+            output["sample_id"] = b2_sample_id
+            output["paired_sample_id"] = str(
+                scene_info.get("strict_pair_id")
+                or canonical_streaming_sample_id(
+                    scene_info,
+                    "b2_pair",
+                    target_indices=[int(sel_global[-1].item())],
+                    object_id=sample_obj_id,
+                )
+            )
         if self.diag_action:
             # C1 input is a causal video segment forward that ends before the
             # target frame. Target supervision remains an isolated exact-frame

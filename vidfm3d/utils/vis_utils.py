@@ -5,7 +5,6 @@ import matplotlib
 import numpy as np
 import torch
 import torchvision
-import trimesh
 from PIL import Image
 from scipy.spatial.transform import Rotation
 
@@ -78,6 +77,7 @@ def save_scene_glb(
 
     Nothing is returned.  Any existing file is silently overwritten.
     """
+    import trimesh
 
     # 1) flatten the tensors -------------------------------------------------
     pmaps = pmaps.detach().cpu()  # (S,3,H,W)
@@ -145,6 +145,7 @@ def _integrate_camera(scene, c2w, rgb, scale):
     Adds a small cone that roughly looks like a camera frustum.
     `c2w` is a 4×4 camera-to-world matrix.
     """
+    import trimesh
     cam_w = scale * 0.05
     cam_h = scale * 0.10
 
