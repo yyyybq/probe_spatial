@@ -18,7 +18,7 @@ Usage (Hydra):
       experiment=inscene15k_streaming/streaming_depth_dino_v1 \
       "+ckpt_path='/path/to/epoch=99-step=xxx.ckpt'" \
       prefix_len=24 vfm_name=dino video_channels=1024 \
-      streaming_feat_root=/mnt/umm/users/yinbaiqiao/InsScene-15K/FEAT_STREAMING_BY_PREFIX/dino_prefix_24 \
+      streaming_feat_root=${INSCENE15K_ROOT}/FEAT_STREAMING_BY_PREFIX/dino_prefix_24 \
       eval_split=val
 """
 

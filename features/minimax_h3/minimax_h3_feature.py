@@ -17,6 +17,7 @@ filename ``feature_t250_layer{L}.sft``.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -24,7 +25,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-DEFAULT_MODEL_PATH = "/mnt/umm/users/yinbaiqiao/Consistency/minimax-h3/models/MiniMax-H3"
+# Local path is deployment-specific: set MINIMAX_H3_MODEL_PATH or pass model_id
+# (the 2026 cluster used .../Consistency/minimax-h3/models/MiniMax-H3).
+DEFAULT_MODEL_PATH = os.environ.get("MINIMAX_H3_MODEL_PATH", "")
 DEFAULT_HEIGHT = 480
 DEFAULT_WIDTH = 832
 DEFAULT_NUM_FRAMES = 73  # 17 * 4 + 5
@@ -64,6 +67,8 @@ class MiniMaxH3Featurizer:
         local_files_only: bool = True,
         seed: int = 0,
     ) -> None:
+        if not model_id:
+            raise ValueError("MiniMax-H3 model path is not set: pass model_id or set MINIMAX_H3_MODEL_PATH")
         from diffusers import ComponentsManager, ModularPipeline
         from diffusers.modular_pipelines.minimax_h3.encoders import (
             MiniMaxH3TextEncoderStep,

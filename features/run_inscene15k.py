@@ -1057,13 +1057,13 @@ def main():
         "opensora":  {"model_id": None,                                "num_frames": 81, "size": (480, 720), "t": 1},
         "f3r":       {"model_id": None,                                "num_frames": 64, "size": (288, 512), "t": 0},
         "minimax_h3": {
-            "model_id": "/mnt/umm/users/yinbaiqiao/Consistency/minimax-h3/models/MiniMax-H3",
+            "model_id": os.environ.get("MINIMAX_H3_MODEL_PATH"),
             "num_frames": 73,
             "size": (480, 832),
             "t": 250,
         },
         "lingbot": {
-            "model_id": "/mnt/umm/users/yinbaiqiao/Consistency/lingbot-video/models/lingbot-video-moe-30b-a3b",
+            "model_id": os.environ.get("LINGBOT_MODEL_PATH"),
             "num_frames": 49,
             "size": (480, 832),
             "t": 250,
@@ -1072,6 +1072,9 @@ def main():
     defaults = VFM_DEFAULTS[args.vfm]
     if args.model_id is None:
         args.model_id = defaults["model_id"]
+    if args.model_id is None and args.vfm in {"minimax_h3", "lingbot"}:
+        env = "MINIMAX_H3_MODEL_PATH" if args.vfm == "minimax_h3" else "LINGBOT_MODEL_PATH"
+        raise SystemExit(f"--vfm {args.vfm} needs a local model path: pass --model-id or set {env}")
     if args.num_frames is None:
         args.num_frames = defaults["num_frames"]
     if args.t is None:

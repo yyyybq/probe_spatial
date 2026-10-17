@@ -22,10 +22,10 @@ import numpy as np
 import torch
 from PIL import Image
 
-DEFAULT_MODEL_PATH = (
-    "/mnt/umm/users/yinbaiqiao/Consistency/lingbot-video/models/lingbot-video-moe-30b-a3b"
-)
-DEFAULT_LINGBOT_ROOT = "/mnt/umm/users/yinbaiqiao/Consistency/lingbot-video"
+# Local paths are deployment-specific: set them in the environment or pass them
+# explicitly (the 2026 cluster used .../Consistency/lingbot-video).
+DEFAULT_MODEL_PATH = os.environ.get("LINGBOT_MODEL_PATH", "")
+DEFAULT_LINGBOT_ROOT = os.environ.get("LINGBOT_ROOT", "")
 DEFAULT_HEIGHT = 480
 DEFAULT_WIDTH = 832
 DEFAULT_NUM_FRAMES = 49  # must be 4n+1
@@ -75,6 +75,10 @@ class LingBotFeaturizer:
         seed: int = 0,
         enable_cpu_offload: bool = True,
     ) -> None:
+        if not model_id:
+            raise ValueError("LingBot model path is not set: pass model_id or set LINGBOT_MODEL_PATH")
+        if not lingbot_root:
+            raise ValueError("LingBot source root is not set: pass lingbot_root or set LINGBOT_ROOT")
         _ensure_lingbot_on_path(lingbot_root)
         from lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
 

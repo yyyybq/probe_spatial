@@ -51,7 +51,7 @@ def test_sco_gpu_gate_rejects_more_than_one_visible_gpu(monkeypatch):
 def test_worker_command_binds_frozen_runner_and_sco_contract(tmp_path):
     bundle = tmp_path / "bundle"
     metadata = {
-        "external_roots": {"repo_root": "/mnt/umm/users/yinbaiqiao/probe_spatial"},
+        "external_roots": {"repo_root": "/opt/probe_spatial"},
         "sco_execution_contract": {
             "execution_tag": "fixture_sco_h800",
             "job_name": "bq_fixture",
