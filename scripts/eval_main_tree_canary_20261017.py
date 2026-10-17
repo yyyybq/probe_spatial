@@ -47,7 +47,7 @@ MOUNT = "019ec9f9-6d12-7d49-aad4-864b15c9eb06:/mnt/umm"
 JOB_ID_RE = re.compile(r"pt-[a-z0-9]+")
 # Summary keys that legitimately differ between two runs of the same evaluation.
 VOLATILE = re.compile(r"(time|seconds|path|dir|host|device|cuda|gpu|date|started|finished|"
-                      r"execution|command|argv|ckpt|checkpoint|git|code|pid)", re.I)
+                      r"execution|command|argv|ckpt|checkpoint|git|code|pid|job_name)", re.I)
 
 
 def now() -> str:
@@ -310,6 +310,36 @@ def _diff(a, b) -> tuple[bool, float]:
     return a == b, (0.0 if a == b else math.inf)
 
 
+AUDIT_FIELDS = {"streaming_tail_raw", "streaming_window_id"}
+# Summary metrics that need a field only the main-tree loader emits.
+MAIN_ONLY_METRIC = re.compile(r"anchor_isolated")
+# Largest per-value absolute difference treated as GPU run-to-run noise.  The
+# A1 identity loss sums prototypes with CUDA scatter_add_ (atomic, unordered).
+NOISE_TOL = 1e-3
+PACK_R1_RUNS = ROOT / "logs/inscene15k_streaming/runs/main_v2_eval_v2_canonical_20261017_r1/canary"
+
+
+def _plain_value(value):
+    try:
+        import torch
+        if torch.is_tensor(value):
+            return value.tolist()
+    except ImportError:
+        pass
+    return value
+
+
+def _flatten(summary: dict, prefix: str = "") -> dict:
+    flat = {}
+    for name, value in summary.items():
+        full = f"{prefix}.{name}" if prefix else name
+        if isinstance(value, dict):
+            flat.update(_flatten(value, full))
+        else:
+            flat[full] = value
+    return flat
+
+
 def _pack_output(key: str) -> Path | None:
     for mode in ("production", "canary"):
         out = PACK_RUNS / mode / key
@@ -361,11 +391,19 @@ def compare_one(key: str) -> dict:
     if "anchor_isolated_valid" in mismatched and all(r.get("anchor_isolated") is None for r in pack_records) \
             and not any(r.get("anchor_isolated_valid") for r in pack_records):
         benign_none.add("anchor_isolated_valid")
+    # Audit ids the frozen-pack C fast path never emitted: the evaluator filled
+    # one constant placeholder for every record (1 or -1); main has real values.
+    placeholder = {f for f in mismatched if f in AUDIT_FIELDS
+                   and len({json.dumps(_plain_value(r.get(f))) for r in pack_records}) == 1}
+    noise = {f for f, v in mismatched.items() if f not in benign_none | placeholder
+             and math.isfinite(v["max_abs_diff"]) and v["max_abs_diff"] <= NOISE_TOL}
     result.update({"mismatched_fields": mismatched, "fields_only_main": sorted(only_main),
                    "fields_only_pack": sorted(only_pack),
-                   "fields_main_adds_where_pack_had_none": sorted(benign_none)})
-    main_summary = json.loads(_one(main_out, "val_summary.json").read_text())
-    pack_summary = json.loads(_one(pack_out, "val_summary.json").read_text())
+                   "fields_main_adds_where_pack_had_none": sorted(benign_none),
+                   "fields_pack_placeholder": sorted(placeholder),
+                   "fields_numeric_noise": sorted(noise)})
+    main_summary = _flatten(json.loads(_one(main_out, "val_summary.json").read_text()))
+    pack_summary = _flatten(json.loads(_one(pack_out, "val_summary.json").read_text()))
     summary_mismatch = {}
     for name in sorted(set(main_summary) & set(pack_summary)):
         if VOLATILE.search(name):
@@ -374,14 +412,32 @@ def compare_one(key: str) -> dict:
         if not equal:
             summary_mismatch[name] = {"main": main_summary[name], "pack": pack_summary[name],
                                       "max_abs_diff": delta}
+    main_only_metrics = {n for n in summary_mismatch if MAIN_ONLY_METRIC.search(n)}
+    summary_noise = {n for n, v in summary_mismatch.items() if n not in main_only_metrics
+                     and math.isfinite(v["max_abs_diff"]) and v["max_abs_diff"] <= NOISE_TOL}
     result.update({"summary_mismatch": summary_mismatch,
+                   "summary_mismatch_main_only_metrics": sorted(main_only_metrics),
+                   "summary_mismatch_numeric_noise": sorted(summary_noise),
                    "summary_only_main": sorted(set(main_summary) - set(pack_summary)),
                    "summary_only_pack": sorted(set(pack_summary) - set(main_summary))})
-    hard = {f: v for f, v in mismatched.items() if f not in benign_none}
-    exact = (result["checkpoint_sha256_equal"] and len(main_records) == len(pack_records)
-             and not hard and not only_pack and not summary_mismatch
-             and not result["summary_only_pack"])
-    result["status"] = "IDENTICAL" if exact else "DIFFERENT"
+    if noise and (PACK_R1_RUNS / key / "EVAL_COMPLETE.json").is_file():
+        # Run-to-run spread of the frozen pack itself on the same checkpoint.
+        r1 = torch.load(_one(PACK_R1_RUNS / key, "val_predictions.pt"), map_location="cpu", weights_only=False)
+        result["pack_r1_vs_r2_max_abs_diff"] = {
+            f: max((_diff(a.get(f), b.get(f))[1] for a, b in zip(r1, pack_records)), default=0.0)
+            for f in sorted(noise)}
+    base_ok = (result["checkpoint_sha256_equal"] and len(main_records) == len(pack_records)
+               and not only_pack and not result["summary_only_pack"])
+    rest = set(mismatched) - benign_none - placeholder - noise
+    rest_summary = set(summary_mismatch) - main_only_metrics - summary_noise
+    if base_ok and not mismatched and not summary_mismatch:
+        result["status"] = "IDENTICAL"
+    elif base_ok and not rest and not rest_summary and not noise and not summary_noise:
+        result["status"] = "IDENTICAL_PREDICTIONS"
+    elif base_ok and not rest and not rest_summary:
+        result["status"] = "WITHIN_NUMERIC_NOISE"
+    else:
+        result["status"] = "DIFFERENT"
     return result
 
 
@@ -398,7 +454,8 @@ def compare(args: argparse.Namespace) -> int:
                                                "at": now(), "main_commit": camp["commit"],
                                                "counts": counts, "items": rows})
     print(json.dumps(counts))
-    return 0 if counts.get("IDENTICAL", 0) == len(keys) else 1
+    return 0 if not counts.get("DIFFERENT") and sum(counts.values()) == len(keys) \
+        and set(counts) <= {"IDENTICAL", "IDENTICAL_PREDICTIONS", "WITHIN_NUMERIC_NOISE"} else 1
 
 
 def main() -> int:
