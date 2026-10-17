@@ -13,6 +13,8 @@ import json
 import logging
 import math
 import os
+import tempfile
+from collections import OrderedDict
 from glob import glob
 from pathlib import Path
 
@@ -30,6 +32,7 @@ from vidfm3d.utils.feature_layers import (
     default_feature_hw,
     feature_filename,
 )
+from vidfm3d.utils.aether_temporal import aether_streaming_token_indices
 from vidfm3d.utils.owner_catalog import (
     OwnerCatalogError,
     load_owner_catalog,
@@ -121,6 +124,11 @@ def camera_to_world_to_extrinsic(T: torch.Tensor) -> torch.Tensor:
 
 class InsScene15KDataset(EasyDataset):
     """Dataset for training identity mask probe on InsScene-15K data."""
+
+    # Defaults for objects built without __init__ (unit tests, tools); __init__
+    # sets both from PROBE_OWNER_OVERLAY_MANIFEST and INSCENE_LABEL_CACHE_ROOT.
+    owner_overlay_enabled = False
+    _label_cache_root = None
 
     def __init__(
         self,
@@ -233,6 +241,12 @@ class InsScene15KDataset(EasyDataset):
         self.feature_layer = feature_layer
         self.feature_timestep = feature_timestep
         self.feature_prefix = feature_prefix
+        self.owner_overlay_enabled = bool(os.environ.get("PROBE_OWNER_OVERLAY_MANIFEST"))
+        if self.owner_overlay_enabled:
+            # Verify manifest and both immutable DB hashes before any samples
+            # are exposed to a worker.
+            from vidfm3d.utils import probe_owner_overlay
+            probe_owner_overlay.load_manifest()
         self.feat_pixalign = feat_pixalign
         # Validation/test samples must not change between epochs. Training keeps
         # worker-seeded stochastic frame sampling unless a seed is explicit.
@@ -281,6 +295,14 @@ class InsScene15KDataset(EasyDataset):
         self._context_segment_meta_cache = {}
         self._target_index_cache = {}
         self._streaming_hidden_obj_cache = {}
+        self._scene_metadata_cache = OrderedDict()
+        self._scene_metadata_cache_max = max(
+            int(os.environ.get("INSCENE_METADATA_CACHE_MAX_SCENES", "32")), 1
+        )
+        self._label_cache_root = os.environ.get("INSCENE_LABEL_CACHE_ROOT")
+        self._label_cache_manifest_sha256 = os.environ.get("INSCENE_MANIFEST_SHA256")
+        self._label_cache_version = "tstep-label-v1"
+        self._probe_task = os.environ.get("INSCENE_PROBE_TASK", "")
         # Diagnostic suite flags
         self.diag_overlap = diag_overlap
         self.diag_hidden_obj = diag_hidden_obj
@@ -319,6 +341,11 @@ class InsScene15KDataset(EasyDataset):
             if allow_missing_vfm:
                 raise OwnerCatalogError(
                     "owner catalog forbids allow_missing_vfm dummy features"
+                )
+            if self.owner_overlay_enabled:
+                raise OwnerCatalogError(
+                    "INSCENE_OWNER_CATALOG and PROBE_OWNER_OVERLAY_MANIFEST are mutually "
+                    "exclusive owner sources; bind exactly one"
                 )
             self.owner_catalog = load_owner_catalog(owner_catalog)
         self.no_obj_mask = no_obj_mask
@@ -414,6 +441,7 @@ class InsScene15KDataset(EasyDataset):
         if (
             getattr(self, "streaming_prefix", False)
             and (self.streaming_feat_root or self.root_vfm)
+            and not self.owner_overlay_enabled
             and not (
                 loaded_from_scene_manifest
                 and manifest_records_are_expanded
@@ -803,7 +831,7 @@ class InsScene15KDataset(EasyDataset):
             # zero-padded, but using metadata order also gives direct pose rows.
             img_files = set(f for f in aoss_fs.listdir(img_dir) if f.endswith(".jpg"))
             mask_files = set(aoss_fs.listdir(mask_dir))
-            meta = aoss_fs.load_npy(meta_path)
+            meta = self._load_scene_metadata(meta_path)
             meta_images = [str(f) for f in meta["images"].tolist()]
             valid_frames = []
             valid_pose_indices = []
@@ -935,6 +963,92 @@ class InsScene15KDataset(EasyDataset):
             torch.stack(extrinsics),  # (S, 3, 4)
         )
 
+    def _load_scene_metadata(self, meta_path):
+        """Load immutable scene metadata through a bounded per-worker LRU."""
+        cached = self._scene_metadata_cache.get(meta_path)
+        if cached is not None:
+            self._scene_metadata_cache.move_to_end(meta_path)
+            return cached
+        archive = aoss_fs.load_npy(meta_path)
+        try:
+            # Detach arrays from NpzFile/BytesIO so no file handles remain cached.
+            value = {name: np.asarray(archive[name]) for name in archive.files}
+        finally:
+            close = getattr(archive, "close", None)
+            if close is not None:
+                close()
+        self._scene_metadata_cache[meta_path] = value
+        self._scene_metadata_cache.move_to_end(meta_path)
+        while len(self._scene_metadata_cache) > self._scene_metadata_cache_max:
+            self._scene_metadata_cache.popitem(last=False)
+        return value
+
+    def _label_cache_identity(self, scene_info, task, raw_frame_ids, task_config):
+        """Build a content identity; no path-similarity cache fallback is allowed."""
+        if not self._label_cache_root:
+            return None
+        if not self._label_cache_manifest_sha256:
+            raise RuntimeError(
+                "INSCENE_LABEL_CACHE_ROOT requires INSCENE_MANIFEST_SHA256"
+            )
+        identity = {
+            "label_version": self._label_cache_version,
+            "manifest_sha256": self._label_cache_manifest_sha256,
+            "manifest_sample_id": str(scene_info.get("sample_id", "")),
+            "source": scene_info["source"],
+            "scene_id": str(scene_info.get("scene_id", self._feat_scene_name(scene_info))),
+            "ordered_raw_frame_ids": [int(v) for v in raw_frame_ids],
+            "prefix": int(len(scene_info.get("streaming_indices", []))),
+            "task": task,
+            "task_config": task_config,
+        }
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return identity, os.path.join(
+            self._label_cache_root, self._label_cache_version, task, digest[:2], digest + ".npz"
+        )
+
+    def _load_label_cache(self, cache_identity, expected_fields):
+        if cache_identity is None:
+            return None
+        identity, path = cache_identity
+        if not os.path.isfile(path):
+            return None
+        with np.load(path, allow_pickle=False) as archive:
+            stored = json.loads(str(archive["identity_json"].item()))
+            if stored != identity:
+                raise RuntimeError(f"label cache identity mismatch: {path}")
+            missing = [field for field in expected_fields if field not in archive.files]
+            if missing:
+                raise RuntimeError(f"label cache lacks {missing}: {path}")
+            return {field: torch.from_numpy(archive[field].copy()) for field in expected_fields}
+
+    def _store_label_cache(self, cache_identity, values):
+        if cache_identity is None:
+            return
+        identity, path = cache_identity
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "identity_json": np.asarray(
+                json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            )
+        }
+        payload.update({key: value.detach().cpu().numpy() for key, value in values.items()})
+        fd, tmp = tempfile.mkstemp(prefix=".label-", suffix=".npz", dir=os.path.dirname(path))
+        os.close(fd)
+        try:
+            np.savez(tmp, **payload)
+            os.replace(tmp, path)
+        finally:
+            # On the shared sidecar filesystem, an attribute-cache lookup can
+            # briefly report the pre-rename temporary path as present after
+            # atomic replace.  Cleanup is best-effort; ENOENT means the atomic
+            # commit already consumed the temporary file.
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
     def _load_scannetpp_scene(self, scene_info, sel_indices):
         """Load frames from a scannetpp scene."""
         scene_dir = scene_info["scene_dir"]
@@ -944,7 +1058,7 @@ class InsScene15KDataset(EasyDataset):
         meta_path = aoss_fs.join(scene_dir, "scene_iphone_metadata.npz")
 
         valid_frames = scene_info["valid_frames"]
-        meta = aoss_fs.load_npy(meta_path)
+        meta = self._load_scene_metadata(meta_path)
         valid_pose_indices = scene_info.get("valid_pose_indices")
 
         images = []
@@ -1033,6 +1147,102 @@ class InsScene15KDataset(EasyDataset):
             raise ValueError(f"Unknown source: {scene_info['source']}")
         return torch.stack(masks)
 
+    def _load_images_scene(self, scene_info, sel_indices):
+        """Load RGB only; used by pixel probes without touching instance masks."""
+        images = []
+        if scene_info["source"] == "scannetpp":
+            img_dir = aoss_fs.join(scene_info["scene_dir"], "images")
+            frames = scene_info["valid_frames"]
+            for idx in sel_indices:
+                frame = frames[min(int(idx.item()), len(frames) - 1)]
+                image = np.array(aoss_fs.load_image(aoss_fs.join(img_dir, frame)).convert("RGB"))
+                images.append(torch.from_numpy(image).float().permute(2, 0, 1))
+        else:
+            # The current frozen campaign is ScanNet++; keep a correctness-first
+            # fallback for historical Infinigen configs.
+            images, _, _, _, _ = self._load_infinigen_scene(scene_info, sel_indices)
+            return images
+        return torch.stack(images)
+
+    def _load_depth_only_scene(self, scene_info, sel_indices):
+        """Load depth without camera metadata for the identity-only mask probe."""
+        depths = []
+        if scene_info["source"] == "scannetpp":
+            depth_dir = aoss_fs.join(scene_info["scene_dir"], "depth")
+            frames = scene_info["valid_frames"]
+            for idx in sel_indices:
+                frame = frames[min(int(idx.item()), len(frames) - 1)]
+                path = aoss_fs.join(depth_dir, f"{os.path.splitext(frame)[0]}.png")
+                if aoss_fs.exists(path):
+                    depth = np.array(aoss_fs.load_image(path)).astype(np.float32) / 1000.0
+                else:
+                    depth = np.zeros((self.target_h, self.target_w), dtype=np.float32)
+                depths.append(torch.from_numpy(depth))
+        else:
+            _, _, depth, _, _ = self._load_infinigen_scene(scene_info, sel_indices)
+            return depth
+        return torch.stack(depths)
+
+    def _getitem_streaming_pixel_probe(self, scene_info, sel_global):
+        """Depth/mask path with exactly the raw modalities used by each loss."""
+        task = self._probe_task
+        images = self._load_images_scene(scene_info, sel_global)
+        images = F.interpolate(
+            images, size=(self.target_h, self.target_w), mode="bilinear", align_corners=False
+        ) / 255.0
+
+        if task == "streaming_depth":
+            depthmaps, intrinsics, extrinsics = self._load_camera_depth_scene(
+                scene_info, sel_global
+            )
+            depthmaps, intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
+            depth_metric = depthmaps.clone()
+            extrinsics, _, _ = invert_pose_ref_and_scale(
+                extrinsics,
+                None,
+                depthmaps=depthmaps.unsqueeze(-1),
+                ref_idx=len(sel_global) - 1,
+                scale_by_points=False,
+            )
+            output = {
+                "image": images,
+                "intrinsics": intrinsics,
+                "extrinsics": extrinsics,
+                "cmaps": (depth_metric > 0).float().unsqueeze(1),
+                "dmaps": depth_metric.unsqueeze(1),
+            }
+        elif task == "streaming_mask":
+            masks = self._resize_masks_to_target(
+                self._load_identity_masks_scene(scene_info, sel_global)
+            )
+            depthmaps = self._load_depth_only_scene(scene_info, sel_global)
+            depthmaps = F.interpolate(
+                depthmaps.unsqueeze(1),
+                size=(self.target_h, self.target_w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+            output = {
+                "image": images,
+                "identity_ids": self._remap_identity_ids(masks),
+                "cmaps": (depthmaps > 0).float().unsqueeze(1),
+                # Retained for the unchanged validation/train visualization cadence.
+                "dmaps": depthmaps.unsqueeze(1),
+            }
+        else:
+            raise RuntimeError(f"unexpected pixel probe task: {task!r}")
+
+        vfm_feat, vfm_idx = self._load_streaming_prefix_feat(scene_info, sel_global)
+        output.update(
+            vfm_feat=vfm_feat,
+            vfm_idx=vfm_idx,
+            vfm_name=self.vfm_name,
+            manifest_sample_id=str(scene_info.get("sample_id", "")),
+            scene_path=scene_info["scene_dir"],
+            rng=int.from_bytes(self._rng.bytes(4), "big"),
+        )
+        return output
+
     def _load_camera_depth_scene(self, scene_info, sel_indices):
         """Load only depth, intrinsics, and extrinsics for feature-only probes."""
         depthmaps = []
@@ -1073,7 +1283,7 @@ class InsScene15KDataset(EasyDataset):
             depth_dir = aoss_fs.join(scene_dir, "depth")
             meta_path = aoss_fs.join(scene_dir, "scene_iphone_metadata.npz")
             valid_frames = scene_info["valid_frames"]
-            meta = aoss_fs.load_npy(meta_path)
+            meta = self._load_scene_metadata(meta_path)
             valid_pose_indices = scene_info.get("valid_pose_indices")
 
             for idx in sel_indices:
@@ -1121,6 +1331,13 @@ class InsScene15KDataset(EasyDataset):
         intrinsics[:, 1, 1] *= scale_h
         intrinsics[:, 1, 2] *= scale_h
         return depthmaps, intrinsics
+
+    def _resize_masks_to_target(self, masks):
+        return F.interpolate(
+            masks.unsqueeze(1).float(),
+            size=(self.target_h, self.target_w),
+            mode="nearest",
+        ).squeeze(1).long()
 
     def _resize_to_target(self, images, masks, depthmaps, intrinsics):
         """Resize images, masks, depth to target resolution and rescale intrinsics."""
@@ -1348,6 +1565,25 @@ class InsScene15KDataset(EasyDataset):
         )
 
     def _streaming_prefix_record(self, scene_info) -> dict | None:
+        if self.owner_overlay_enabled:
+            from vidfm3d.utils import probe_owner_overlay
+            row = probe_owner_overlay.resolve_streaming(
+                self.vfm_name,
+                scene_info["source"],
+                self._feat_scene_name(scene_info),
+                self._owner_feature_layer(),
+                self._owner_feature_timestep(),
+                int(scene_info.get("streaming_window_id", 0)),
+                len(scene_info["streaming_indices"]),
+            )
+            return {
+                "window_id": int(row["window_id"]),
+                "tail": int(row["prefix"]) - 1,
+                "indices": json.loads(row["raw_ids_json"]),
+                "input_length": int(row["input_length"]),
+                "valid_length": int(row["valid_length"]),
+                "pad_mode": row["pad_mode"],
+            }
         scene_dir = self._streaming_prefix_scene_dir(scene_info)
         if scene_dir is None:
             return None
@@ -1375,6 +1611,17 @@ class InsScene15KDataset(EasyDataset):
         return records.get((window_id, int(scene_info["streaming_tail"]))) or records.get(
             int(scene_info["streaming_tail"])
         )
+
+    def _owner_feature_layer(self) -> int:
+        layer = int(self.feature_layer if self.feature_layer is not None else 0)
+        return {("lingbot", 48): 47, ("minimax_h3", 50): 49}.get(
+            (self.vfm_name, layer), layer
+        )
+
+    def _owner_feature_timestep(self) -> int:
+        if self.feature_timestep is not None:
+            return int(self.feature_timestep)
+        return 250 if self.vfm_name in {"lingbot", "minimax_h3"} else 749
 
     def _context_segment_dir_name(self, start: int, tail: int) -> str:
         return self.context_segment_dir_fmt.format(start=int(start), tail=int(tail))
@@ -1513,19 +1760,40 @@ class InsScene15KDataset(EasyDataset):
             cached = self._streaming_hidden_obj_cache[key]
             return None if cached is None else int(cached)
 
+        required_len = max(max(lengths), seed_len)
+        label_identity = self._label_cache_identity(
+            scene_info,
+            "shared_hidden_object",
+            window_indices[:required_len],
+            {
+                "candidate_prefix_lengths": list(lengths),
+                "seed_prefix_len": seed_len,
+                "min_visible_pixels": self.hidden_obj_min_visible_pixels,
+                "min_history_visible_frames": self.streaming_hidden_min_history_visible_frames,
+                "min_query_pixels": self.streaming_hidden_min_query_pixels,
+                "min_border_px": self.streaming_hidden_min_border_px,
+                "strict_post_history": self.streaming_hidden_strict_post_history,
+                "preferred_visible_tail_indices": self._streaming_preferred_visible_tail_indices(),
+            },
+        )
+        cached_label = self._load_label_cache(
+            label_identity, ["object_id", "object_valid"]
+        )
+        if cached_label is not None:
+            obj_id = (
+                int(cached_label["object_id"].item())
+                if bool(cached_label["object_valid"].item()) else None
+            )
+            self._streaming_hidden_obj_cache[key] = obj_id
+            return obj_id
+
         from vidfm3d.utils.spatial_diag import select_common_history_hidden_object_id
 
-        required_len = max(max(lengths), seed_len)
         sel = torch.as_tensor(window_indices[:required_len], dtype=torch.long)
-        if scene_info["source"] == "infinigen":
-            _images, masks, depthmaps, intrinsics, _extrinsics = self._load_infinigen_scene(scene_info, sel)
-        elif scene_info["source"] == "scannetpp":
-            _images, masks, depthmaps, intrinsics, _extrinsics = self._load_scannetpp_scene(scene_info, sel)
-        else:
-            raise ValueError(f"Unknown source: {scene_info['source']}")
-        _images, masks, depthmaps, _intrinsics = self._resize_to_target(
-            _images, masks, depthmaps, intrinsics
-        )
+        masks = self._load_identity_masks_scene(scene_info, sel)
+        depthmaps, intrinsics, _extrinsics = self._load_camera_depth_scene(scene_info, sel)
+        masks = self._resize_masks_to_target(masks)
+        depthmaps, _intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
         confmaps = (depthmaps > 0).float()
         obj_id = select_common_history_hidden_object_id(
             masks,
@@ -1538,6 +1806,13 @@ class InsScene15KDataset(EasyDataset):
             min_query_pixels=self.streaming_hidden_min_query_pixels,
             min_border_px=self.streaming_hidden_min_border_px,
             strict_post_history=self.streaming_hidden_strict_post_history,
+        )
+        self._store_label_cache(
+            label_identity,
+            {
+                "object_id": torch.tensor(-1 if obj_id is None else int(obj_id), dtype=torch.long),
+                "object_valid": torch.tensor(obj_id is not None, dtype=torch.bool),
+            },
         )
         self._streaming_hidden_obj_cache[key] = obj_id
         return None if obj_id is None else int(obj_id)
@@ -1556,6 +1831,8 @@ class InsScene15KDataset(EasyDataset):
 
         Returns the feature for the exact target index, or None if missing.
         """
+        if self.owner_overlay_enabled:
+            return self._load_target_feats(scene_info, [target_global_idx], num_frames)[0]
         if self.target_feat_root is None:
             return None
         path = aoss_fs.join(self._target_feat_dir(scene_info), self._feat_filename())
@@ -1575,6 +1852,23 @@ class InsScene15KDataset(EasyDataset):
 
     def _load_target_feats(self, scene_info, target_global_indices, num_frames):
         """Load multiple isolated frame features with one safetensors read."""
+        if self.owner_overlay_enabled:
+            from vidfm3d.utils import probe_owner_overlay
+            rows = probe_owner_overlay.resolve_targets(
+                self.vfm_name,
+                scene_info["source"],
+                self._feat_scene_name(scene_info),
+                self._owner_feature_layer(),
+                self._owner_feature_timestep(),
+                [int(v) for v in target_global_indices],
+            )
+            by_uri = {}
+            for row in rows:
+                uri = row["source_uri"]
+                if uri not in by_uri:
+                    local = probe_owner_overlay.materialize_verified(row)
+                    by_uri[uri] = _feat_cast(load_file(local)[row["tensor_key"]])
+            return [by_uri[row["source_uri"]][int(row["source_row_index"])] for row in rows]
         if self.target_feat_root is None:
             return [None for _ in target_global_indices]
         path = aoss_fs.join(self._target_feat_dir(scene_info), self._feat_filename())
@@ -1653,16 +1947,32 @@ class InsScene15KDataset(EasyDataset):
     def _load_streaming_prefix_feat(self, scene_info, sel_global):
         """Load the precomputed VFM feature for one online prefix sample."""
         dummy_h, dummy_w = default_feature_hw(self.vfm_name)
-        vfm_feat_path = self._streaming_feature_uri(scene_info)
-        if not vfm_feat_path:
-            if self.owner_catalog is not None:
+        overlay_row = None
+        if self.owner_overlay_enabled:
+            from vidfm3d.utils import probe_owner_overlay
+            overlay_row = probe_owner_overlay.resolve_streaming(
+                self.vfm_name,
+                scene_info["source"],
+                self._feat_scene_name(scene_info),
+                self._owner_feature_layer(),
+                self._owner_feature_timestep(),
+                int(scene_info.get("streaming_window_id", 0)),
+                len(scene_info["streaming_indices"]),
+            )
+            vfm_feat_path = probe_owner_overlay.materialize_verified(overlay_row)
+            vfm_feat = _feat_cast(load_file(vfm_feat_path)["feat"])
+        else:
+            vfm_feat = None
+            vfm_feat_path = self._streaming_feature_uri(scene_info)
+            if not vfm_feat_path and self.owner_catalog is not None:
                 raise OwnerCatalogError("owner catalog returned an empty streaming URI")
+        if overlay_row is None and not vfm_feat_path:
             return (
                 torch.zeros(len(sel_global), dummy_h, dummy_w, default_feature_channels(self.vfm_name), dtype=torch.float32),
                 torch.arange(len(sel_global)),
             )
 
-        if not aoss_fs.exists(vfm_feat_path):
+        if overlay_row is None and not aoss_fs.exists(vfm_feat_path):
             msg = f"Streaming prefix VFM feature not found at {vfm_feat_path}"
             if self.owner_catalog is not None or not self.allow_missing_vfm:
                 raise FileNotFoundError(
@@ -1678,16 +1988,8 @@ class InsScene15KDataset(EasyDataset):
                 torch.arange(len(sel_global)),
             )
 
-        vfm_feat = _feat_cast(aoss_fs.load_safetensors(vfm_feat_path)["feat"])
-        if self.vfm_name == "cogvideox":
-            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
-        if vfm_feat.ndim != 4:
-            raise ValueError(
-                f"Expected streaming prefix VFM feature feat to be 4D (T,H,W,C), "
-                f"got {tuple(vfm_feat.shape)} from {vfm_feat_path}."
-            )
-
-        T = vfm_feat.shape[0]
+        if overlay_row is None:
+            vfm_feat = _feat_cast(aoss_fs.load_safetensors(vfm_feat_path)["feat"])
         prefix_len = len(sel_global)
         meta_record = self._streaming_prefix_record(scene_info)
         input_length = None
@@ -1698,17 +2000,46 @@ class InsScene15KDataset(EasyDataset):
             valid_length = int(meta_record.get("valid_length", prefix_len))
             pad_mode = meta_record.get("pad_mode")
 
-        if input_length is not None and input_length > 1 and T > 1:
+        positions = torch.arange(prefix_len, dtype=torch.float32)
+        if (
+            pad_mode == "repeat_tail"
+            and prefix_len > 0
+            and input_length is not None
+            and input_length > valid_length
+        ):
+            positions[-1] = float(input_length - 1)
+
+        aether_indices = None
+        if self.vfm_name == "aether":
+            if vfm_feat.ndim != 5:
+                raise ValueError(
+                    "Expected Aether streaming prefix feature feat to be 5D "
+                    f"(2,11,H,W,C), got {tuple(vfm_feat.shape)} from {vfm_feat_path}."
+                )
+            if input_length is None:
+                raise ValueError("Aether streaming prefix metadata lacks input_length.")
+            aether_indices = aether_streaming_token_indices(
+                positions,
+                n_chunks=int(vfm_feat.shape[0]),
+                n_feature_frames=int(vfm_feat.shape[1]),
+                input_length=input_length,
+            )
+            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+        elif self.vfm_name == "cogvideox":
+            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+        if vfm_feat.ndim != 4:
+            raise ValueError(
+                f"Expected streaming prefix VFM feature feat to be 4D (T,H,W,C), "
+                f"got {tuple(vfm_feat.shape)} from {vfm_feat_path}."
+            )
+
+        T = vfm_feat.shape[0]
+        if aether_indices is not None:
+            vfm_idx = aether_indices
+        elif input_length is not None and input_length > 1 and T > 1:
             # Prefix extraction pads short inputs by repeating the current tail
             # frame. Historical frames use their real positions in the padded
             # input; the tail can use its final repeated occurrence.
-            positions = torch.arange(prefix_len, dtype=torch.float32)
-            if (
-                pad_mode == "repeat_tail"
-                and prefix_len > 0
-                and input_length > valid_length
-            ):
-                positions[-1] = float(input_length - 1)
             vfm_idx = (
                 positions / float(input_length - 1) * float(T - 1)
             ).round().long().clamp(0, T - 1)
@@ -1857,19 +2188,88 @@ class InsScene15KDataset(EasyDataset):
             feats.append(target_prefix[-1])
         return feats
 
-    def _getitem_feature_action_diag(self, scene_info, num_frames, sel_global):
-        """Fast path for C1/C2/C3 probes that do not consume RGB, masks, or identity IDs."""
-        from vidfm3d.utils.spatial_diag import (
-            compute_overlap_ratio,
-            encode_relative_pose,
-        )
+    def _getitem_overlap_diag(self, scene_info, sel_global):
+        """A2 path: load only features and deterministic geometric supervision."""
+        from vidfm3d.utils.spatial_diag import compute_overlap_ratio
 
+        raw_ids = [int(v) for v in sel_global.tolist()]
+        identity = self._label_cache_identity(
+            scene_info,
+            "view_consistency",
+            raw_ids,
+            {
+                "target_hw": [self.target_h, self.target_w],
+                "scale_by_points": True,
+                "reference_index": len(raw_ids) - 1 if self.streaming_prefix else 0,
+            },
+        )
+        cached = self._load_label_cache(identity, ["overlap_gt"])
+        if cached is None:
+            depthmaps, intrinsics, extrinsics = self._load_camera_depth_scene(
+                scene_info, sel_global
+            )
+            depthmaps, intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
+            pointmaps = torch.stack([
+                depth_to_pointmap(depthmaps[i], intrinsics[i], extrinsics[i])
+                for i in range(depthmaps.shape[0])
+            ])
+            ref_idx = len(raw_ids) - 1 if self.streaming_prefix else 0
+            extrinsics, pointmaps, depthmaps_hw1 = invert_pose_ref_and_scale(
+                extrinsics,
+                pointmaps,
+                depthmaps=depthmaps.unsqueeze(-1),
+                ref_idx=ref_idx,
+                scale_by_points=True,
+            )
+            depthmaps = depthmaps_hw1.squeeze(-1)
+            overlap_gt = compute_overlap_ratio(
+                pointmaps, intrinsics, extrinsics, depthmaps > 0
+            ).cpu()
+            self._store_label_cache(identity, {"overlap_gt": overlap_gt})
+        else:
+            overlap_gt = cached["overlap_gt"]
+
+        if not self.streaming_prefix:
+            raise RuntimeError("optimized A2 path is enabled only for fixed streaming manifests")
+        vfm_feat, _ = self._load_streaming_prefix_feat(scene_info, sel_global)
+        return {
+            "vfm_feat": vfm_feat,
+            "overlap_gt": overlap_gt,
+            "manifest_sample_id": str(scene_info.get("sample_id", "")),
+            "sample_id": canonical_streaming_sample_id(scene_info, "a2"),
+        }
+
+    def _action_geometry(self, scene_info, sel_global, target_global):
+        """Reference-relative poses (and C3 anchor overlap) for one C-probe sample.
+
+        Optionally stored in the content-addressed label cache.  Every action
+        label and every evaluation pose field is derived from these tensors, so
+        a cache hit and a recomputation give identical values.
+        """
+        from vidfm3d.utils.spatial_diag import compute_overlap_ratio
+
+        K = int(target_global.numel())
+        need_overlap = bool(self.diag_counterfactual) and K > 0
+        fields = ["extrinsics"] + (["counterfactual_overlap"] if need_overlap else [])
+        cache_identity = self._label_cache_identity(
+            scene_info,
+            "c_probe_geometry",
+            [int(v) for v in sel_global.tolist()],
+            {
+                "target_hw": [self.target_h, self.target_w],
+                "scale_by_points": True,
+                "reference_index": 0,
+                "horizons": [int(v) for v in (target_global - sel_global[0]).tolist()],
+                "fields": fields,
+            },
+        )
+        geometry = self._load_label_cache(cache_identity, fields)
+        if geometry is not None:
+            return geometry
         depthmaps, intrinsics, extrinsics = self._load_camera_depth_scene(
             scene_info, sel_global
         )
         depthmaps, intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
-        confmaps = (depthmaps > 0).float()
-
         pointmaps = torch.stack([
             depth_to_pointmap(depthmaps[i], intrinsics[i], extrinsics[i])
             for i in range(depthmaps.shape[0])
@@ -1882,6 +2282,41 @@ class InsScene15KDataset(EasyDataset):
             scale_by_points=True,
         )
         depthmaps = depthmaps_hw1.squeeze(-1)
+        geometry = {"extrinsics": extrinsics.cpu()}
+        if need_overlap:
+            overlap_full = compute_overlap_ratio(
+                pointmaps_scaled, intrinsics, extrinsics, depthmaps > 0
+            )
+            geometry["counterfactual_overlap"] = overlap_full[0, 1:].cpu()
+        self._store_label_cache(cache_identity, geometry)
+        return geometry
+
+    def _load_anchor_isolated_feat(self, scene_info, anchor_global_idx, num_frames):
+        """Isolated (target-style) feature of the anchor frame, or None if absent.
+
+        Under the owner overlay a missing anchor owner is reported as absent;
+        every other overlay error (hash or size mismatch) still fails closed.
+        """
+        if self.owner_overlay_enabled:
+            from vidfm3d.utils import probe_owner_overlay
+            try:
+                probe_owner_overlay.resolve_targets(
+                    self.vfm_name,
+                    scene_info["source"],
+                    self._feat_scene_name(scene_info),
+                    self._owner_feature_layer(),
+                    self._owner_feature_timestep(),
+                    [int(anchor_global_idx)],
+                )
+            except probe_owner_overlay.OwnerOverlayError as exc:
+                if str(exc).startswith("no exact target owner"):
+                    return None
+                raise
+        return self._load_target_feats(scene_info, [anchor_global_idx], num_frames)[0]
+
+    def _getitem_feature_action_diag(self, scene_info, num_frames, sel_global):
+        """Fast path for C1/C2/C3 probes that do not consume RGB, masks, or identity IDs."""
+        from vidfm3d.utils.spatial_diag import encode_relative_pose
 
         target_global = sel_global[1:]
         K = int(target_global.numel())
@@ -1897,6 +2332,9 @@ class InsScene15KDataset(EasyDataset):
             if scene_info.get("paired_sample_id") is not None
             else canonical_streaming_sample_id(scene_info, f"{sample_task}_pair")
         )
+
+        geometry = self._action_geometry(scene_info, sel_global, target_global)
+        extrinsics = geometry["extrinsics"]
 
         if getattr(self, "streaming_prefix", False):
             prefix_global = torch.as_tensor(
@@ -1955,9 +2393,9 @@ class InsScene15KDataset(EasyDataset):
         # Same-domain persistence control.  This is intentionally loaded from
         # target_isolated, never sliced from the contextual prefix forward.
         anchor_global_idx = int(sel_global[0].item())
-        anchor_isolated_feat = self._load_target_feats(
-            scene_info, [anchor_global_idx], num_frames
-        )[0]
+        anchor_isolated_feat = self._load_anchor_isolated_feat(
+            scene_info, anchor_global_idx, num_frames
+        )
         anchor_isolated_valid = anchor_isolated_feat is not None
         if anchor_isolated_feat is None:
             anchor_isolated_feat = torch.zeros_like(input_feat[0])
@@ -2026,15 +2464,9 @@ class InsScene15KDataset(EasyDataset):
             counterfactual_actions = torch.zeros(0, 9, dtype=torch.float32)
             horizons = torch.zeros(0, dtype=torch.long)
 
-        overlap_anchor = torch.ones(K, dtype=torch.float32)
-        if self.diag_counterfactual and K > 0:
-            overlap_full = compute_overlap_ratio(
-                pointmaps_scaled,
-                intrinsics,
-                extrinsics,
-                depthmaps > 0,
-            )
-            overlap_anchor = overlap_full[0, 1:].cpu()
+        overlap_anchor = geometry.get("counterfactual_overlap")
+        if overlap_anchor is None:
+            overlap_anchor = torch.ones(K, dtype=torch.float32)
 
         counterfactual_valid = horizon_valid & (
             overlap_anchor >= float(self.counterfactual_min_overlap)
@@ -2205,6 +2637,21 @@ class InsScene15KDataset(EasyDataset):
                         target = target_candidates[nearest]
                         sel_global[-1] = target
 
+        if self.streaming_prefix and self._probe_task in {
+            "streaming_depth", "streaming_mask"
+        }:
+            return self._getitem_streaming_pixel_probe(scene_info, sel_global)
+
+        if self.diag_overlap and not (
+            self.diag_hidden_obj
+            or self.diag_visible_obj
+            or self.diag_abnormal
+            or self.diag_action
+            or self.diag_path_integration
+            or self.diag_counterfactual
+        ):
+            return self._getitem_overlap_diag(scene_info, sel_global)
+
         if (
             (self.diag_action or self.diag_path_integration or self.diag_counterfactual)
             and not (
@@ -2217,32 +2664,45 @@ class InsScene15KDataset(EasyDataset):
         ):
             return self._getitem_feature_action_diag(scene_info, num_frames, sel_global)
 
-        # Load data based on source
-        if scene_info["source"] == "infinigen":
-            images, masks, depthmaps, intrinsics, extrinsics = (
-                self._load_infinigen_scene(scene_info, sel_global)
-            )
-        elif scene_info["source"] == "scannetpp":
-            images, masks, depthmaps, intrinsics, extrinsics = (
-                self._load_scannetpp_scene(scene_info, sel_global)
-            )
-        else:
-            raise ValueError(f"Unknown source: {scene_info['source']}")
-
-        # Resize to target resolution (also rescales intrinsics)
-        images, masks, depthmaps, intrinsics = self._resize_to_target(
-            images, masks, depthmaps, intrinsics
+        lean_b = (self.diag_hidden_obj or self.diag_visible_obj) and not (
+            self.diag_overlap or self.diag_abnormal or self.diag_action
+            or self.diag_path_integration or self.diag_counterfactual
         )
+        if lean_b:
+            # B consumes masks + geometry + VFM features; RGB was only carried
+            # through IPC/GPU transfer and never read by ProbeExtensionLitModule.
+            images = None
+            masks = self._load_identity_masks_scene(scene_info, sel_global)
+            depthmaps, intrinsics, extrinsics = self._load_camera_depth_scene(
+                scene_info, sel_global
+            )
+            masks = self._resize_masks_to_target(masks)
+            depthmaps, intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
+        else:
+            # Load data based on source
+            if scene_info["source"] == "infinigen":
+                images, masks, depthmaps, intrinsics, extrinsics = (
+                    self._load_infinigen_scene(scene_info, sel_global)
+                )
+            elif scene_info["source"] == "scannetpp":
+                images, masks, depthmaps, intrinsics, extrinsics = (
+                    self._load_scannetpp_scene(scene_info, sel_global)
+                )
+            else:
+                raise ValueError(f"Unknown source: {scene_info['source']}")
 
-        # Normalize images
-        images = images / 255.0
+            # Resize to target resolution (also rescales intrinsics)
+            images, masks, depthmaps, intrinsics = self._resize_to_target(
+                images, masks, depthmaps, intrinsics
+            )
+            images = images / 255.0
 
         # Build confidence maps from depth validity (1 where depth > 0)
         confmaps = (depthmaps > 0).float()  # (S, H, W)
 
         # Compute world-coordinate point maps only when needed (v3 can disable this).
         if self.include_pmaps:
-            S, _, H, W = images.shape
+            S, H, W = depthmaps.shape
             pointmaps = []
             for i in range(S):
                 pts = depth_to_pointmap(depthmaps[i], intrinsics[i], extrinsics[i])
@@ -2286,13 +2746,14 @@ class InsScene15KDataset(EasyDataset):
         # Prepare output
         output = {}
         output["manifest_sample_id"] = str(scene_info.get("sample_id", ""))
-        output["image"] = images  # (S, 3, H, W)
-        output["identity_ids"] = masks  # (S, H, W) - integer identity IDs
-        output["intrinsics"] = intrinsics  # (S, 3, 3)
-        output["extrinsics"] = extrinsics  # (S, 3, 4)
-        output["cmaps"] = confmaps.unsqueeze(1)  # (S, 1, H, W)
-        output["dmaps"] = depthmaps.unsqueeze(1)  # (S, 1, H, W)
-        if self.include_pmaps and pointmaps_scaled is not None:
+        if images is not None:
+            output["image"] = images  # (S, 3, H, W)
+            output["identity_ids"] = masks  # (S, H, W) - integer identity IDs
+            output["intrinsics"] = intrinsics  # (S, 3, 3)
+            output["extrinsics"] = extrinsics  # (S, 3, 4)
+            output["cmaps"] = confmaps.unsqueeze(1)  # (S, 1, H, W)
+            output["dmaps"] = depthmaps.unsqueeze(1)  # (S, 1, H, W)
+        if not lean_b and self.include_pmaps and pointmaps_scaled is not None:
             output["pmaps"] = pointmaps_scaled.permute(0, 3, 1, 2)  # (S, 3, H, W)
 
         # VFM features
@@ -2717,4 +3178,18 @@ class InsScene15KDataset(EasyDataset):
                 shuf is not None, dtype=torch.bool
             )
 
+        if lean_b:
+            required = {"vfm_feat", "hidden_obj_valid", "hidden_obj_polar"}
+            if self._probe_task == "ego_belief_v2":
+                required.add("belief_query_feat")
+            else:
+                required.add("hidden_obj_mask")
+            audit_keys = {
+                "manifest_sample_id", "sample_id", "paired_sample_id",
+                "scene_path", "vfm_name", "rng",
+            }
+            return {
+                key: value for key, value in output.items()
+                if key in required | audit_keys
+            }
         return output

@@ -1,18 +1,7 @@
-import importlib.util
-from pathlib import Path
-
 import pytest
 import torch
 
-
-MODULE = (
-    Path(__file__).resolve().parents[1]
-    / "runtime/main_v2_probe_v2_aetherfix_r1/source/vidfm3d/utils/aether_temporal.py"
-)
-SPEC = importlib.util.spec_from_file_location("aether_temporal_fix", MODULE)
-AETHER_TEMPORAL = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(AETHER_TEMPORAL)
+from vidfm3d.utils import aether_temporal as AETHER_TEMPORAL
 
 
 def test_aether_interleaved_clip_mapping_and_repeat_tail():

@@ -321,9 +321,14 @@ def test_c2_fast_path_uses_context_segment_not_normal_or_isolated_anchor():
     ds = InsScene15KDataset.__new__(InsScene15KDataset)
     ds._rng = np.random.default_rng(0)
     ds.diag_counterfactual = False
+    ds.diag_action = False
+    ds.diag_path_integration = True
     ds.counterfactual_min_overlap = 0.05
     ds.vfm_name = "wan"
     ds.context_len = 4
+    ds.target_h = ds.target_w = 2
+    ds._label_cache_root = None
+    ds.owner_overlay_enabled = False
     ds._load_camera_depth_scene = lambda scene, sel: (
         torch.ones(2, 2, 2),
         torch.eye(3).repeat(2, 1, 1),

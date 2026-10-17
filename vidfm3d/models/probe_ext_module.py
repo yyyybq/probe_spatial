@@ -101,6 +101,40 @@ class ProbeExtensionLitModule(LightningModule):
         zero = self._zero_loss()
         return zero, {name: zero.detach() for name in names}
 
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        """Transfer only tensors consumed by the selected probe.
+
+        Dataset audit strings remain available on CPU and are deliberately not
+        copied into the training batch.  This hook runs before ``model_step`` and
+        therefore also prevents Lightning's default recursive all-tensor H2D.
+        """
+        required = {
+            "view_consistency": {"vfm_feat", "overlap_gt"},
+            "ego_belief": {
+                "vfm_feat", "hidden_obj_valid", "hidden_obj_mask", "hidden_obj_polar"
+            },
+            "ego_belief_v2": {
+                "vfm_feat", "hidden_obj_valid", "belief_query_feat", "hidden_obj_polar"
+            },
+            "action_dynamics": {"input_feat", "action", "target_feat", "dyn_valid"},
+            "path_integration": {
+                "input_feat_seq", "path_actions", "target_feat_seq", "path_horizon_valid"
+            },
+            "counterfactual": {
+                "input_feat_seq", "counterfactual_actions", "target_feat_seq",
+                "counterfactual_valid",
+            },
+        }.get(self.probe_type)
+        if required is None or not isinstance(batch, dict) or not required <= set(batch):
+            # Not a probe batch from the InsScene loader (tests, custom steps):
+            # move it unchanged; model_step reports any missing field itself.
+            filtered = batch
+        else:
+            filtered = {key: batch[key] for key in required}
+            if "scene_path" in batch:
+                filtered["scene_path"] = batch["scene_path"]
+        return super().transfer_batch_to_device(filtered, device, dataloader_idx)
+
     # ------------------------------------------------------------------ A2
     def _step_view_consistency(
         self, batch: Dict[str, torch.Tensor], train: bool
