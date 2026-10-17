@@ -7,6 +7,8 @@ env/
 venv/
 .venv/
 .env
+.env.*
+!.env.example
 
 # PyTorch
 *.pt
@@ -25,10 +27,21 @@ dist/
 # IDE / tooling
 .vscode/
 .claude/
-.editorconfig
 
 # temporary files
 vidfm3d/vggt/tmp**
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.test-*/
+.codex_remote_scripts/
+
+# Local execution copies and downloaded model caches (not release sources)
+/runtime/
+/model_cache/
+# Separate robotics workspace kept locally alongside this project
+/robocasa365/
 
 # Data
 vidfm3d/data/DL3DV
@@ -44,17 +57,37 @@ feature_dataset_bundle/
 
 # Certificates
 certificate.pem
+*.key
+petreloss.conf
 
 # Output
 logs/
 gradio_tmp_dir/
-temp**
-!vidfm3d/utils/temporal_sampling.py
+/temp/
+/tmp/
+*.tmp
 demo_outputs/
 comparison_*.csv
 layer_sweep_*.csv
 seed_summary.csv
+results/tmp/
+metadata/tmp/
+analyses/probe_validity/tmp/
+archive/artifacts/
 
 # Checkpoints
-**tar
-**ckpt
+*.tar
+*.ckpt
+
+# Data, sites and tools of the separate InteriorGS spatial-QA project; they live
+# in this directory locally but are not part of this repository (2026-10-17).
+/spatial_paired_*/
+/spatial_six_tasks_*/
+/sites/
+/paired_release_tools/
+/paired_v2_inventory/
+/analysis/interiorgs_v1_flow_audit/
+# Local git worktrees, ads-cli transfer records, cached analysis features
+/.worktrees/
+syncRecord.txt
+/features/independent_*/
