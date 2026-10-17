@@ -77,7 +77,21 @@
   canonical run 中有记录的 668 个 `aoss_metrics.jsonl`，查询错误事件为 0；另 24 个没有该文件。
   冻结包还把 AOSS 配置默认指向个人路径，主目录改为 `~/.petreloss.conf`，SCO 作业需显式设 `AOSS_CONF`。
 
-## 三、对发布与评估的含义
+## 三、本次已提交的内容（分支 `release-prep-20261017`，未 push）
+
+| commit | 内容 |
+|---|---|
+| `e4e4886` | 主目录训练、评估与测试源码，178 个文件（也是 10-16 timestep B2 重训的代码） |
+| `34a532e` | 记录已存在的删除：vendored Open-Sora、旧 V-JEPA 封装、`tmp_ddp_smoke.py` |
+| `d44e62b` | 文档、状态页、发布清单 |
+| `941675e` | `.gitignore`：排除 InteriorGS 项目目录、本地 worktree、缓存特征等，不移动任何文件 |
+| `994a8e6` | 个人模型路径改为环境变量；冻结协议里记录的路径保留 |
+
+评估包也记为 tag（详见 [评估方案](EVALUATION_PLAN_20261017.md)）：r1 `code/main_v2_eval_v2_from_*`
+（`2495bc5`、`6ab0c5c`、`c84da76`），r2 `code/main_v2_eval_v2r2_from_*`（`2d818ac`、`2379275`）。
+记录脚本：`scripts/record_runtime_pack_commits_20261017.sh`。
+
+## 四、对发布与评估的含义
 
 1. **评估**：在每个训练包上评估它自己训练的 checkpoint，只把 `eval_diag.py` 与 `eval_a1_streaming.py`
    换成主目录的 v2 版本，做法同冻结包运行器（按 sha 绑定、先 canary）。这样样本选择与训练一致，

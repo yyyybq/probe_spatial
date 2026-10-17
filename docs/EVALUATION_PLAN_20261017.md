@@ -1,0 +1,107 @@
+# 正式评估：为什么还没有可发布结果，以及补齐方案 — 2026-10-17
+
+配套文档：[代码版本对齐](CODE_ALIGNMENT_20261017.md)。所有 commit 与 tag 只在本地，未 push。
+
+## 结论
+
+- **canonical V2 的 checkpoint 从来没有做过正式评估。** 训练结束后每个 run 目录里只有 checkpoint、
+  训练日志与收据，没有评估输出。清单里的 “validation” 指训练前的输入 canary，不是对训练好的探针打分。
+  所以 865 个训练完成、692 个身份核验通过，可发布结果仍是 0。
+- **timestep 只评估过 A1、A2、B2 三类，而且评估代码与训练代码不是同一版本。** 2026-09-23 的评估战役
+  `tstep_eval_a1a2b2_20260923_r1` 用当时主目录的 v1 评估器，训练用的是冻结包 `tstep_probe_opt_v3`，
+  因此那 136 行只算“匹配但未验收”。B1、C1、C2、mask 没有评估，C3 是旧协议。
+- **另一个原因是 v1 评估器会给发散的模型打出看似正常的分数**（NaN logits 变成类别 0），必须换成 v2。
+- **正式评估本身不贵。** canary 实测每个 checkpoint 2.5–4.4 分钟；676 个约 40–50 GPU·h。
+- **现状（2026-10-17）**：评估方法经两轮 canary 验证，676 个已核验 canonical run 的正式评估已全部提交。
+
+## 做法
+
+1. **评估用训练时的代码。** 主目录的数据加载路径与训练时不同（见对齐文档），所以评估在训练冻结包的
+   副本上运行，只替换 3 个文件为 v2：`vidfm3d/eval_diag.py`、`vidfm3d/eval_a1_streaming.py`、
+   `vidfm3d/utils/loss.py`（来自 commit `994a8e6`）。这样的评估包有 3 个，均已冻结并记为 tag：
+
+| 评估包 | 基于训练包 | commit |
+|---|---|---|
+| `main_v2_eval_v2_from_main_v2_probe_v2_r7_single_v3` | `code/main_v2_probe_v2_r7_single_v3` | `2495bc5` |
+| `main_v2_eval_v2_from_main_v2_probe_v2_aetherfix_r1` | `code/main_v2_probe_v2_aetherfix_r1` | `6ab0c5c` |
+| `main_v2_eval_v2_from_main_v2_probe_minimax_bf16_v2` | `code/main_v2_probe_minimax_bf16_v2` | `c84da76` |
+
+2. **评估项从训练项派生。** 每个评估项复制训练项的实验配置、科学参数与执行 manifest，按训练运行器
+   重建环境（owner overlay、fp16 直通设置），绑定 checkpoint 路径与大小；运行器在 GPU 节点上先逐项核对
+   哈希，再计算 checkpoint 的 SHA-256 写进结果。
+3. **划分与指标沿用 2026-09 的正式评估口径**：`eval_split=val`，不用训练时的 W&B 日志。
+
+| 探针 | 评估器 | 主指标 |
+|---|---|---|
+| A1 depth | `eval_a1_streaming` | `mean_loss_depth`（另记 `mean_Auc_30`） |
+| A1 mask | `eval_a1_streaming` | `mean_loss_identity` |
+| A2 view consistency | `eval_diag` | `balanced_acc` |
+| B2 ego belief v2 | `eval_diag` | `mean_ang_err_deg` |
+| C1 action dynamics | `eval_diag` | `global_R@1`（另记无动作、打乱动作、末帧对照） |
+| C2 path integration | `eval_diag` | `global_R@1` |
+
+4. **验收**（`scripts/export_eval_v2_canonical_20261017.py`）：v2 评估器版本、主指标有限、非有限预测为 0、
+   至少有一条被评分的记录、summary 哈希与收据一致。不满足的行标为 REJECTED 并写明原因。
+
+## 覆盖范围
+
+- 已为 692 个已核验 canonical run 中的 **676 个** 生成评估项（656 个 r7 包，20 个 Aether 包）。
+- 未覆盖：16 个 MiniMax L30 A/B16 run，它们的训练设置存在 `case.json` 而不是训练项里，需要单独适配；
+  132 个 MiniMax 全层战役 run 尚未通过身份核验，不在本轮；16 个 canonical B2 重训完成后再加入。
+
+## 进度（2026-10-17）
+
+**r1 canary**（V-JEPA2 L11 p12 的 6 个探针 + Aether L1 p12 A2，7 个单卡作业，本次实际执行）
+
+- 第 1 次 7 个全部在启动时失败：checkpoint 文件名里的 `=` 没有加引号，Hydra 无法解析参数。
+  修复后先用 Hydra 只组合配置的模式核对了 7 个评估项，再提交第 2 次。
+- 第 2 次 6 个通过、C2 失败：
+
+| run | 主指标 | 值 | 评分/载入 | 用时 |
+|---|---|---:|---:|---:|
+| V-JEPA2 A1 depth | `mean_loss_depth` | 0.313（`mean_Auc_30` 0.081） | 276/276 | 3.0 min |
+| V-JEPA2 A1 mask | `mean_loss_identity` | 2.92 | 276/276 | 2.8 min |
+| V-JEPA2 A2 | `balanced_acc` | 0.921 | 276/276 | 2.6 min |
+| V-JEPA2 B2 | `mean_ang_err_deg` | 37.6（95% 区间 32.7–42.9） | 171/276 | 3.5 min |
+| V-JEPA2 C1 | `global_R@1` | 0.0157（无动作 0.0048，打乱动作 0.0109） | 828/828 | 2.5 min |
+| Aether A2 | `balanced_acc` | 0.684 | 276/276 | 4.4 min |
+
+  所有行非有限预测为 0，checkpoint 的 SHA-256 已记录。B2 的 171/276 与 2026-09 timestep 评估的有效比例一致
+  （无可见目标的样本不计分）。
+
+**C2 失败原因与 r2 修复**
+
+- 训练包的 C 探针快速取样路径 `_getitem_feature_action_diag` 只产出训练要用的字段；v2 评估器算 C2 还需要
+  相机位姿和时间间隔（`target_extrinsics`、`start_extrinsic`、`action_horizons`），用于终点位姿误差、漂移率和
+  分时间步误差。主目录后来给这个路径补上了这些字段，但主目录又缺 owner overlay，不能直接用。
+- r2 评估包只在数据加载器里改两处：总是重新计算几何量（即标签缓存未命中时执行的同一段代码），并按主目录的
+  算法补上这三个字段。训练输入由未改动的代码产生。MiniMax 包的这个函数与另两个不同，本轮不涉及。
+
+| r2 评估包 | 基于 | commit |
+|---|---|---|
+| `main_v2_eval_v2r2_from_main_v2_probe_v2_r7_single_v3` | `code/main_v2_probe_v2_r7_single_v3` | `2d818ac` |
+| `main_v2_eval_v2r2_from_main_v2_probe_v2_aetherfix_r1` | `code/main_v2_probe_v2_aetherfix_r1` | `2379275` |
+
+**r2 canary**（4 个作业，全部通过，本次实际执行）
+
+- V-JEPA2 C2：`global_R@1` 0.0242，终点位姿误差 0.121；Aether C2：`global_R@1` 0.0024。
+- V-JEPA2 C1 与 A2 在 r2 上的主指标和全部次指标与 r1 逐位相同，说明补丁不影响这两条路径、评估可复现。
+
+**正式评估**：r2 上 676 个评估项，每作业 4 个，共 169 个单卡作业，已提交（见 `submissions.json`）。
+
+## 复现命令（服务器 `/mnt/umm/users/yinbaiqiao/probe_spatial`）
+
+```bash
+/mnt/umm/users/yinbaiqiao/.conda/envs/probe-spatial/bin/python scripts/build_eval_v2_packs_20261017.py --revision r2 --check
+python3 scripts/build_eval_v2_canonical_items_20261017.py --revision r2 --all-verified
+/mnt/umm/users/yinbaiqiao/.conda/envs/probe-spatial/bin/python scripts/submit_eval_v2_canonical_20261017.py --revision r2 --mode production
+python3 scripts/export_eval_v2_canonical_20261017.py --revision r2 --mode production
+```
+
+结果表：`results/canonical_v2_eval_v2/r2/production_metrics.csv`。
+
+## 待你决定
+
+1. **timestep**：(a) 用同样方法为 `tstep_probe_opt_v3` 与 `tstep_probe_pack_v4_1` 建评估包并重新评估
+   （推荐；这两个包只有快照身份，需在结果里注明）；(b) 等 MiniMax 重训完成后一起评估。
+   2026-09-07 的 88 个 run 没有可恢复的训练代码，建议不进入发布结果或重训。
