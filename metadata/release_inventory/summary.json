@@ -1,0 +1,166 @@
+{
+  "generated_at": "2026-10-16T05:59:48.589074+00:00",
+  "scope_note": "Local evidence inventory, not a live scheduler query. Do not sum run, package, or scope entries.",
+  "ready_definition": "YES_WITH_SCOPE is a scientific result candidate within its declared split/protocol, not completed code packaging or publication.",
+  "correctness_definition": "VERIFIED applies only to each row's declared scope. Canonical V2 verifies training identity and input protocol gates, not final metrics; consult correctness_scope and evaluation_acceptance_status.",
+  "inputs": {
+    "canonical_v2": {
+      "file": "canonical_v2.csv",
+      "sha256": "6aa9b916fb42d6dcbace70c2a9ed53be2b03badc97ca191770b4e7654d672170"
+    },
+    "timestep": {
+      "file": "timestep.csv",
+      "sha256": "9a860f382e06680803427acc7ae5892fbe79e7c5cc78fbea8959ff366f4b35a6"
+    },
+    "analyses": {
+      "file": "analyses.csv",
+      "sha256": "6050cb5aaece026e8b90f9262d960793d6cd3167226be95c205f0cc5f12cd96d"
+    }
+  },
+  "groups": {
+    "canonical_v2": {
+      "run": {
+        "entries": 868,
+        "training_status": {
+          "COMPLETE": 865,
+          "INCOMPLETE": 3
+        },
+        "correctness_status": {
+          "DEGENERATE": 16,
+          "NOT_VERIFIED": 160,
+          "VERIFIED": 692
+        },
+        "result_status": {
+          "INVALID_NONFINITE_WEIGHTS": 16,
+          "NON_CANONICAL_PROBE_RAW_TRAINING_ARTIFACTS": 36,
+          "RAW_TRAINING_ARTIFACTS_NOT_METRIC_AUDITED": 815,
+          "TRAINING_IN_PROGRESS": 1
+        },
+        "ready_for_release": {
+          "NO": 868
+        },
+        "training_complete_and_scope_verified": 692
+      },
+      "scope": {
+        "entries": 1,
+        "training_status": {
+          "UNKNOWN": 1
+        },
+        "correctness_status": {
+          "NOT_VERIFIED": 1
+        },
+        "result_status": {
+          "FEATURE_RECOVERY_ONLY_NO_FORMAL_PROBE_RESULT_ESTABLISHED": 1
+        },
+        "ready_for_release": {
+          "NO": 1
+        },
+        "training_complete_and_scope_verified": 0
+      }
+    },
+    "timestep": {
+      "run": {
+        "entries": 576,
+        "training_status": {
+          "COMPLETE": 576
+        },
+        "correctness_status": {
+          "DEGENERATE": 160,
+          "NOT_VERIFIED": 416
+        },
+        "result_status": {
+          "INVALID_FEATURE_CACHE_OVERFLOW": 33,
+          "INVALID_NONFINITE_WEIGHTS": 127,
+          "LEGACY_TRAINED_C3_NO_CURRENT_PROTOCOL_RESULT": 56,
+          "OFFICIAL_EVAL_MATCHED_NOT_ACCEPTED": 136,
+          "TRAINING_LOG_ONLY": 224
+        },
+        "ready_for_release": {
+          "NO": 576
+        },
+        "training_complete_and_scope_verified": 0
+      },
+      "scope": {
+        "entries": 1,
+        "training_status": {
+          "COMPLETE": 1
+        },
+        "correctness_status": {
+          "PROTOCOL_INVALID": 1
+        },
+        "result_status": {
+          "EXCLUDED_INVALID_PROTOCOL": 1
+        },
+        "ready_for_release": {
+          "NO": 1
+        },
+        "training_complete_and_scope_verified": 0
+      }
+    },
+    "analyses": {
+      "package": {
+        "entries": 7,
+        "training_status": {
+          "NOT_APPLICABLE": 7
+        },
+        "correctness_status": {
+          "NOT_VERIFIED": 1,
+          "VERIFIED": 6
+        },
+        "result_status": {
+          "COMPLETE_SCOPED_RESULT": 6,
+          "UNIFIED_EXPORT_MISSING_VJEPA2_D2": 1
+        },
+        "ready_for_release": {
+          "NO": 1,
+          "YES_WITH_SCOPE": 6
+        },
+        "training_complete_and_scope_verified": 0
+      },
+      "run": {
+        "entries": 617,
+        "training_status": {
+          "COMPLETE": 555,
+          "NOT_APPLICABLE": 62
+        },
+        "correctness_status": {
+          "NOT_VERIFIED": 64,
+          "VERIFIED": 553
+        },
+        "result_status": {
+          "BLOCKED_CHECKPOINT_AND_V1_INPUTS": 8,
+          "BLOCKED_CHECKPOINT_UNAVAILABLE": 3,
+          "BLOCKED_V1_INPUTS": 32,
+          "COMPLETE_DEV_AGGREGATE": 33,
+          "COMPLETE_SCOPED_RESULT": 537,
+          "NO_CONFLICT_EXISTING_RESULT": 1,
+          "RAW_DEV_EVAL_COMPLETE_AGGREGATE_MISSING": 3
+        },
+        "ready_for_release": {
+          "NO": 47,
+          "UNKNOWN": 20,
+          "YES_WITH_SCOPE": 550
+        },
+        "training_complete_and_scope_verified": 535
+      },
+      "scope": {
+        "entries": 6,
+        "training_status": {
+          "INCOMPLETE": 6
+        },
+        "correctness_status": {
+          "NOT_VERIFIED": 6
+        },
+        "result_status": {
+          "BLOCKED_PREREQUISITES": 1,
+          "MATCHED_CANARY_AND_MVP_UNESTABLISHED": 4,
+          "ONE_STATE_FORWARD_ONLY": 1
+        },
+        "ready_for_release": {
+          "NO": 6
+        },
+        "training_complete_and_scope_verified": 0
+      }
+    }
+  }
+}

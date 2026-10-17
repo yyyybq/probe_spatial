@@ -1,0 +1,10 @@
+probe_config,probe_family,atomic_probe,training_unit,evaluation_unit,primary_metric,secondary_metrics,horizon_expansion,notes
+streaming_depth,A1,A1-depth,task_config,summary_metric,mean_loss_depth,"Auc_30,Rac_15,Tac_15,mean_loss_camera",none,streaming_depth emits depth and camera atomic outputs
+streaming_depth,A1,A1-camera,task_config,summary_metric,Auc_30,"Auc_30,Rac_15,Tac_15,mean_loss_camera",none,streaming_depth emits depth and camera atomic outputs
+streaming_camera,A1,A1-camera,task_config,summary_metric,Auc_30,"mean_loss_camera,Rac_15,Tac_15",none,
+streaming_mask,A1,A1-mask,task_config,summary_metric,mean_loss_identity,,none,
+view_consistency,A2,A2,task_config,summary_metric,balanced_acc,"roc_auc,mean_overlap_mae,hard_acc",none,
+ego_belief_v2,B2,B2,task_config,summary_metric,mean_ang_err_deg,"mean_az_err_deg,mean_el_err_deg,top1,top3,mean_log_dist_err",none,
+action_dynamics,C1,C1,task_config,summary_metric,global_R@1,"global_R@5,no_action_global_R@1,shuffled_action_global_R@1,last_observation_global_R@1,action_gain_cos",none,
+path_integration,C2,C2,task_config,summary_metric,global_R@1,"global_R@5,final_pose_error,drift_rate,loop_closure_error,pose_error_h1,pose_error_h2,pose_error_h4",pose_error_h* rows,
+counterfactual,C3,C3,task_config,summary_metric,intervention_validity,"intervention_margin,counterfactual_consistency,global_R@1,cf_cos_h1,cf_cos_h2,cf_cos_h4",cf_cos_h* rows,
