@@ -9,15 +9,10 @@ TEST_ROOT = Path(__file__).resolve().parent
 # These modules import frozen runtime copies or assert against completed runs.
 # Exclude them before import: marker deselection alone cannot prevent missing
 # local artifacts from breaking collection on a fresh checkout.
-ARTIFACT_MODULES = {
-    "test_aether_streaming_temporal_mapping.py",
-    "test_cog_upload_backpressure_v1.py",
-    "test_f3r_recovery_logging.py",
-    "test_upload_recovery_20260923.py",
-    "test_wan_p12_l20_c1_b2_study.py",
-    "windowfix_v2/test_canonical_gap_lifecycle_smoke.py",
-    "windowfix_v2/test_target_accounting_report.py",
-}
+# Release tests need no local campaign artifacts (2026-10-18). Internal
+# campaign tests are not tracked in git; list a module here only if a
+# tracked test cannot be imported on a clean checkout.
+ARTIFACT_MODULES: set[str] = set()
 
 
 def pytest_addoption(parser):

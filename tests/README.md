@@ -34,3 +34,16 @@ zero loss or bin 0, A2 summaries must use the module's overlap thresholds, and
 the cache-name registry must produce `feature_t250_layer{L}.sft` for
 MiniMax-H3/LingBot. Run it alone with
 `python -m pytest -q tests/test_nonfinite_handling.py`.
+
+## Release tests and internal tests (2026-10-18)
+
+The repository tracks only release tests: tests of the training, data, model and
+evaluation code (`vidfm3d/`), the feature-extraction contracts (`features/`), the
+timestep manifest protocol and the D-series code. They run on a clean checkout with
+`python -m pytest -q`, without campaign artifacts or extra `PYTHONPATH` entries.
+
+Tests of cluster submission, upload and recovery, extraction campaigns (windowfix,
+timestep, Wan target), the 816 overlay audit and the unreleased analyses (SE3,
+active representation, probe validity) are internal. They are not tracked; they stay
+next to the internal tools they test in the working checkout, and are listed in
+`.gitignore`. Earlier commits of the 2026-10 history still contain them.
