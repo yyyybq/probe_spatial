@@ -145,3 +145,4 @@ syncRecord.txt
 /tests/windowfix_v2/test_target_route_audit_worker.py
 /tests/windowfix_v2/test_target_row_merge.py
 /tests/test_probe_validity_b2_order.py
+/tests/internal_artifact_modules.txt

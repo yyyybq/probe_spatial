@@ -10,9 +10,17 @@ TEST_ROOT = Path(__file__).resolve().parent
 # Exclude them before import: marker deselection alone cannot prevent missing
 # local artifacts from breaking collection on a fresh checkout.
 # Release tests need no local campaign artifacts (2026-10-18). Internal
-# campaign tests are not tracked in git; list a module here only if a
-# tracked test cannot be imported on a clean checkout.
+# campaign tests are not tracked in git; an internal checkout lists the ones
+# that need its local artifacts in the untracked file below (one path per line,
+# relative to tests/). List a module here only if a tracked test cannot be
+# imported on a clean checkout.
 ARTIFACT_MODULES: set[str] = set()
+_INTERNAL_LIST = TEST_ROOT / "internal_artifact_modules.txt"
+if _INTERNAL_LIST.is_file():
+    ARTIFACT_MODULES |= {
+        line.strip() for line in _INTERNAL_LIST.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    }
 
 
 def pytest_addoption(parser):
