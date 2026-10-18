@@ -93,6 +93,8 @@
 2026-10-18 增加 timestep 评估包 tag：`code/tstep_eval_v2_from_tstep_probe_opt_v3`（`8fbf9e1`）、
 `code/tstep_eval_v2_from_tstep_probe_pack_v4_1`（`a9cb990`）、`code/tstep_eval_v2_from_main_e4e4886`（`6294d04`），
 见 [timestep 正式评估](TSTEP_EVALUATION_20261018.md)。
+同日增加 MiniMax 评估包 `code/main_v2_eval_v2r2_from_main_v2_probe_minimax_bf16_v2`（`b3df00a`），
+用于 r4 补评，见 [正式评估](EVALUATION_PLAN_20261017.md)。
 
 ## 四、对发布与评估的含义
 

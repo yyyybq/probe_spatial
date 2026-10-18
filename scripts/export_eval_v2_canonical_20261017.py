@@ -56,7 +56,7 @@ def finite(value) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=("canary", "production"), required=True)
-    parser.add_argument("--revision", choices=("r1", "r2", "r3", "t1"), default="r1")
+    parser.add_argument("--revision", choices=("r1", "r2", "r3", "r4", "t1"), default="r1")
     args = parser.parse_args()
     global RUN_ID, RUNS, PLAN, OUT
     if args.revision.startswith("t"):

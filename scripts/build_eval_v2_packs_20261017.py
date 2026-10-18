@@ -70,6 +70,11 @@ REVISIONS = {
     "r2": {"prefix": "main_v2_eval_v2r2_from_",
            "bases": ["main_v2_probe_v2_r7_single_v3", "main_v2_probe_v2_aetherfix_r1"],
            "patches": {DATASET: R2_PATCHES}},
+    # 2026-10-18: the MiniMax bf16 pack's C-probe fast path has the same anchors;
+    # same r2 patch so C2 gets its evaluation-only pose fields.
+    "r2m": {"prefix": "main_v2_eval_v2r2_from_",
+            "bases": ["main_v2_probe_minimax_bf16_v2"],
+            "patches": {DATASET: R2_PATCHES}},
     # Timestep training packs have no source.sha256; their identity is the
     # snapshot recorded as git tag code/<pack> on 2026-10-17.  The base file set
     # is that tag's tree, and every file must still equal runtime/<pack>/source.

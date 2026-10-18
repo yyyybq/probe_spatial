@@ -67,7 +67,7 @@ def main() -> int:
     parser.add_argument("--per-job", type=int, default=4)
     parser.add_argument("--limit-jobs", type=int, default=0)
     parser.add_argument("--submit", action="store_true")
-    parser.add_argument("--revision", choices=("r1", "r2", "r3", "t1"), default="r1",
+    parser.add_argument("--revision", choices=("r1", "r2", "r3", "r4", "t1"), default="r1",
                         help="r*: canonical-V2 campaigns; t1: timestep campaign artifacts/tstep_eval_v2_20261018_t1")
     args = parser.parse_args()
     global CAMPAIGN, RUNNER, RUN_ID, OUTPUT_ROOT

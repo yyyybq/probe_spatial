@@ -12,9 +12,10 @@
   因此那 136 行只算“匹配但未验收”。B1、C1、C2、mask 没有评估，C3 是旧协议。
 - **另一个原因是 v1 评估器会给发散的模型打出看似正常的分数**（NaN logits 变成类别 0），必须换成 v2。
 - **正式评估本身不贵。** canary 实测每个 checkpoint 2.5–4.4 分钟；676 个约 40–50 GPU·h。
-- **现状（2026-10-18）**：676 个已核验 canonical run 的正式评估全部通过验收。
-  r2 一次通过 668 项；另 8 项是评估项绑错了 owner overlay，按训练回执改正后用 r3 重评，8 项全部通过。
-  合并表：`results/canonical_v2_eval_v2/final/production_metrics.csv`（见下文“正式评估”）。
+- **现状（2026-10-18）**：canonical 合并表 804 项全部通过验收。
+  - 676 个已核验 run：r2 一次通过 668 项；另 8 项是评估项绑错了 owner overlay，按训练回执改正后用 r3 重评，全部通过。
+  - r4 补评 128 项，全部通过：16 个 B2 fp32 重训、96 个 MiniMax 全层六探针 run、16 个 MiniMax 第 30 层 run。
+  - 合并表：`results/canonical_v2_eval_v2/final/production_metrics.csv`（见下文“正式评估”与“补充评估 r4”）。
 
 ## 做法
 
@@ -48,8 +49,8 @@
 ## 覆盖范围
 
 - 已为 692 个已核验 canonical run 中的 **676 个** 生成评估项（656 个 r7 包，20 个 Aether 包）。
-- 未覆盖：16 个 MiniMax L30 A/B16 run，它们的训练设置存在 `case.json` 而不是训练项里，需要单独适配；
-  132 个 MiniMax 全层战役 run 尚未通过身份核验，不在本轮；16 个 canonical B2 重训完成后再加入。
+- 10-17 未覆盖的三组（16 个 MiniMax L30 A/B16、MiniMax 全层战役、16 个 canonical B2 重训）已在
+  2026-10-18 用 r4 补评，见下文“补充评估 r4”。MiniMax 全层战役里 36 个不属于六探针协议的 run 不评估。
 
 ## 进度（2026-10-17）
 
@@ -114,6 +115,38 @@
 - 合并表 `results/canonical_v2_eval_v2/final/production_metrics.csv`：676 项全部 ACCEPTED，
   其中 8 行来自 r3（`eval_revision` 列）。
 
+## 补充评估 r4：B2 重训与 MiniMax（2026-10-18）
+
+本次实际执行通过。r2 没有覆盖的三组 canonical run，用同样方法评估（训练代码 + v2 评估器，逐项按训练记录核对）：
+
+| 组 | run 数 | 训练代码 / 评估包 | 训练记录核对 |
+|---|---:|---|---|
+| B2 fp32 重训（替代 16 个权重非有限的 CogVideoX L0/5/10 与 Aether L1 B2） | 16 | r7 / Aether 包，`main_v2_eval_v2r2_from_*` | 训练回执的状态、训练项、代码包、overlay 全部一致 |
+| MiniMax-H3 全层战役，六探针部分 | 96 | `main_v2_probe_minimax_bf16_v2`，新建 `main_v2_eval_v2r2_from_main_v2_probe_minimax_bf16_v2`（同 r2 的 C 路径补丁，tag `b3df00a`） | 训练回执一致 |
+| MiniMax-H3 第 30 层 A/B16 | 16 | 同上 | 正式训练命令（环境变量与覆盖参数）逐项复原，与 run 的 `run_manifest.json` 一致 |
+
+- 生成脚本 `scripts/build_eval_v2_canonical_extra_items_20261018.py`，评估项在 `eval_v2_canonical_20261017_r4`。
+  训练回执由 SCO 作业读出（`artifacts/release_audit_20261018/overlay_binding_audit/training_receipts_extra.jsonl`）。
+- 不在本轮：MiniMax 全层战役中的 20 个 `streaming_camera` 与 16 个单独训练的 `counterfactual`（不属于六探针协议）。
+- 一项清单记录过时：`minimax_h3 … l50 p24 streaming_mask` 的清单记的是 10-15 仍在训练时的 epoch 95，
+  这个 run 已训练完成（epoch 99，回执 SUCCEEDED），评估用的是最终 checkpoint，并在评估项里注明。
+- **可比性注意**：MiniMax 全层战役的训练与评估清单是 `frozen_queue_r2`（p12：训练 1,523、验证 171 个样本），
+  其他 canonical run（包括 MiniMax 第 30 层）用的是 `execution_manifest_r3_receipt_union`（训练 2,445、验证 276）。
+  所以 MiniMax 全层的数字是在较小的验证集上得到的，不能与其他模型的 canonical 数字直接并列。
+
+结果（本次实际执行通过）：canary 10 项（两组 B2 重训、MiniMax 全层每种探针 1 项、第 30 层 B2 与 A1 mask），
+全部通过；正式评估 128 项、32 个单卡作业、0 失败，**128 项全部 ACCEPTED**。canary 的 10 项在正式评估中重跑，
+8 项主指标逐位相同，2 项 A1 mask 差不超过 1.1e-7（CUDA `scatter_add_` 的运行间噪声）。
+
+| 组 | 评估项 | 通过 | 每项验证样本 |
+|---|---:|---:|---:|
+| B2 fp32 重训 | 16 | 16 | 276 |
+| MiniMax 全层（六探针） | 96 | 96 | 171 |
+| MiniMax 第 30 层 A/B16 | 16 | 16 | 276 |
+
+合并表 `results/canonical_v2_eval_v2/final/production_metrics.csv` 现为 **804 项，全部 ACCEPTED**
+（r2 668 项、r3 8 项、r4 128 项，见 `eval_revision` 列）。
+
 ## 复现命令（服务器 `/mnt/umm/users/yinbaiqiao/probe_spatial`）
 
 ```bash
@@ -128,7 +161,15 @@ python3 scripts/build_eval_v2_canonical_items_20261017.py --revision r3 --keys <
 /mnt/umm/users/yinbaiqiao/.conda/envs/probe-spatial/bin/python scripts/submit_eval_v2_canonical_20261017.py --revision r3 --mode production --per-job 2
 python3 scripts/export_eval_v2_canonical_20261017.py --revision r3 --mode production
 python3 scripts/export_eval_v2_canonical_final_20261018.py
+# 2026-10-18 r4：B2 重训与 MiniMax
+$PY scripts/build_eval_v2_packs_20261017.py --revision r2m --commit 994a8e6
+$PY scripts/build_eval_v2_canonical_extra_items_20261018.py --write
+$PY scripts/submit_eval_v2_canonical_20261017.py --revision r4 --mode production --per-job 4
+python3 scripts/export_eval_v2_canonical_20261017.py --revision r4 --mode production
+python3 scripts/export_eval_v2_canonical_final_20261018.py
 ```
+
+（`$PY` 为 `/mnt/umm/users/yinbaiqiao/.conda/envs/probe-spatial/bin/python`。）
 
 训练回执是 root 权限文件，由 SCO 作业用 `artifacts/release_audit_20261018/overlay_binding_audit/dump_training_receipts.py`
 读出（命令见同目录 `job_command.txt`）。

@@ -5,6 +5,7 @@ Base: results/canonical_v2_eval_v2/r2/production_metrics.csv (676 items).
 Supersede: every key that revision r3 re-evaluated (the 8 VideoMAE p24 C1/C2 items
 whose r2 items bound the wrong owner overlay; see
 artifacts/release_audit_20261018/overlay_binding_audit/BINDING_AUDIT.json).
+Add: every row of revision r4 (runs r2 did not cover), when its export exists.
 A superseding r3 row must itself be ACCEPTED, else the export refuses.
 
 Writes results/canonical_v2_eval_v2/final/production_metrics.{csv,json} with an
@@ -21,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BASE = ROOT / "results/canonical_v2_eval_v2/r2/production_metrics.csv"
 SUPERSEDE = ROOT / "results/canonical_v2_eval_v2/r3/production_metrics.csv"
+ADD = ROOT / "results/canonical_v2_eval_v2/r4/production_metrics.csv"
 OUT = ROOT / "results/canonical_v2_eval_v2/final"
 
 
@@ -41,6 +43,14 @@ def main() -> int:
     for row in base:
         replacement = newer.get(row["unique_key"])
         rows.append({**(replacement or row), "eval_revision": "r3" if replacement else "r2"})
+    # r4 adds runs that r2 never covered (B2 fp32 re-trains, MiniMax all-layer and
+    # layer-30 runs); every row is kept, accepted or not, with its own status.
+    if ADD.is_file():
+        added = read(ADD)
+        clash = {r["unique_key"] for r in added} & {r["unique_key"] for r in rows}
+        if clash:
+            raise SystemExit(f"r4 keys already in the table: {sorted(clash)[:5]}")
+        rows += [{**r, "eval_revision": "r4"} for r in added]
     fields = list(rows[0])
     OUT.mkdir(parents=True, exist_ok=True)
     with (OUT / "production_metrics.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -49,7 +59,7 @@ def main() -> int:
         writer.writerows(rows)
     counts = dict(Counter(r["status"] for r in rows))
     (OUT / "production_metrics.json").write_text(json.dumps(
-        {"base": str(BASE), "supersede": str(SUPERSEDE), "superseded_keys": sorted(newer),
+        {"base": str(BASE), "supersede": str(SUPERSEDE), "superseded_keys": sorted(newer), "add": str(ADD),
          "counts": counts, "by_revision": dict(Counter(r["eval_revision"] for r in rows)), "rows": rows},
         indent=1, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({"counts": counts, "superseded": len(newer)}))
