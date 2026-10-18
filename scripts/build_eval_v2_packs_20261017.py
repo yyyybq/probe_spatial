@@ -81,6 +81,12 @@ REVISIONS = {
     "t1": {"prefix": "tstep_eval_v2_from_",
            "bases": ["tstep_probe_opt_v3", "tstep_probe_pack_v4_1"],
            "base_kind": "tag", "patches": {DATASET: R2_PATCHES}},
+    # 2026-10-18 C3-from-C1: the release main tree itself (owner overlay, label
+    # paths, C1 mixed-horizon loader, v2 evaluators), frozen at 206c5de.
+    "m1": {"prefix": "main_eval_v2_from_",
+           "bases": ["main_206c5de"],
+           "base_kind": "commit", "commits": {"main_206c5de": "206c5de"},
+           "paths": ["vidfm3d", "configs", ".project-root"], "patches": {}},
     # The 2026-10-16 timestep B2 fp32 retrains ran from the main tree at e4e4886
     # (no pack).  Base = that commit's vidfm3d/, configs/ and .project-root.
     "t1m": {"prefix": "tstep_eval_v2_from_",

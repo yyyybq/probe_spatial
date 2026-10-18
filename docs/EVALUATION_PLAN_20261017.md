@@ -16,6 +16,8 @@
   - 676 个已核验 run：r2 一次通过 668 项；另 8 项是评估项绑错了 owner overlay，按训练回执改正后用 r3 重评，全部通过。
   - r4 补评 128 项，全部通过：16 个 B2 fp32 重训、96 个 MiniMax 全层六探针 run、16 个 MiniMax 第 30 层 run。
   - 合并表：`results/canonical_v2_eval_v2/final/production_metrics.csv`（见下文“正式评估”与“补充评估 r4”）。
+  - C3-from-C1：全部 136 个 canonical C1 与 44 个 timestep C1 已用主目录评估，见
+    [C3-from-C1 评估](C3_FROM_C1_EVALUATION_20261018.md)。
 
 ## 做法
 
