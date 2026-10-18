@@ -35,10 +35,11 @@ SECONDARY = {
     "streaming_mask": [],
     "view_consistency": ["overlap_mae", "pos_acc", "neg_acc"],
     "ego_belief_v2": ["mean_az_err_deg", "mean_el_err_deg", "mean_log_dist_err", "top1", "top3"],
+    "ego_belief": ["mean_el_err_deg", "mean_log_dist_err"],
     "action_dynamics": ["global_R@5", "mean_rank", "mean_cos", "no_action_global_R@1", "shuffled_action_global_R@1"],
     "path_integration": ["global_R@5", "mean_rank", "mean_cos", "final_pose_error"],
 }
-FIELDS = ["unique_key", "model", "probe", "layer", "prefix", "scope", "status", "reject_reason",
+FIELDS = ["unique_key", "model", "probe", "layer", "prefix", "timestep", "scope", "status", "reject_reason",
           "primary_metric", "primary_value", "primary_ci_low", "primary_ci_high", "secondary_json",
           "n_loader", "n_scored", "n_nonfinite_pred", "evaluator_version", "eval_pack", "training_code_tag",
           "checkpoint_path", "checkpoint_sha256", "summary_path", "summary_sha256"]
@@ -55,13 +56,18 @@ def finite(value) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=("canary", "production"), required=True)
-    parser.add_argument("--revision", choices=("r1", "r2"), default="r1")
+    parser.add_argument("--revision", choices=("r1", "r2", "r3", "t1"), default="r1")
     args = parser.parse_args()
     global RUN_ID, RUNS, PLAN, OUT
-    RUN_ID = f"main_v2_eval_v2_canonical_20261017_{args.revision}"
+    if args.revision.startswith("t"):
+        RUN_ID = f"tstep_eval_v2_20261018_{args.revision}"
+        PLAN = ROOT / f"artifacts/tstep_eval_v2_20261018_{args.revision}/plan.json"
+        OUT = ROOT / "results/tstep_eval_v2" / args.revision
+    else:
+        RUN_ID = f"main_v2_eval_v2_canonical_20261017_{args.revision}"
+        PLAN = ROOT / f"artifacts/main_v2_probe_v2_816_20260917/eval_v2_canonical_20261017_{args.revision}/plan.json"
+        OUT = ROOT / "results/canonical_v2_eval_v2" / args.revision
     RUNS = ROOT / "logs/inscene15k_streaming/runs" / RUN_ID
-    PLAN = ROOT / f"artifacts/main_v2_probe_v2_816_20260917/eval_v2_canonical_20261017_{args.revision}/plan.json"
-    OUT = ROOT / "results/canonical_v2_eval_v2" / args.revision
     plan = json.loads(PLAN.read_text())["items"]
     rows = []
     for key, entry in sorted(plan.items()):
@@ -70,6 +76,7 @@ def main() -> int:
         receipt_path = out / "EVAL_COMPLETE.json"
         row = {f: "" for f in FIELDS}
         row.update({k: item[k] for k in ("unique_key", "model", "probe", "layer", "prefix", "scope", "primary_metric")})
+        row["timestep"] = item.get("timestep", "")
         row.update({"eval_pack": item["eval_pack"]["name"], "training_code_tag": item["training_code_tag"],
                     "checkpoint_path": item["checkpoint"]["path"]})
         if not receipt_path.is_file():

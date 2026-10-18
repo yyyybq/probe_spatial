@@ -111,17 +111,65 @@ def campaign_of(output_path: str) -> str:
     return m.group(1) if m else ""
 
 
+def ledger_runners() -> dict[tuple[str, str], set[str]]:
+    """(unique_key, run_id) -> runner paths that training submission ledgers launched.
+
+    A retry runner can share its Hydra output folder with the original campaign
+    while binding a different overlay (e.g. main_v2_probe_v2_vm24_targetfix_r1),
+    so the run id of the checkpoint, not the output folder, decides the runner.
+    """
+    found: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for path in glob(str(ROOT / "artifacts/main_v2_probe_v2_816_20260917/*/submissions.json")):
+        try:
+            jobs = json.loads(Path(path).read_text()).get("jobs", {})
+        except Exception:  # noqa: BLE001 - unreadable ledgers just give no evidence
+            continue
+        for name, job in (jobs.items() if isinstance(jobs, dict) else enumerate(jobs)):
+            if not isinstance(job, dict):
+                continue
+            command = str(job.get("startup_command") or job.get("command") or "")
+            run_id = re.search(r"--run-id\s+(\S+)", command)
+            runner = re.search(r"(\S+/run_single\.py)", command)
+            key = job.get("unique_key") or (name if isinstance(name, str) else None)
+            if run_id and runner and key:
+                found[(key, run_id.group(1))].add(runner.group(1))
+    return found
+
+
+def load_receipts(path: Path | None) -> dict[str, dict]:
+    """<mode>/<run_id>/<key> -> TRAIN_COMPLETE fields, from dump_training_receipts.py output."""
+    if path is None:
+        return {}
+    receipts = {}
+    for line in path.read_text().splitlines():
+        row = json.loads(line) if line.strip() else {}
+        if str(row.get("path", "")).endswith("/TRAIN_COMPLETE.json") and "fields" in row:
+            tail = "/".join(Path(row["path"]).parent.parts[-3:])
+            receipts.setdefault(tail, []).append({**row["fields"], "_path": row["path"]})
+    return {tail: rows[0] for tail, rows in receipts.items() if len(rows) == 1}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--keys", nargs="*", default=[], help="explicit unique keys")
     parser.add_argument("--all-verified", action="store_true", help="every VERIFIED row whose weights are not known non-finite")
     parser.add_argument("--write", action="store_true", help="write items and plan (default: report only)")
-    parser.add_argument("--revision", choices=("r1", "r2"), default="r1",
-                        help="r1: campaign/packs main_v2_eval_v2_from_*; r2: patched C-probe packs main_v2_eval_v2r2_from_*")
+    parser.add_argument("--revision", choices=("r1", "r2", "r3"), default="r1",
+                        help="r1: campaign/packs main_v2_eval_v2_from_*; r2: patched C-probe packs "
+                             "main_v2_eval_v2r2_from_*; r3: r2 packs, runner chosen by the checkpoint's "
+                             "run id and checked against its training receipt")
+    parser.add_argument("--receipts", type=Path, default=None,
+                        help="training_receipts.jsonl from dump_training_receipts.py; required for r3")
+    parser.add_argument("--campaign-dir", type=Path, default=None,
+                        help="write items and plan here instead of the revision's campaign folder (dry comparisons)")
     args = parser.parse_args()
     global CAMPAIGN
-    CAMPAIGN = ROOT / f"artifacts/main_v2_probe_v2_816_20260917/eval_v2_canonical_20261017_{args.revision}"
+    CAMPAIGN = args.campaign_dir or ROOT / f"artifacts/main_v2_probe_v2_816_20260917/eval_v2_canonical_20261017_{args.revision}"
     pack_glob = "runtime/main_v2_eval_v2_from_*" if args.revision == "r1" else "runtime/main_v2_eval_v2r2_from_*"
+    if args.revision == "r3" and args.receipts is None:
+        raise SystemExit("--revision r3 needs --receipts")
+    ledger = ledger_runners() if args.revision == "r3" else {}
+    receipts = load_receipts(args.receipts)
 
     runners = [r for r in (parse_runner(Path(p)) for p in
                glob(str(ROOT / "artifacts/**/run_single.py"), recursive=True) + glob(str(ROOT / "runtime/*/run_single.py"))) if r]
@@ -149,6 +197,13 @@ def main() -> int:
     for row in selected:
         key = row["experiment_id"]
         cands = by_campaign.get(campaign_of(row["output_path"]), [])
+        run_parts = Path(row["checkpoint_path"]).parts
+        run_tail = ("/".join(run_parts[run_parts.index("VideoProbe3D") - 3:run_parts.index("VideoProbe3D")])
+                    if "VideoProbe3D" in run_parts else "")
+        run_id = run_tail.split("/")[1] if run_tail else ""
+        named = ledger.get((key, run_id))
+        if named:
+            cands = [r for r in (parse_runner(Path(p)) for p in sorted(named)) if r]
         found = []
         for r in cands:
             for f in glob(str(r["item_root"] / "*.jsonl")):
@@ -176,6 +231,21 @@ def main() -> int:
         if not ckpt.is_file():
             problems["checkpoint_missing"] += 1
             continue
+        receipt = None
+        if args.revision == "r3":
+            receipt = receipts.get(run_tail)
+            if receipt is None:
+                problems["training_receipt_missing"] += 1
+                continue
+            mismatched = [label for label, ok in (
+                ("state", receipt.get("state") == "SUCCEEDED"),
+                ("item", receipt.get("item_sha256") == sha256(item_path)),
+                ("pack", receipt.get("source_sha_file_sha256") == sha256(ROOT / "runtime" / runner["pack"] / "source.sha256")),
+                ("overlay", runner["family"] != "overlay" or receipt.get("overlay_sha256") == runner["overlay_sha256"]),
+            ) if not ok]
+            if mismatched:
+                problems["training_receipt_mismatch_" + "_".join(mismatched)] += 1
+                continue
         manifest = titem["execution_manifest"]
         env = {
             "INSCENE_DATA_ROOT": DATA_ROOT, "INSCENE_LOCAL_SCENE_ROOT": SCENE_ROOT,
@@ -216,6 +286,9 @@ def main() -> int:
             "training_pack": runner["pack"], "training_code_tag": f"code/{runner['pack']}",
             "eval_pack": eval_packs[runner["pack"]],
             "checkpoint": {"path": str(ckpt), "size_bytes": st.st_size, "mtime_ns": st.st_mtime_ns},
+            **({"training_receipt": {k: receipt.get(k) for k in (
+                "_path", "state", "overlay_sha256", "item_sha256", "source_sha_file_sha256", "completed_utc")}}
+               if receipt else {}),
         })
     report = {"selected_rows": len(selected), "items": len(items), "problems": dict(problems),
               "by_probe": dict(Counter(i["probe"] for i in items)),

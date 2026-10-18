@@ -12,10 +12,11 @@
 - **预测级一致（本次实际执行通过）。** 同样 52 项、同一批 checkpoint：25 项完全相同；18 项（C1、C2）预测与
   全部共有指标逐位相同；9 项（A1 mask）的差异在 GPU 重跑噪声内，与冻结包自己跑两次的差异同量级。
   没有一项判为不同。
-- **发现一个数据问题。** VideoMAE 前缀 24 的 8 个 C1/C2 run 需要的 2,724 个旧目标特征文件已不在 AOSS 上，
-  本地也没有，这 8 个 run 现在不能评估也不能重训。其余 668 项正式评估已通过验收。
-- **还有一个发布缺口。** 74 个测试文件里有 48 个依赖从未提交的文件，只含已提交内容的树跑不通自己的测试。
-- 所有 commit 只在本地，未 push，未合并进 `release-prep-20261017`。
+- **正式评估 676 项全部通过验收（2026-10-18 更正）。** 10-17 写的“VideoMAE 前缀 24 的 8 个 run 缺数据”有误：
+  这 8 项是评估项绑错了 owner overlay，训练所用的特征都在。改正后重评，8 项全部通过（见第五节）。
+- **测试缺口已补（2026-10-18）。** 原先 74 个测试文件里有 48 个依赖从未提交的文件。现在仓库只跟踪 25 个发布测试，
+  在只含已提交内容的干净检出里 198 项全部通过；50 个内部战役测试留在工作目录，不再提交（见第二节）。
+- 所有 commit 只在本地，未 push。本分支已于 2026-10-17 快进合并进 `release-prep-20261017`（`6ff8df0`）。
 
 ## 一、补回了什么
 
@@ -68,7 +69,14 @@ C2 快速路径测试补上新属性。
 
 两边的失败与收集错误逐条相同，多出的 7 个通过就是新增测试。这 50 项失败与改动无关：已提交的测试引用了
 从未提交的文件。74 个测试文件中有 48 个引用 `analyses/`、`scripts/`、`runtime/` 或 `artifacts/` 下
-未提交的内容；主 checkout 里全部通过，是因为那些文件就放在那里。这是发布前要补的缺口，见“待你决定”。
+未提交的内容；主 checkout 里全部通过，是因为那些文件就放在那里。
+
+**2026-10-18 补齐（commit `11478a3`，本次实际执行通过）**：按 10-11 发布计划的划分（可移植的训练、提特征、评估入口
+属于发布；集群提交、恢复与一次性历史脚本不属于），仓库只保留 25 个发布测试，取消跟踪 50 个内部战役测试
+（文件仍在工作目录，列入 `.gitignore`）。`test_probe_contracts.py` 里依赖 `analyses/probe_validity` 的 4 个测试
+移到内部文件 `tests/test_probe_validity_b2_order.py`：`analyses/` 不在本次发布范围。`conftest.py` 的
+“需要战役产物”列表随之清空。在 `/tmp` 的干净检出里，不加任何 `PYTHONPATH`，`python -m pytest -q` 为
+**198 passed，0 失败，0 错误**。说明见 `tests/README.md`。早先的 commit 历史里仍有这些内部测试。
 
 ## 三、样本级一致性（数据加载器）
 
@@ -133,19 +141,23 @@ A1 mask 的差异不是代码造成的：identity loss 用 CUDA `scatter_add_` �
 评估作业按 `CAMPAIGN.json` 绑定 `cb87839` 的 306 个代码文件；比较脚本随后在下一个 commit 里加入上述分类规则，
 所以若要重跑评估作业，需要先用 `freeze --force` 重新绑定。
 
-## 五、数据可用性（正式评估中发现）
+## 五、数据可用性与评估项绑定（2026-10-18 更正）
 
-本次实际执行通过的只读检查（`artifacts/release_audit_20261017/aoss_payload_probe/`）。
+10-17 的判断“8 个 VideoMAE run 缺数据、不能评估也不能重训”是错的。实际情况（本次实际执行通过，证据见
+`artifacts/release_audit_20261017/aoss_payload_probe/VIDEOMAE_TARGET_RECOVERY_SEARCH.md` 与
+`artifacts/release_audit_20261018/overlay_binding_audit/`）：
 
-- r2 正式评估有 8 项失败，全是 VideoMAE 前缀 24 的 C1 与 C2（层 5、11、17、23）。它们的 overlay 把部分目标特征
-  指向旧目录 `aoss://baiqiao/InsScene-15K/FEAT_TARGET/videomae/scannetpp/<场景>/feature_layer<L>.sft`。
-  这些对象 9 月训练时存在，overlay 记录了远端全文 SHA 核对通过。
-- 676 个评估项的 overlay 能解析到 357,164 个载荷对象。其中旧目录只有这一处：2,724 个对象（681 个场景 × 4 层）。
-  探测结果：**2,724 个全部不在 AOSS 上，本地镜像也没有**。按场景划分，训练集 2,448 个、验证集 276 个。
-  所以这 8 个 run 现在既不能评估，也不能重训。
-- 规范命名空间随机抽查 3,000 个对象，63 个不在 AOSS 上（VideoMAE 60、Wan 3），但 63 个都在本地镜像
-  `/mnt/umm/users/yinbaiqiao/InsScene-15K/` 里。overlay 先查本地镜像，这些对象可用。
-- 没有找到删除或迁移这些对象的记录。未查：其余 354,164 个对象（只抽查了 3,000 个）、节点本地缓存里是否还有副本。
+- 这 8 个 checkpoint 由 9 月 23 日的重试运行器训练，它用的 overlay 读规范目录里的目标特征副本。
+  这 2,724 个副本现在都在 AOSS 上，全量 SHA-256 与 overlay 记录一致。
+- 评估项生成脚本按输出目录匹配运行器，绑定了原 r7 运行器的 overlay。那份 overlay 指向的旧目录
+  `FEAT_TARGET/videomae/` 已不存在，评估因此失败。
+- 用作业读出全部训练回执逐项核对：668 项的 overlay、训练项与代码包都与训练一致；只有这 8 项的 overlay 和
+  运行器绑错。改正生成脚本后重评，8 项全部通过验收；canonical 合并表 676 项全部 ACCEPTED。
+- AOSS `baiqiao/InsScene-15K/` 下所有旧命名空间（`FEAT_TARGET`、`FEAT_STREAMING`、`*_BY_PREFIX`、
+  `*_PREFIX_ALIAS`）在 2026-09-19 到 09-21 之间被整批删除，执行者不明；bucket 没有版本控制。依赖旧命名空间的
+  文档或脚本已不能直接复现，但已核验的 canonical 结果都不依赖它们。
+- 规范命名空间随机抽查 3,000 个对象，63 个不在 AOSS 上，但都在本地镜像 `/mnt/umm/users/yinbaiqiao/InsScene-15K/`
+  里，overlay 先查本地镜像，可用。其余约 35 万个对象未逐一探测。
 
 ## 六、复现命令（服务器，`/mnt/umm/users/yinbaiqiao/probe_spatial`）
 
@@ -167,12 +179,11 @@ $PY -B $W/scripts/eval_main_tree_canary_20261017.py submit --per-job 2 --submit
 $PY -B $W/scripts/eval_main_tree_canary_20261017.py compare
 ```
 
-## 待你决定
+## 决定与执行
 
-1. **合并分支**：(a) 推荐：把 `release-main-overlay-20261017` 在本地合并进 `release-prep-20261017`，不 push；
-   (b) 先保持独立分支。
-2. **缺失的 VideoMAE 目标特征**：(a) 推荐：先只读查找副本（其他 AOSS 命名空间、节点本地缓存）；找不到再用冻结的
-   提特征代码重提，按 overlay 记录的 SHA 核对，字节不同则这 8 个 run 不进发布结果；(b) 直接把这 8 个 run 排除。
-3. **测试依赖未提交文件**：(a) 推荐：发布分支只带发布测试，并补交它们需要的模块；内部战役测试留在内部；
-   (b) 把 `analyses/` 等目录全部提交。
-4. **仍未决定（上一轮）**：timestep 结果的评估方式，推荐为 `opt_v3` 与 `pack_v4_1` 建评估包。
+10-17 列出的四项都已按推荐选项执行（2026-10-18）：
+
+1. 合并分支：已在本地快进合并进 `release-prep-20261017`，未 push。
+2. VideoMAE 的 8 个 run：查明是评估项绑错 overlay，不是数据缺失；已改正并重评，见第五节。
+3. 测试依赖：仓库只跟踪发布测试，干净检出 198 项全部通过，见第二节。
+4. timestep 评估：见 [timestep 正式评估](TSTEP_EVALUATION_20261018.md)。

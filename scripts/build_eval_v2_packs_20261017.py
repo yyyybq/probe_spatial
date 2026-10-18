@@ -70,6 +70,18 @@ REVISIONS = {
     "r2": {"prefix": "main_v2_eval_v2r2_from_",
            "bases": ["main_v2_probe_v2_r7_single_v3", "main_v2_probe_v2_aetherfix_r1"],
            "patches": {DATASET: R2_PATCHES}},
+    # Timestep training packs have no source.sha256; their identity is the
+    # snapshot recorded as git tag code/<pack> on 2026-10-17.  The base file set
+    # is that tag's tree, and every file must still equal runtime/<pack>/source.
+    "t1": {"prefix": "tstep_eval_v2_from_",
+           "bases": ["tstep_probe_opt_v3", "tstep_probe_pack_v4_1"],
+           "base_kind": "tag", "patches": {DATASET: R2_PATCHES}},
+    # The 2026-10-16 timestep B2 fp32 retrains ran from the main tree at e4e4886
+    # (no pack).  Base = that commit's vidfm3d/, configs/ and .project-root.
+    "t1m": {"prefix": "tstep_eval_v2_from_",
+            "bases": ["main_e4e4886"],
+            "base_kind": "commit", "commits": {"main_e4e4886": "e4e4886"},
+            "paths": ["vidfm3d", "configs", ".project-root"], "patches": {}},
 }
 
 
@@ -81,24 +93,58 @@ def git(*args: str) -> bytes:
     return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True).stdout
 
 
+def base_files(base: str, spec: dict) -> tuple[dict[str, bytes], dict]:
+    """rel path -> bytes of the base pack's frozen file set, plus identity facts."""
+    kind = spec.get("base_kind", "runtime")
+    base_dir = ROOT / "runtime" / base
+    files: dict[str, bytes] = {}
+    if kind == "runtime":
+        for line in (base_dir / "source.sha256").read_text(encoding="utf-8").splitlines():
+            sha, rel = line.split("  ", 1)
+            rel = rel[2:] if rel.startswith("./") else rel
+            data = (base_dir / "source" / rel).read_bytes()
+            if sha256_bytes(data) != sha:
+                raise SystemExit(f"base pack {base} file changed since freeze: {rel}")
+            files[rel] = data
+        return files, {"base_pack": f"runtime/{base}", "base_git_tag": f"code/{base}",
+                       "base_source_sha256_file_sha256": sha256_bytes((base_dir / "source.sha256").read_bytes())}
+    rev = f"code/{base}" if kind == "tag" else spec["commits"][base]
+    commit = git("rev-parse", f"{rev}^{{commit}}").decode().strip()
+    listing = git("ls-tree", "-r", "-z", commit, "--", *spec.get("paths", [])).decode().split("\0")
+    changed = []
+    for entry in filter(None, listing):
+        meta, rel = entry.split("\t", 1)
+        mode, kind_, _ = meta.split()
+        if kind_ != "blob" or mode == "120000":
+            raise SystemExit(f"{rev}: unsupported tree entry {mode} {kind_} {rel}")
+        data = git("show", f"{commit}:{rel}")
+        files[rel] = data
+        if kind == "tag":
+            live = base_dir / "source" / rel
+            if not live.is_file() or sha256_bytes(live.read_bytes()) != sha256_bytes(data):
+                changed.append(rel)
+    if changed:
+        raise SystemExit(f"runtime/{base}/source differs from {rev} in {len(changed)} files, e.g. {changed[:3]}")
+    listing_text = "".join(f"{sha256_bytes(files[r])}  ./{r}\n" for r in sorted(files))
+    return files, {"base_pack": f"runtime/{base}" if kind == "tag" else f"git {commit}",
+                   "base_git_tag": rev if kind == "tag" else None, "base_commit": commit,
+                   "base_source_sha256_file_sha256": sha256_bytes(listing_text.encode()),
+                   "base_identity_note": ("snapshot of runtime/<pack>/source recorded 2026-10-17; "
+                                          "no freeze-time hash list exists" if kind == "tag" else
+                                          "main-tree commit the training ran from")}
+
+
 def build(base: str, commit: str, revision: str = "r1") -> Path:
     spec = REVISIONS[revision]
-    base_dir = ROOT / "runtime" / base
     out = ROOT / "runtime" / f"{spec['prefix']}{base}"
     if out.exists():
         raise SystemExit(f"{out} exists; evaluation packs are immutable")
-    entries = []
-    for line in (base_dir / "source.sha256").read_text(encoding="utf-8").splitlines():
-        sha, rel = line.split("  ", 1)
-        entries.append((sha, rel[2:] if rel.startswith("./") else rel))
+    files, identity = base_files(base, spec)
     src = out / "source"
     src.mkdir(parents=True)
     records = {}
-    for sha, rel in entries:
-        data = (base_dir / "source" / rel).read_bytes()
-        if sha256_bytes(data) != sha:
-            raise SystemExit(f"base pack {base} file changed since freeze: {rel}")
-        records[rel] = {"sha256": sha, "origin": f"runtime/{base}"}
+    for rel, data in files.items():
+        records[rel] = {"sha256": sha256_bytes(data), "origin": identity["base_pack"]}
     replaced = {}
     for rel in REPLACED:
         data = git("show", f"{commit}:{rel}")
@@ -110,7 +156,7 @@ def build(base: str, commit: str, revision: str = "r1") -> Path:
         records[rel] = {"sha256": replaced[rel]["sha256"], "origin": f"git {commit}"}
     patched = {}
     for rel, patches in spec["patches"].items():
-        text = (base_dir / "source" / rel).read_text(encoding="utf-8")
+        text = files[rel].decode("utf-8")
         for old, new in patches:
             if text.count(old) != 1:
                 raise SystemExit(f"{base}:{rel}: patch anchor found {text.count(old)} times, expected 1")
@@ -118,7 +164,7 @@ def build(base: str, commit: str, revision: str = "r1") -> Path:
         data = text.encode("utf-8")
         patched[rel] = {"sha256": sha256_bytes(data), "base_sha256": records[rel]["sha256"],
                         "patches": len(patches), "data": data}
-        records[rel] = {"sha256": patched[rel]["sha256"], "origin": f"runtime/{base} + {revision} patch"}
+        records[rel] = {"sha256": patched[rel]["sha256"], "origin": f"{identity['base_pack']} + {revision} patch"}
     for rel in sorted(records):
         dest = src / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -127,7 +173,7 @@ def build(base: str, commit: str, revision: str = "r1") -> Path:
         elif rel in patched:
             dest.write_bytes(patched[rel]["data"])
         else:
-            shutil.copyfile(base_dir / "source" / rel, dest)
+            dest.write_bytes(files[rel])
         os.chmod(dest, 0o444)
         if sha256_bytes(dest.read_bytes()) != records[rel]["sha256"]:
             raise SystemExit(f"copy mismatch {rel}")
@@ -138,9 +184,7 @@ def build(base: str, commit: str, revision: str = "r1") -> Path:
         "schema": "MAIN_V2_EVAL_V2_PACK_V1",
         "status": "FROZEN",
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "base_pack": f"runtime/{base}",
-        "base_source_sha256_file_sha256": sha256_bytes((base_dir / "source.sha256").read_bytes()),
-        "base_git_tag": f"code/{base}",
+        **identity,
         "revision": revision,
         "replaced_from_commit": commit,
         "replaced_files": replaced,

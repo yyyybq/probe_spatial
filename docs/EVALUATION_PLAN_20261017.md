@@ -12,8 +12,9 @@
   因此那 136 行只算“匹配但未验收”。B1、C1、C2、mask 没有评估，C3 是旧协议。
 - **另一个原因是 v1 评估器会给发散的模型打出看似正常的分数**（NaN logits 变成类别 0），必须换成 v2。
 - **正式评估本身不贵。** canary 实测每个 checkpoint 2.5–4.4 分钟；676 个约 40–50 GPU·h。
-- **现状（2026-10-17 12:50 UTC）**：评估方法经两轮 canary 验证；676 个已核验 canonical run 的正式评估已跑完，
-  **668 项通过验收**，8 项因 AOSS 上的特征文件缺失而失败（见下文“正式评估”）。
+- **现状（2026-10-18）**：676 个已核验 canonical run 的正式评估全部通过验收。
+  r2 一次通过 668 项；另 8 项是评估项绑错了 owner overlay，按训练回执改正后用 r3 重评，8 项全部通过。
+  合并表：`results/canonical_v2_eval_v2/final/production_metrics.csv`（见下文“正式评估”）。
 
 ## 做法
 
@@ -92,12 +93,26 @@
 
 - 导出结果：**668 项 ACCEPTED**（v2 评估器、主指标有限、非有限预测为 0、有评分记录、summary 哈希一致），
   **8 项 FAILED**，0 项 REJECTED。表：`results/canonical_v2_eval_v2/r2/production_metrics.csv`。
-- 8 项失败全是 VideoMAE 前缀 24 的 C1 与 C2（层 5、11、17、23 各 2 项）。它们的 owner overlay 把部分目标特征
-  指向旧目录 `aoss://baiqiao/InsScene-15K/FEAT_TARGET/videomae/`，AOSS 现在找不到这些对象，评估在读第一个
-  场景时就停止。这些对象 9 月训练时存在，并通过了全文哈希核对。
-- 12:41 UTC 的只读探测（`artifacts/release_audit_20261017/aoss_payload_probe/`）：这个旧目录里被引用的
-  2,724 个对象全部缺失；另从规范命名空间随机抽查 3,000 个，缺 63 个（VideoMAE 60、Wan 3）。
-  见[主目录发布一致性](MAIN_TREE_RELEASE_PARITY_20261017.md)的“数据可用性”一节。
+- 8 项失败全是 VideoMAE 前缀 24 的 C1 与 C2（层 5、11、17、23 各 2 项），**原因是评估项绑错了 overlay，
+  不是数据丢失**（10-17 晚的初步判断“数据缺失”有误，2026-10-18 更正）：
+  - 这 8 个 checkpoint 由 9 月 23 日的重试运行器 `runtime/main_v2_probe_v2_vm24_targetfix_r1/run_single.py`
+    训练，overlay 是 `probe552_validation_40_20260923_r2/overlay/manifest.json`（sha256 `291cebd5…`），
+    目标特征读的是规范目录 `FEAT_TARGET_CANONICAL_V2_GAP_DELTA_V1` 的副本，这 2,724 个对象现在都在 AOSS 上，
+    全量 SHA 核对一致。
+  - 生成评估项的脚本按输出目录匹配运行器。重试运行器把 checkpoint 写进原 r7 战役的目录，回执却写在自己的目录，
+    所以脚本找到的是 r7 运行器和它的 overlay（`9671fc95…`）。r7 overlay 指向的旧目录
+    `FEAT_TARGET/videomae/` 在 2026-09-19 到 09-21 之间已和其他旧命名空间一起被删除，评估因此读不到文件。
+- **改正（本次实际执行通过）**：
+  - 用作业读出全部训练回执（root 权限文件），逐项核对评估项与训练回执的 overlay、训练项和代码包哈希：
+    668 项一致；不一致的正是这 8 项，且只差 overlay 与运行器。证据：
+    `artifacts/release_audit_20261018/overlay_binding_audit/BINDING_AUDIT.json`。
+  - 生成脚本改为按 checkpoint 的 run id 在训练提交记录里找运行器，并要求与训练回执一致
+    （`--revision r3 --receipts …`）。用新逻辑重建全部 676 项：668 项与 r2 逐字节相同，这 8 项只在 overlay、
+    运行器和对应环境变量上不同。
+  - 只为这 8 项写了 r3 评估项（`eval_v2_canonical_20261017_r3`，同一 r2 评估包），canary 2 项后正式评估 8 项，
+    全部通过验收；层 11 的两项与 canary 数值相同。
+- 合并表 `results/canonical_v2_eval_v2/final/production_metrics.csv`：676 项全部 ACCEPTED，
+  其中 8 行来自 r3（`eval_revision` 列）。
 
 ## 复现命令（服务器 `/mnt/umm/users/yinbaiqiao/probe_spatial`）
 
@@ -106,12 +121,22 @@
 python3 scripts/build_eval_v2_canonical_items_20261017.py --revision r2 --all-verified
 /mnt/umm/users/yinbaiqiao/.conda/envs/probe-spatial/bin/python scripts/submit_eval_v2_canonical_20261017.py --revision r2 --mode production
 python3 scripts/export_eval_v2_canonical_20261017.py --revision r2 --mode production
+# 2026-10-18 改正：核对绑定，重建并重评 8 项，合并
+python3 scripts/audit_eval_item_binding_20261018.py --revision r2
+python3 scripts/build_eval_v2_canonical_items_20261017.py --revision r3 --keys <8 个 key> \
+    --receipts artifacts/release_audit_20261018/overlay_binding_audit/training_receipts.jsonl --write
+/mnt/umm/users/yinbaiqiao/.conda/envs/probe-spatial/bin/python scripts/submit_eval_v2_canonical_20261017.py --revision r3 --mode production --per-job 2
+python3 scripts/export_eval_v2_canonical_20261017.py --revision r3 --mode production
+python3 scripts/export_eval_v2_canonical_final_20261018.py
 ```
+
+训练回执是 root 权限文件，由 SCO 作业用 `artifacts/release_audit_20261018/overlay_binding_audit/dump_training_receipts.py`
+读出（命令见同目录 `job_command.txt`）。
 
 结果表：`results/canonical_v2_eval_v2/r2/production_metrics.csv`。
 
 ## 待你决定
 
-1. **timestep**：(a) 用同样方法为 `tstep_probe_opt_v3` 与 `tstep_probe_pack_v4_1` 建评估包并重新评估
-   （推荐；这两个包只有快照身份，需在结果里注明）；(b) 等 MiniMax 重训完成后一起评估。
-   2026-09-07 的 88 个 run 没有可恢复的训练代码，建议不进入发布结果或重训。
+1. **timestep**：已按 (a) 执行（2026-10-18）：为 `tstep_probe_opt_v3`、`tstep_probe_pack_v4_1` 和
+   B2 重训用的 `e4e4886` 建评估包，评估 316 个 run，见 [timestep 正式评估](TSTEP_EVALUATION_20261018.md)。
+   2026-09-07 的 88 个 run 没有可恢复的训练代码，不进入本轮。

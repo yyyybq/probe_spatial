@@ -67,12 +67,17 @@ def main() -> int:
     parser.add_argument("--per-job", type=int, default=4)
     parser.add_argument("--limit-jobs", type=int, default=0)
     parser.add_argument("--submit", action="store_true")
-    parser.add_argument("--revision", choices=("r1", "r2"), default="r1")
+    parser.add_argument("--revision", choices=("r1", "r2", "r3", "t1"), default="r1",
+                        help="r*: canonical-V2 campaigns; t1: timestep campaign artifacts/tstep_eval_v2_20261018_t1")
     args = parser.parse_args()
     global CAMPAIGN, RUNNER, RUN_ID, OUTPUT_ROOT
-    CAMPAIGN = ROOT / f"artifacts/main_v2_probe_v2_816_20260917/eval_v2_canonical_20261017_{args.revision}"
+    if args.revision.startswith("t"):
+        CAMPAIGN = ROOT / f"artifacts/tstep_eval_v2_20261018_{args.revision}"
+        RUN_ID = f"tstep_eval_v2_20261018_{args.revision}"
+    else:
+        CAMPAIGN = ROOT / f"artifacts/main_v2_probe_v2_816_20260917/eval_v2_canonical_20261017_{args.revision}"
+        RUN_ID = f"main_v2_eval_v2_canonical_20261017_{args.revision}"
     RUNNER = CAMPAIGN / "run_eval_single.py"
-    RUN_ID = f"main_v2_eval_v2_canonical_20261017_{args.revision}"
     OUTPUT_ROOT = ROOT / "logs/inscene15k_streaming/runs" / RUN_ID
     plan = json.loads((CAMPAIGN / "plan.json").read_text())
     ledger_path = CAMPAIGN / "submissions.json"
@@ -109,7 +114,8 @@ def main() -> int:
             steps.append(shlex.join([PY, str(RUNNER), "--item", e["path"], "--item-sha256", e["sha256"],
                                      "--run-id", RUN_ID, "--mode", args.mode]) + " || rc=1")
         command = f"cd {shlex.quote(str(ROOT))} && rc=0; " + "; ".join(steps) + "; exit $rc"
-        name = f"bq-evalv2-{args.mode[:4]}-{len(ledger['jobs']):04d}"
+        tag = "tstep" if args.revision.startswith("t") else "evalv2"
+        name = f"bq-{tag}-{args.mode[:4]}-{len(ledger['jobs']):04d}"
         if not args.submit:
             print(f"  {name}: {', '.join(batch)}")
             continue
