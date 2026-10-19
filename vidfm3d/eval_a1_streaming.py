@@ -341,7 +341,6 @@ def _summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
-@hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
 def _require_val_split(cfg) -> str:
     """This evaluator always reads the validation loader and writes val_* files.
 
@@ -357,6 +356,7 @@ def _require_val_split(cfg) -> str:
     return split
 
 
+@hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
 def main(cfg: DictConfig) -> None:
     if not cfg.get("ckpt_path"):
         raise ValueError("Must provide ckpt_path=<path>")
