@@ -1,0 +1,84 @@
+{
+  "schema": "PROBE_SPATIAL_RELEASE_STATUS_V1",
+  "unit": "trained run; C3-from-C1 is an evaluation attached to its C1 run",
+  "inventory_observed": "2026-10-16 (training completion, checkpoint tensor validity)",
+  "evaluations_accepted": "2026-10-17/18 (v2 evaluator, val split, seed 42)",
+  "inputs": {
+    "canonical_inventory": {
+      "path": "metadata/release_inventory/canonical_v2.csv",
+      "sha256": "6aa9b916fb42d6dcbace70c2a9ed53be2b03badc97ca191770b4e7654d672170"
+    },
+    "timestep_inventory": {
+      "path": "metadata/release_inventory/timestep.csv",
+      "sha256": "9a860f382e06680803427acc7ae5892fbe79e7c5cc78fbea8959ff366f4b35a6"
+    },
+    "retrain_queue": {
+      "path": "metadata/release_inventory/retrain_queue_20261016.csv",
+      "sha256": "443d1f700d07f80565374e636bc973155e9ad1646ba77bf47c354f290b6b73e1"
+    },
+    "canonical_accepted": {
+      "path": "results/canonical_v2_eval_v2/final/production_metrics.csv",
+      "sha256": "480a9ded79d3018c714daa55777e356b25003d746b7510de4d28b7e7038d62bb"
+    },
+    "timestep_accepted": {
+      "path": "results/tstep_eval_v2/t1/production_metrics.csv",
+      "sha256": "2b92a8dc13e50d3819d9fb6eb284bed011c21cc9e6002d2c330f6ab180583540"
+    },
+    "c3_from_c1_accepted": {
+      "path": "results/c3_from_c1_eval/c3/production_metrics.csv",
+      "sha256": "fa6b076d7e79188d3171d48ec1e3705248c73e39889db7dc6f5cc084b3aad440"
+    }
+  },
+  "groups": {
+    "canonical_v2": {
+      "runs": 868,
+      "release_class": {
+        "ACCEPTED_VAL_RESULT": 804,
+        "NONCANONICAL_PROBE": 36,
+        "WAN_A2_CANARY_CONFLICT": 28
+      },
+      "accepted_by_eval_scope": {
+        "canonical_v2_b2_fp32_retrain_20261016": 16,
+        "canonical_v2_main552": 536,
+        "canonical_v2_minimax_all_layers_20261011": 96,
+        "canonical_v2_minimax_l30_ab16": 16,
+        "canonical_v2_wan168": 140
+      },
+      "checkpoint_replaced_by_fp32_retrain": 16
+    },
+    "timestep": {
+      "runs": 576,
+      "release_class": {
+        "ACCEPTED_VAL_RESULT": 316,
+        "AWAITING_STAGE5_RETRAIN": 128,
+        "LEGACY_TRAINED_C3": 44,
+        "UNRECOVERABLE_TRAINING_CODE_20260907": 88
+      },
+      "accepted_by_eval_scope": {
+        "tstep_b2_fp32_retrain_20261016": 32,
+        "tstep_probe_opt_v3": 254,
+        "tstep_probe_pack_v4_1": 30
+      },
+      "checkpoint_replaced_by_fp32_retrain": 32
+    }
+  },
+  "c3_from_c1": {
+    "evaluations": 180,
+    "variant": {
+      "c3_from_c1": 120,
+      "h1_trained_diagnostic": 60
+    },
+    "ci_low_above_one_third": {
+      "c3_from_c1": 120,
+      "h1_trained_diagnostic": 55
+    }
+  },
+  "release_class_to_remaining_work": {
+    "ACCEPTED_VAL_RESULT": "export_only",
+    "AWAITING_STAGE5_RETRAIN": "retrain_needed",
+    "WAN_A2_CANARY_CONFLICT": "needs_diagnosis",
+    "UNRECOVERABLE_TRAINING_CODE_20260907": "user_decision",
+    "LEGACY_TRAINED_C3": "not_in_release",
+    "NONCANONICAL_PROBE": "optional_extension"
+  }
+}
