@@ -341,10 +341,26 @@ def _summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
+def _require_val_split(cfg) -> str:
+    """This evaluator always reads the validation loader and writes val_* files.
+
+    Refuse any other eval_split instead of silently evaluating validation data
+    under a test request (scripts/run_streaming_probe_sweep.sh forwards
+    +eval_split to it).
+    """
+    split = cfg.get("eval_split", "val")
+    if split != "val":
+        raise ValueError(
+            f"eval_a1_streaming evaluates the validation split only; got eval_split={split!r}"
+        )
+    return split
+
+
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
 def main(cfg: DictConfig) -> None:
     if not cfg.get("ckpt_path"):
         raise ValueError("Must provide ckpt_path=<path>")
+    _require_val_split(cfg)
     device, execution_metadata = _execution_device()
 
     log.info(OmegaConf.to_yaml(cfg))

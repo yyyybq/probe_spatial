@@ -1,6 +1,10 @@
 # Probe Spatial — Project Status
 
 **Current handoff (2026-10-19):** [docs/HANDOFF_20261019.md](docs/HANDOFF_20261019.md).
+**Independent audit and per-run release status (2026-10-19 10:00 UTC):**
+[docs/RELEASE_AUDIT_20261019.md](docs/RELEASE_AUDIT_20261019.md) and
+`metadata/release_inventory/release_status_20261019.csv`; the counts in the body
+below predate the 10-17/18 evaluations.
 The page below is the 2026-10-16 snapshot. Canonical V2 (804), timestep (316)
 and C3-from-C1 (180) evaluations have since been accepted; MiniMax L20/L25
 bf16 consolidation and full verification passed on 2026-10-19 (job pt-f4g9bk61;

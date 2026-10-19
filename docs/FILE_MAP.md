@@ -9,6 +9,8 @@ ledger/dashboard/export are historical snapshots, not a live status feed.
 # Start Here
 
 - [2026-10-19 handoff](HANDOFF_20261019.md): current project purpose and latest progress. Read this first.
+- [2026-10-19 audit](RELEASE_AUDIT_20261019.md): independent check of the published branch, fixes, per-group status and remaining release work.
+- `metadata/release_inventory/release_status_20261019.csv`: per-run release status joining the inventories with the accepted tables.
 - `PROJECT_STATUS.md`: 2026-10-16 evidence snapshot; its counts are superseded by the handoff.
 - [2026-10-15 inventory](EXPERIMENT_INVENTORY_20261015.md): per-group completion, checkpoint tensor validity, feature-cache overflow, remaining work by kind.
 - [Release plan](RELEASE_READINESS_20261011.md): canonical V2, timestep, other analyses, and publication requirements (2026-10-11 counts superseded where the 10-15 inventory differs).
