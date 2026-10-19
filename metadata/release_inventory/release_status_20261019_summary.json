@@ -3,6 +3,7 @@
   "unit": "trained run; C3-from-C1 is an evaluation attached to its C1 run",
   "inventory_observed": "2026-10-16 (training completion, checkpoint tensor validity)",
   "evaluations_accepted": "2026-10-17/18 (v2 evaluator, val split, seed 42)",
+  "c3_from_c1_evaluated": "2026-10-18 (main tree 206c5de)",
   "inputs": {
     "canonical_inventory": {
       "path": "metadata/release_inventory/canonical_v2.csv",

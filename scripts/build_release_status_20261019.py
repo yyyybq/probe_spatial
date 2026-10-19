@@ -49,6 +49,9 @@ OUT_JSON = INV / "release_status_20261019_summary.json"
 # commits in artifacts/release_audit_20261017/code_alignment/pack_commits.tsv is
 # in the GitHub repository); e4e4886 is.
 SNAPSHOT_TAGS = {"code/tstep_probe_opt_v3", "code/tstep_probe_pack_v4_1"}
+# Date each evaluation revision was run (UTC), from docs/EVALUATION_PLAN_20261017.md
+# and docs/TSTEP_EVALUATION_20261018.md.
+EVAL_DATES = {"r2": "2026-10-17", "r3": "2026-10-18", "r4": "2026-10-18", "t1": "2026-10-18"}
 PUBLISHED_TRAINING_CODE = {"commit e4e4886"}
 
 # Release class -> remaining-work category used in the reports.
@@ -64,8 +67,8 @@ CLASSES = {
 FIELDS = [
     "group", "experiment_id", "scope", "model", "probe", "layer", "prefix", "timestep",
     "inventory_training_status", "inventory_correctness_status", "inventory_result_status",
-    "inventory_checkpoint_tensor_status", "release_class", "remaining_work_category",
-    "eval_status", "eval_table", "eval_revision", "eval_scope", "training_code_tag",
+    "inventory_checkpoint_tensor_status", "inventory_observed_at", "release_class", "remaining_work_category",
+    "eval_status", "eval_table", "eval_revision", "eval_date", "eval_scope", "training_code_tag",
     "eval_pack", "primary_metric", "primary_value", "primary_ci_low", "primary_ci_high",
     "n_loader", "n_scored", "checkpoint_replaced", "accepted_checkpoint_sha256",
     "caveats", "c3_variant", "c3_intervention_validity", "c3_ci_low", "c3_ci_high",
@@ -165,6 +168,7 @@ def build() -> tuple[str, str]:
                 "inventory_correctness_status": inv["correctness_status"],
                 "inventory_result_status": inv["result_status"],
                 "inventory_checkpoint_tensor_status": inv.get("checkpoint_tensor_status", ""),
+                "inventory_observed_at": inv.get("observed_at", ""),
                 "release_class": release_class,
                 "remaining_work_category": CLASSES[release_class],
                 "eval_status": "NOT_EVALUATED", "checkpoint_replaced": "",
@@ -175,7 +179,8 @@ def build() -> tuple[str, str]:
                 replaced = replaced and acc["scope"].startswith(("canonical_v2_b2_fp32", "tstep_b2_fp32"))
                 row.update({
                     "eval_status": "ACCEPTED_V2", "eval_table": table_name,
-                    "eval_revision": acc.get("eval_revision", "t1"), "eval_scope": acc["scope"],
+                    "eval_revision": acc.get("eval_revision", "t1"),
+                    "eval_date": EVAL_DATES[acc.get("eval_revision", "t1")], "eval_scope": acc["scope"],
                     **{k: acc[k] for k in ("training_code_tag", "eval_pack", "primary_metric", "primary_value",
                                            "primary_ci_low", "primary_ci_high", "n_loader", "n_scored")},
                     "checkpoint_replaced": str(replaced).lower(),
@@ -211,6 +216,7 @@ def build() -> tuple[str, str]:
         "unit": "trained run; C3-from-C1 is an evaluation attached to its C1 run",
         "inventory_observed": "2026-10-16 (training completion, checkpoint tensor validity)",
         "evaluations_accepted": "2026-10-17/18 (v2 evaluator, val split, seed 42)",
+        "c3_from_c1_evaluated": "2026-10-18 (main tree 206c5de)",
         "inputs": {name: {"path": str(path.relative_to(ROOT)), "sha256": sha256(path)}
                    for name, path in INPUTS.items()},
         "groups": {
