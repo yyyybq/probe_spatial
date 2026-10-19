@@ -27,6 +27,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -49,6 +50,14 @@ OUT_JSON = INV / "release_status_20261019_summary.json"
 # commits in artifacts/release_audit_20261017/code_alignment/pack_commits.tsv is
 # in the GitHub repository); e4e4886 is.
 SNAPSHOT_TAGS = {"code/tstep_probe_opt_v3", "code/tstep_probe_pack_v4_1"}
+# Training samples per epoch. Lightning drops the last partial training batch, so
+# steps per epoch = samples // batch size; the checkpoint name epoch=E-step=S gives
+# steps per epoch = S / (E + 1), from which the training batch size is inferred.
+TRAIN_SAMPLES = {"canonical_v2_minimax_all_layers_20261011": 1523}
+DEFAULT_TRAIN_SAMPLES = 2445
+# The frozen probe552 queue (scripts/build_probe816_frozen_queue.py) trains every
+# canonical probe at batch size 2; other canonical batch sizes are flagged.
+CANONICAL_BATCH_SIZE = 2
 # Date each evaluation revision was run (UTC), from docs/EVALUATION_PLAN_20261017.md
 # and docs/TSTEP_EVALUATION_20261018.md.
 EVAL_DATES = {"r2": "2026-10-17", "r3": "2026-10-18", "r4": "2026-10-18", "t1": "2026-10-18"}
@@ -70,7 +79,7 @@ FIELDS = [
     "inventory_checkpoint_tensor_status", "inventory_observed_at", "release_class", "remaining_work_category",
     "eval_status", "eval_table", "eval_revision", "eval_date", "eval_scope", "training_code_tag",
     "eval_pack", "primary_metric", "primary_value", "primary_ci_low", "primary_ci_high",
-    "n_loader", "n_scored", "checkpoint_replaced", "accepted_checkpoint_sha256",
+    "n_loader", "n_scored", "train_batch_size_inferred", "checkpoint_replaced", "accepted_checkpoint_sha256",
     "caveats", "c3_variant", "c3_intervention_validity", "c3_ci_low", "c3_ci_high",
 ]
 
@@ -117,8 +126,22 @@ def classify(group: str, inv: dict[str, str], accepted: dict | None, stage5: set
     raise SystemExit(f"{group}: unclassified run without accepted evaluation: {inv['experiment_id']}")
 
 
-def caveats(group: str, acc: dict[str, str], replaced: bool) -> list[str]:
+def inferred_batch_size(checkpoint_path: str, scope: str) -> str:
+    match = re.search(r"epoch=(\d+)-step=(\d+)", checkpoint_path)
+    if not match:
+        return ""
+    epochs, steps = int(match.group(1)) + 1, int(match.group(2))
+    if steps % epochs:
+        return ""
+    samples = TRAIN_SAMPLES.get(scope, DEFAULT_TRAIN_SAMPLES)
+    sizes = [b for b in (1, 2, 3, 4, 6, 8) if samples // b == steps // epochs]
+    return str(sizes[0]) if len(sizes) == 1 else ""
+
+
+def caveats(group: str, acc: dict[str, str], replaced: bool, batch_size: str) -> list[str]:
     out = ["VAL_SPLIT_SEED42_ONLY"]
+    if group == "canonical_v2" and batch_size and int(batch_size) != CANONICAL_BATCH_SIZE:
+        out.append(f"TRAIN_BATCH_SIZE_{batch_size}_NOT_CANONICAL_{CANONICAL_BATCH_SIZE}")
     if acc["scope"] == "canonical_v2_minimax_all_layers_20261011":
         out.append("VAL_171_SAMPLES_NOT_COMPARABLE_TO_276")
     if acc["training_code_tag"] in SNAPSHOT_TAGS:
@@ -177,15 +200,17 @@ def build() -> tuple[str, str]:
                 seen[group].add(key)
                 replaced = Path(acc["checkpoint_path"]).parts[-6:] != Path(inv["checkpoint_path"]).parts[-6:]
                 replaced = replaced and acc["scope"].startswith(("canonical_v2_b2_fp32", "tstep_b2_fp32"))
+                batch_size = inferred_batch_size(acc["checkpoint_path"], acc["scope"])
                 row.update({
                     "eval_status": "ACCEPTED_V2", "eval_table": table_name,
                     "eval_revision": acc.get("eval_revision", "t1"),
                     "eval_date": EVAL_DATES[acc.get("eval_revision", "t1")], "eval_scope": acc["scope"],
                     **{k: acc[k] for k in ("training_code_tag", "eval_pack", "primary_metric", "primary_value",
                                            "primary_ci_low", "primary_ci_high", "n_loader", "n_scored")},
+                    "train_batch_size_inferred": batch_size,
                     "checkpoint_replaced": str(replaced).lower(),
                     "accepted_checkpoint_sha256": acc["checkpoint_sha256"],
-                    "caveats": ";".join(caveats(group, acc, replaced)),
+                    "caveats": ";".join(caveats(group, acc, replaced, batch_size)),
                 })
                 if key in c3:
                     row.update({"c3_variant": c3[key]["variant"],
@@ -225,6 +250,9 @@ def build() -> tuple[str, str]:
                 "release_class": count(group, "release_class"),
                 "accepted_by_eval_scope": dict(sorted(Counter(
                     r["eval_scope"] for r in rows if r["group"] == group and r.get("eval_scope")).items())),
+                "accepted_by_inferred_train_batch_size": dict(sorted(Counter(
+                    r["train_batch_size_inferred"] or "unknown"
+                    for r in rows if r["group"] == group and r.get("eval_status") == "ACCEPTED_V2").items())),
                 "checkpoint_replaced_by_fp32_retrain": sum(
                     1 for r in rows if r["group"] == group and r.get("checkpoint_replaced") == "true"),
             }

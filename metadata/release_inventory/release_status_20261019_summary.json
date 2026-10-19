@@ -45,6 +45,11 @@
         "canonical_v2_minimax_l30_ab16": 16,
         "canonical_v2_wan168": 140
       },
+      "accepted_by_inferred_train_batch_size": {
+        "1": 92,
+        "2": 656,
+        "4": 56
+      },
       "checkpoint_replaced_by_fp32_retrain": 16
     },
     "timestep": {
@@ -59,6 +64,10 @@
         "tstep_b2_fp32_retrain_20261016": 32,
         "tstep_probe_opt_v3": 254,
         "tstep_probe_pack_v4_1": 30
+      },
+      "accepted_by_inferred_train_batch_size": {
+        "1": 96,
+        "2": 220
       },
       "checkpoint_replaced_by_fp32_retrain": 32
     }
