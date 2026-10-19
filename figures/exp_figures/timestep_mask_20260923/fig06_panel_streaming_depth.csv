@@ -1,0 +1,7 @@
+model,task,timestep,layer,prefixes,metric_value
+wan,A1 Depth,499,20,"8,12,16,24",0.3873407170176506
+wan,A1 Depth,999,20,"8,12,16,24",0.4300670176744461
+cogvideox,A1 Depth,499,20,"8,12,16,24",0.4491110071539879
+cogvideox,A1 Depth,999,20,"8,12,16,24",0.46710280328989023
+minimax_h3,A1 Depth,500,20,"8,12,16,24",
+minimax_h3,A1 Depth,1000,20,"8,12,16,24",

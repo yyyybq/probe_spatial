@@ -1,0 +1,53 @@
+\section{Can latent representations be updated by ordered camera motion?}
+\label{sec:se3_one_step_generalization}
+
+When a camera moves from view $A$ to $B$ and then to $C$, we ask whether a
+frozen visual representation can be updated according to the measured 3D
+camera motion, and whether that update preserves motion composition and order.
+We train an external recurrent diagnostic head---not the foundation model's
+native predictor---only on observed one-step transitions: from a causal p12
+streaming state ending at $A$ and the rigid transform $T_1=T_{AB}$, it
+predicts the isolated target representation at $B$. At test time, the same
+updater and checkpoint must reach view $C$ through two alternative executions,
+\begin{align}
+\hat z_{\rm seq} &= D\!\left(U(U(s_A,T_1),T_2)\right), &
+\hat z_{\rm dir} &= D\!\left(U(s_A,T_2T_1)\right),
+\end{align}
+where $T_2=T_{BC}$ and the direct path first composes the motions as SE(3)
+matrices. Composition consistency asks whether these two routes produce similar
+predictions while remaining close to the real endpoint $z_C$. To test whether
+the update also preserves order, we reverse the inputs,
+$\hat z_{\rm swap}=D(U(U(s_A,T_2),T_1))$, and ask whether the correct-order
+prediction is closer to $z_C$.
+
+On the frozen exact-v2 split (436 tuples, seven Wan layers, five V-JEPA2 layers,
+and seeds 42--46), every layer improves two-step endpoint prediction over
+copying $A$; all but Wan L0 also improve over a predictor that does not receive
+the camera motion. Thus the diagnostic head uses motion information rather
+than only static scene persistence. At the predeclared representative layers,
+the normalized sequential--direct distance is
+0.0377 for Wan L15 and
+0.0232 for V-JEPA2 L11. Their paired difference is
+0.0145 (95\% CI
+[0.0107,
+0.0188],
+$p_{\rm Holm}<0.004$), providing evidence only for greater composition
+consistency at this specified layer pair and metric, not an overall model
+ranking. In contrast, neither model shows a robust control-adjusted preference
+for the correct motion order, including among trajectories with large physical
+non-commutativity.
+
+Action-only, matched-shuffle, additive, and identity-padding checks do not
+reveal a hidden stable order effect; identity is outside the training-action
+support and is treated only as a stress test. The analytic SE(3) oracle passes,
+whereas the learned GRU positive control trained with the same one-step
+objective has sequential RMSE 0.7010\,m and no reliable order margin,
+despite the oracle's positive margin of 0.1107\,m. Therefore, useful
+motion-conditioned endpoint prediction does not by itself establish an
+order-preserving latent group action, and the weak order signal cannot be
+attributed uniquely to the frozen representation rather than to one-step probe
+generalization. Finally, the 276 evaluation tuples are new frame triples from
+the same 69 scenes as the legacy pilot, so this is development evidence rather
+than an independent-scene confirmation.
+
+\input{table_representative.tex}

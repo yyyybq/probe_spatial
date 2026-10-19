@@ -1,0 +1,379 @@
+{
+  "sources": {
+    "results/analysis/q00_1096_v1_mask_validated_20260924_r2/data/fig03_layer_statistics.csv": {
+      "sha256": "db76c8c8ef2a09ec6a4302f2d2042bdae768baebb271795cacab411d3222bb60"
+    },
+    "results/analysis/q00_1096_v1_mask_validated_20260924_r2/data/fig04_prefix_statistics.csv": {
+      "sha256": "4454a05706b120537a6533a1a3775a7af2c2b287c6d2e542c74d01e09ddd9ee4"
+    },
+    "experiments/d_series_scannetpp_v1/diagnostics/dseries_vjepa2_d1_d3_three_seed_20260917_zoetrope_r1/across_seed_metrics.csv": {
+      "sha256": "262c6732324d3a9595448b1e40b87bb8c7d96c80dfbc54ddccb351d8c8889617"
+    },
+    "results/independent_goal_conditioned_continuous_action_p8_relational_v2_20260923/continuous_action_paired_effects.csv": {
+      "sha256": "b55aa5e5d69bccc5dae00aef2ba11cb33f7cfa2b0efbcd43ac8a29e6aa1d9047"
+    }
+  },
+  "data": {
+    "layer_peaks": {
+      "models": [
+        "videomae",
+        "vjepa2",
+        "wan",
+        "cogvideox"
+      ],
+      "tasks": [
+        "A1 Geometry",
+        "A1 Mask",
+        "A2 View",
+        "B2 Persistence",
+        "C1 Dynamics",
+        "C2 Integration"
+      ],
+      "normalized_depth": [
+        [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          0.7391304347826086,
+          0.7391304347826086
+        ],
+        [
+          0.7391304347826086,
+          0.4782608695652174,
+          0.4782608695652174,
+          0.7391304347826086,
+          0.21739130434782608,
+          0.21739130434782608
+        ],
+        [
+          0.8620689655172413,
+          0.6896551724137931,
+          0.5172413793103449,
+          0.5172413793103449,
+          0.3448275862068966,
+          0.5172413793103449
+        ],
+        [
+          0.36585365853658536,
+          0.4878048780487805,
+          0.36585365853658536,
+          0.24390243902439024,
+          0.4878048780487805,
+          0.4878048780487805
+        ]
+      ],
+      "layer_indices": [
+        [
+          23,
+          23,
+          23,
+          23,
+          17,
+          17
+        ],
+        [
+          17,
+          11,
+          11,
+          17,
+          5,
+          5
+        ],
+        [
+          25,
+          20,
+          15,
+          15,
+          10,
+          15
+        ],
+        [
+          15,
+          20,
+          15,
+          10,
+          20,
+          20
+        ]
+      ],
+      "single_measured_layer": [
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          true,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          true,
+          false,
+          false,
+          true,
+          true
+        ]
+      ]
+    },
+    "prefix_effects": {
+      "models": [
+        "dino",
+        "f3r",
+        "videomae",
+        "vjepa2",
+        "qwen2_5_vl",
+        "wan",
+        "cogvideox",
+        "aether"
+      ],
+      "tasks": [
+        "A1 Depth",
+        "A1 Mask",
+        "A1 Camera",
+        "A2 View",
+        "B2 Persistence",
+        "C1 Dynamics",
+        "C2 Integration"
+      ],
+      "standardized_delta": [
+        [
+          0.10097452652689945,
+          0.02336279127223621,
+          -0.3753334324416237,
+          0.012022848918045765,
+          -1.2873389887256426,
+          -0.16351551099660033,
+          -2.336252761303583
+        ],
+        [
+          0.1110003660402087,
+          0.0041042741424199385,
+          0.3753334324416237,
+          -0.00826570863115615,
+          null,
+          0.02725259917638637,
+          -0.11829128627000247
+        ],
+        [
+          -0.664569933453636,
+          -3.3418262921164823,
+          -1.4227515235252737,
+          -0.6041481581317826,
+          -0.6780989318515125,
+          -0.4360414747398917,
+          -2.070097270276361
+        ],
+        [
+          -0.002864525575231272,
+          -0.45202265410843395,
+          -0.7258514313333881,
+          -0.12548848558209943,
+          -0.7163947250353383,
+          -0.027252585166100192,
+          -0.11829112663753294
+        ],
+        [
+          0.16829087754483235,
+          -0.2908115014951152,
+          -0.2605620522735239,
+          0.05560567624595979,
+          -0.41777011725546226,
+          -0.19076832032728414,
+          -2.2475341426697693
+        ],
+        [
+          -0.3129494190940072,
+          -1.3304162489351778,
+          -0.585230641217518,
+          -0.24346269059041964,
+          -1.2742467533166084,
+          -0.43604147473989263,
+          -0.14786409073402604
+        ],
+        [
+          -0.1654263519696013,
+          -1.3566993891164432,
+          -0.3443141405042994,
+          -0.4501054063693259,
+          -1.1956071247021829,
+          0.08175778351887293,
+          -0.17743690660036693
+        ],
+        [
+          -0.32225912721350913,
+          -3.7813782670998712,
+          -0.287445438619205,
+          -0.1630598884509914,
+          -0.49621306686314387,
+          -0.027252592171243668,
+          -0.0295728187169201
+        ]
+      ]
+    },
+    "prediction": [
+      {
+        "horizon": 2,
+        "condition": "native_target_reference",
+        "mean": 0.18244095589371695,
+        "sd": 0.0002878338872442153
+      },
+      {
+        "horizon": 2,
+        "condition": "frozen_readout_transfer",
+        "mean": 0.2458928549338294,
+        "sd": 0.005787160544774567
+      },
+      {
+        "horizon": 2,
+        "condition": "retrained_same_capacity_readout",
+        "mean": 0.22328758268540608,
+        "sd": 0.0008241897499896842
+      },
+      {
+        "horizon": 2,
+        "condition": "last_context",
+        "mean": 0.2889846683016434,
+        "sd": 0.004370422304153636
+      },
+      {
+        "horizon": 4,
+        "condition": "native_target_reference",
+        "mean": 0.182739342459374,
+        "sd": 0.00032993083825709366
+      },
+      {
+        "horizon": 4,
+        "condition": "frozen_readout_transfer",
+        "mean": 0.24266850981177485,
+        "sd": 0.005394378765017992
+      },
+      {
+        "horizon": 4,
+        "condition": "retrained_same_capacity_readout",
+        "mean": 0.22709435087309224,
+        "sd": 0.0004893378583271095
+      },
+      {
+        "horizon": 4,
+        "condition": "last_context",
+        "mean": 0.29739969015877316,
+        "sd": 0.004130437054599965
+      }
+    ],
+    "action": [
+      {
+        "model": "dino",
+        "comparison": "full_relational_minus_goal_only",
+        "metric": "positive_progress",
+        "estimate_pp": 13.750000000000002,
+        "ci_low_pp": 7.61167869141378,
+        "ci_high_pp": 20.153861003861003
+      },
+      {
+        "model": "f3r",
+        "comparison": "full_relational_minus_goal_only",
+        "metric": "positive_progress",
+        "estimate_pp": 13.28125,
+        "ci_low_pp": 6.665999999999999,
+        "ci_high_pp": 19.92613636363634
+      },
+      {
+        "model": "vjepa2",
+        "comparison": "full_relational_minus_goal_only",
+        "metric": "positive_progress",
+        "estimate_pp": 8.906249999999998,
+        "ci_low_pp": 2.5,
+        "ci_high_pp": 15.313408430232547
+      },
+      {
+        "model": "wan",
+        "comparison": "full_relational_minus_goal_only",
+        "metric": "positive_progress",
+        "estimate_pp": 6.015625,
+        "ci_low_pp": 0.571199082042456,
+        "ci_high_pp": 11.278683349595354
+      },
+      {
+        "model": "dino",
+        "comparison": "full_relational_minus_current_only",
+        "metric": "positive_progress",
+        "estimate_pp": -2.03125,
+        "ci_low_pp": -4.5418399661427555,
+        "ci_high_pp": 0.5324213685299289
+      },
+      {
+        "model": "f3r",
+        "comparison": "full_relational_minus_current_only",
+        "metric": "positive_progress",
+        "estimate_pp": -2.109375,
+        "ci_low_pp": -5.426697674418604,
+        "ci_high_pp": 1.417470288124095
+      },
+      {
+        "model": "vjepa2",
+        "comparison": "full_relational_minus_current_only",
+        "metric": "positive_progress",
+        "estimate_pp": -3.5937499999999996,
+        "ci_low_pp": -6.932433531181396,
+        "ci_high_pp": -0.39992063492063573
+      },
+      {
+        "model": "wan",
+        "comparison": "full_relational_minus_current_only",
+        "metric": "positive_progress",
+        "estimate_pp": -2.5000000000000004,
+        "ci_low_pp": -6.022349621534465,
+        "ci_high_pp": 0.9836376055638347
+      },
+      {
+        "model": "dino",
+        "comparison": "correct_goal_minus_inference_shuffled_goal",
+        "metric": "positive_progress",
+        "estimate_pp": 0.7812500000000002,
+        "ci_low_pp": -2.1167883211678835,
+        "ci_high_pp": 3.694846613344132
+      },
+      {
+        "model": "f3r",
+        "comparison": "correct_goal_minus_inference_shuffled_goal",
+        "metric": "positive_progress",
+        "estimate_pp": 1.1718750000000002,
+        "ci_low_pp": -2.656938162123557,
+        "ci_high_pp": 5.20018867924528
+      },
+      {
+        "model": "vjepa2",
+        "comparison": "correct_goal_minus_inference_shuffled_goal",
+        "metric": "positive_progress",
+        "estimate_pp": 0.3125,
+        "ci_low_pp": -2.8574355971896956,
+        "ci_high_pp": 3.5857105927435304
+      },
+      {
+        "model": "wan",
+        "comparison": "correct_goal_minus_inference_shuffled_goal",
+        "metric": "positive_progress",
+        "estimate_pp": -2.2656250000000004,
+        "ci_low_pp": -6.279069767441861,
+        "ci_high_pp": 1.6669999999999952
+      }
+    ]
+  }
+}

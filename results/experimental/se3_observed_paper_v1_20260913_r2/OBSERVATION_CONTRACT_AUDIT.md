@@ -1,0 +1,10 @@
+# Observation-contract audit
+
+Gate: **PASS only for the target-isolated causal/update track**. Every state A/B/C is extracted without future endpoint content. The cells are not declared observationally equivalent: repeated-frame count, architecture, pooling, and diffusion computation differ.
+
+- **DINOv2-L:** 1 input frame(s); one RGB frame; no repetition is passed to DINO. Representation: target_isolated anchor token map; pooling: spatial mean over 30x52 patch tokens; condition: N/A deterministic encoder.
+- **Fast3R ViT-L:** 64 input frame(s); the same isolated RGB frame repeated 64 times and jointly encoded by multiview inference. Representation: target_isolated middle repeated-view output; pooling: spatial mean over 18x32 tokens; condition: N/A (deterministic intent; multiview inference API accepts RNG).
+- **V-JEPA2 ViT-L:** 64 input frame(s); the same isolated RGB frame repeated 64 times; tubelet encoder only. Representation: target_isolated encoder output; skip_predictor=True; pooling: middle temporal token then spatial mean over 16x16; condition: N/A deterministic encoder.
+- **CogVideoX-5B-I2V:** 97 input frame(s); the same isolated RGB frame repeated 97 times; I2V transformer receives no other video content. Representation: target_isolated diffusion-transformer hidden state; pooling: middle latent-time token then spatial mean; condition: CogVideoXDDIMScheduler index 749 -> scheduler timestep 250, log-SNR 0.629856 under current cached scheduler; historical noise seed absent.
+
+`p8` denotes tuple selection/cache naming, not eight-frame history. DINO consumes one image; the video backbones receive repetitions of that same isolated image. Hence no model sees B while encoding A or C while encoding A/B. Historical checkpoint revisions are not retroactively claimed where the producing artifacts did not bind them. CogVideoX scheduler semantics are recorded, while its historical noise seed remains unbound. Those gaps prohibit a stronger extraction-level causal comparison but do not introduce endpoint leakage into this frozen target-isolated analysis.

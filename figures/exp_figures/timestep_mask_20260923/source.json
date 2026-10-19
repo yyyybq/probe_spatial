@@ -1,0 +1,12 @@
+{
+  "source": "results/analysis/tstep_canonical_v2_seeded_v1/results.csv",
+  "version": "canonical-v2 seeded-v1; separate from V1 main benchmark",
+  "generator": "analyses/tstep_canonical_v2/build_paper_timestep_figure.py",
+  "display_tasks": [
+    "Metric geometry: depth",
+    "Instance identity",
+    "View consistency",
+    "Out-of-view object localization"
+  ],
+  "C3_included": false
+}

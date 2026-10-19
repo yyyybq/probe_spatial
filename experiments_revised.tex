@@ -1,0 +1,468 @@
+% Drop-in replacement for the experiment section.
+% Required packages: booktabs, tabularx, graphicx.
+% The main-table numbers and Figures 1--5 are intentionally placeholders until
+% the frozen p8 results are regenerated.  Existing q00_1096 figures average
+% prefixes and therefore must not be relabeled as p8 results.
+
+\providecommand{\TBD}{\textit{TBD}}
+\providecommand{\model}[1]{\textsc{#1}}
+\providecommand{\figplaceholder}[2][3.1cm]{%
+  \fbox{\parbox[c][#1][c]{0.94\linewidth}{\centering\small #2}}}
+
+\section{Experiments}
+\label{sec:experiments}
+
+We ask three questions: which spatial capabilities are accessible in a frozen
+video representation, where in the network they emerge, and when additional
+temporal evidence helps.  All probes operate on causal ScanNet++ prefixes and
+use scene-disjoint splits.  Unless stated otherwise, the backbone is frozen,
+the prefix contains eight observations (p8), and each model is evaluated at one
+registered representative layer.  Longer prefixes and layer sweeps are analyzed
+separately, rather than selected post hoc for the headline table.
+
+\subsection{Main benchmark}
+\label{sec:main-benchmark}
+
+\paragraph{Capabilities and metrics.}
+Table~\ref{tab:benchmark-tasks} summarizes the six tasks.  We retain the short
+codes only as table indices; throughout the text we refer to the capabilities
+by their scientific names.  The geometry tasks test metric scene structure and
+cross-view correspondence.  Hidden-object persistence asks whether a queried
+object remains localized after leaving the view.  The three dynamics tasks then
+test one-step update, multi-step integration, and sensitivity to an alternative
+camera action.
+
+\begin{table*}[t]
+  \centering
+  \caption{\textbf{Benchmark axes and tasks.}  Targets are constructed from the
+  same causal stream, while future target features used by the dynamics tasks
+  are extracted from isolated target frames.  Higher is better except for depth
+  loss and angular error.}
+  \label{tab:benchmark-tasks}
+  \small
+  \begin{tabularx}{\textwidth}{@{}llXXXl@{}}
+    \toprule
+    ID & Capability & Probe input & Prediction target & What success shows & Metric \\
+    \midrule
+    A1 & Metric geometry & Streaming visual features & Depth and camera pose &
+      Metric 3D structure is directly readable & Depth loss $\downarrow$; AUC@30 $\uparrow$ \\
+    A2 & View correspondence & A pair of streaming views & View-overlap label &
+      Scene identity survives viewpoint change & Balanced accuracy $\uparrow$ \\
+    B2 & Hidden-object persistence & Object query and causal history &
+      Object bearing in the final camera frame & An occluded object state is retained &
+      Angular error (deg) $\downarrow$ \\
+    C1 & One-step dynamics & Context and one 9D relative pose &
+      Isolated next-state feature & The state can be updated by an action &
+      Global R@1 $\uparrow$ \\
+    C2 & Path integration & Context and a pose sequence &
+      Features at successive waypoints & Egomotion can be accumulated &
+      Global R@1 $\uparrow$ \\
+    C3 & Counterfactual update & Shared context and alternative poses &
+      Intervention-specific target features & Predictions change with the intervention &
+      Intervention validity $\uparrow$ \\
+    \bottomrule
+  \end{tabularx}
+\end{table*}
+
+\paragraph{Models and default operating point.}
+We compare ten frozen representations spanning image encoders, masked and
+predictive video encoders, explicit 3D reconstruction, multimodal encoders, and
+video generators: DINOv2-L, VideoMAE-L, V-JEPA2 ViT-L, Fast3R ViT-L,
+Qwen2.5-VL-7B, Wan2.1-T2V-1.3B, CogVideoX-5B-I2V, AetherV1, MiniMax-H3, and
+LingBot-Video MoE-30B-A3B.  Their representative layer indices are respectively
+$0,23,23,24,-1,20,20,1,30,$ and $30$; indices $0$ for DINOv2 and $-1$ for
+Qwen2.5-VL denote their single exported final representation and visual merger.
+For diffusion models, the default extraction point is scheduler index 749 for
+Wan, CogVideoX, and Aether; MiniMax-H3 and LingBot use flow coordinate $0.25$.
+
+\begin{table*}[t]
+  \centering
+  \caption{\textbf{Main results at the fixed representative layer and p8.}
+  Results are reported in native units; bold and underline indicate the best
+  and second-best model per column.  No overall average is reported because the
+  tasks measure distinct capabilities.  Cells marked \TBD{} await the frozen
+  p8 export.}
+  \label{tab:main-results}
+  \setlength{\tabcolsep}{3.7pt}
+  \small
+  \begin{tabular}{@{}lrrrrrrr@{}}
+    \toprule
+    Model (layer) & Depth $\downarrow$ & Camera $\uparrow$ & View $\uparrow$ &
+    Persistence $\downarrow$ & One-step $\uparrow$ & Integration $\uparrow$ &
+    Counterfactual $\uparrow$ \\
+    \midrule
+    \model{DINOv2-L} (0)       & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \model{Fast3R} (24)        & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \model{VideoMAE-L} (23)    & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \model{V-JEPA2-L} (23)     & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \model{Qwen2.5-VL} ($-1$) & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \model{Wan} (20)           & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \model{CogVideoX} (20)     & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \model{Aether} (1)         & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \model{MiniMax-H3} (30)    & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \model{LingBot-Video} (30) & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\paragraph{A spatial capability atlas.}
+Raw metrics cannot be averaged because they have different units and
+directions.  Figure~\ref{fig:capability-atlas} therefore converts each column of
+Table~\ref{tab:main-results} to a within-task percentile after orienting all
+metrics so that larger is better.  The resulting atlas reveals specialization:
+geometry, persistence, and action-conditioned prediction do not induce a single
+model ranking.  In particular, strong direct geometry need not imply strong
+dynamics, and the best model changes across one-step, integration, and
+counterfactual prediction.
+
+\begin{figure*}[t]
+  \centering
+  \IfFileExists{figures/paper/fig01_capability_atlas_p8.pdf}{%
+    \includegraphics[width=0.92\textwidth]{figures/paper/fig01_capability_atlas_p8.pdf}%
+  }{\figplaceholder[5.0cm]{\textbf{Figure 1 placeholder: Spatial Capability Atlas}\\[2mm]
+      Rows: 10 models. Columns: Depth, Camera, View, Persistence, One-step,
+      Integration, Counterfactual.\\
+      Cell color: within-capability percentile at the fixed layer and p8.}}
+  \caption{\textbf{Spatial Capability Atlas.}  Task-wise normalization is used
+  only for visualization; all statistical comparisons use native metrics.
+  This figure answers \emph{which model exposes which spatial capability?}}
+  \label{fig:capability-atlas}
+\end{figure*}
+
+\paragraph{Geometry is not dynamics.}
+Figure~\ref{fig:geometry-dynamics} averages normalized depth, camera, and view
+scores on the horizontal axis and C1--C3 on the vertical axis, placing each
+model at one fixed operating point.  The models do not collapse onto a common
+diagonal, and the
+leaders on the two axes differ.  Spatial competence is therefore better
+described as a profile than as a scalar ``spatial score.''  B2 is kept separate
+because persistence combines geometric readout with memory.
+
+\begin{figure}[t]
+  \centering
+  \IfFileExists{figures/paper/fig02_geometry_vs_dynamics_p8.pdf}{%
+    \includegraphics[width=\columnwidth]{figures/paper/fig02_geometry_vs_dynamics_p8.pdf}%
+  }{\figplaceholder[4.1cm]{\textbf{Figure 2 placeholder: Geometry vs. Dynamics}\\[2mm]
+      One labeled point per model.\\
+      $x$: mean normalized A1/A2; $y$: mean normalized C1--C3.}}
+  \caption{\textbf{Geometry versus dynamics.}  Marker color may encode model
+  family and marker size B2 performance.  The plot tests whether spatial
+  capability is well represented by one common scalar.}
+  \label{fig:geometry-dynamics}
+\end{figure}
+
+\subsection{Where and when do capabilities emerge?}
+\label{sec:layer-prefix-analysis}
+
+\paragraph{Layer-wise emergence.}
+We next restore all registered layers and plot a separate curve for each prefix
+in Figure~\ref{fig:layer-emergence}.  Layer depth is normalized within a model,
+and scores are normalized within a model--task pair; neither the layer nor the
+prefix is selected by validation performance.  The curves are task-specific
+and frequently non-monotonic.  Across V-JEPA2, VideoMAE, and Wan, geometry tends
+to peak deeper than one-step dynamics, which often favors early or middle
+blocks.  This is a tendency rather than a universal ordering: counterfactual and
+persistence readouts can peak later, and the maximizing layer can change with
+the prefix.
+
+\begin{figure*}[t]
+  \centering
+  \IfFileExists{figures/paper/fig03_layer_emergence_by_prefix.pdf}{%
+    \includegraphics[width=0.98\textwidth]{figures/paper/fig03_layer_emergence_by_prefix.pdf}%
+  }{\figplaceholder[5.0cm]{\textbf{Figure 3 placeholder: Capability emergence across layers}\\[2mm]
+      Small multiples by capability; $x$: normalized layer depth; $y$: oriented,
+      within-sweep score.\\
+      Four lines per panel: p8, p12, p16, p24; one row per multi-layer model.}}
+  \caption{\textbf{Capability emergence across layers.}  Multiple prefixes are
+  shown explicitly rather than averaged.  The figure asks where a capability
+  becomes readable and whether that location is stable under additional
+  temporal evidence.}
+  \label{fig:layer-emergence}
+\end{figure*}
+
+\paragraph{Longer history is capability-dependent.}
+At each model's fixed representative layer, Figure~\ref{fig:prefix-integration}
+reports the oriented difference between p24 and p8, standardized by the
+task-level score variation.  Most model--task cells are non-positive: extra
+frames commonly saturate or interfere with hidden-object localization and
+action readout.  The effect is nevertheless structured rather than uniformly
+negative.  At V-JEPA2's fixed layer, camera geometry and counterfactual update
+provide positive cases, while depth and view do not improve from p8 to p24.
+Their full layer--prefix surfaces nevertheless contain benefits at other
+depths, foreshadowing the interaction below.  Thus, long history is useful only
+when the representation and readout integrate the relevant temporal evidence.
+
+\begin{figure*}[t]
+  \centering
+  \IfFileExists{figures/paper/fig04_prefix_delta_p24_minus_p8.pdf}{%
+    \includegraphics[width=0.90\textwidth]{figures/paper/fig04_prefix_delta_p24_minus_p8.pdf}%
+  }{\figplaceholder[4.8cm]{\textbf{Figure 4 placeholder: Prefix integration}\\[2mm]
+      Model $\times$ capability heatmap at each model's fixed layer.\\
+      Cell value: oriented $(\mathrm{p24}-\mathrm{p8})/$ task standard deviation;
+      red hurts, blue helps.}}
+  \caption{\textbf{Prefix integration.}  Positive values mean that adding
+  observations improves the task.  Raw differences are standardized only to
+  share a color scale.  This figure asks whether more history is reliably useful.}
+  \label{fig:prefix-integration}
+\end{figure*}
+
+\paragraph{Layer--prefix interaction.}
+The one-dimensional summaries hide cases in which temporal evidence changes
+which layer is most useful.  Figure~\ref{fig:layer-prefix-cases} shows the full
+layer--prefix surface for four prespecified case studies.  V-JEPA2 depth and
+hidden-object persistence are especially informative because their best layer
+changes across prefixes; Wan persistence illustrates a middle-layer optimum,
+whereas CogVideoX persistence illustrates degradation with longer prefixes.
+These surfaces show that representation depth and temporal evidence are not
+independent experimental knobs.
+
+\begin{figure*}[t]
+  \centering
+  \IfFileExists{figures/paper/fig05_layer_prefix_cases.pdf}{%
+    \includegraphics[width=0.98\textwidth]{figures/paper/fig05_layer_prefix_cases.pdf}%
+  }{\figplaceholder[5.2cm]{\textbf{Figure 5 placeholder: Layer $\times$ Prefix case studies}\\[2mm]
+      Four heatmaps: V-JEPA2--Depth, V-JEPA2--Persistence,
+      Wan--Persistence, CogVideoX--Persistence.\\
+      $x$: p8/p12/p16/p24; $y$: layer; color: within-panel oriented score;
+      mark the best layer in every column.}}
+  \caption{\textbf{Layer--prefix interactions.}  Each panel is normalized
+  independently and should be interpreted by its shape, not by comparing color
+  values across tasks.}
+  \label{fig:layer-prefix-cases}
+\end{figure*}
+
+\paragraph{Main findings.}
+The main benchmark supports four conclusions.  First, spatial capabilities are
+specialized, so there is no universal ``strong-model'' ordering.  Second,
+readable spatial structure emerges at task-dependent and often non-monotonic
+depths.  Third, longer context is not uniformly beneficial: prediction and
+consistency sometimes improve, whereas localization and action readout often
+saturate or degrade.  Finally, the effect of history depends on representation
+depth; in V-JEPA2, for example, the optimal depth can move as the prefix grows.
+
+\subsection{Analysis experiments}
+\label{sec:analysis-experiments}
+
+The following experiments test whether the main scores reflect the intended
+mechanism rather than persistence, action priors, or feature-space shortcuts.
+
+\subsubsection{Does the probe use history and action?}
+\label{sec:analysis-controls}
+
+\paragraph{Action-conditioned prediction beyond persistence.}
+For Wan we fix p12, layer 20, and diffusion index 749.  A two-layer predictor
+receives causal feature maps and the 9D relative camera pose and predicts the
+spatially pooled feature of an isolated future frame.  Retrieval is performed
+against the entire validation target pool.  Table~\ref{tab:wan-c1-controls}
+shows that the correct action beats shuffled and zero-action evaluation, but
+does not reliably beat copying the last observed state.  The evidence therefore
+supports a weak action signal, not a strong dynamics claim.
+
+\begin{table}[t]
+  \centering
+  \caption{\textbf{Wan one-step controls} (p12, layer 20, $t=749$; 276 samples,
+  69 scenes).  Shuffle averages 100 cross-scene permutations.}
+  \label{tab:wan-c1-controls}
+  \small
+  \begin{tabularx}{\columnwidth}{@{}Xrr@{}}
+    \toprule
+    Condition & Global R@1 (\%) & $\Delta$ vs. correct (pp) \\
+    \midrule
+    Correct action & 15.22 & -- \\
+    Shuffled real action & 9.95 & $-5.26$ \\
+    Evaluation-time zero action & 5.43 & $-9.78$ \\
+    Copy last streaming state & 11.96 & $-3.26$ \\
+    Copy prefix-pooled state & 1.09 & $-14.13$ \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+Across all 275 observed wrong actions per sample, the correct action improves
+cosine similarity by $8.64\!\times\!10^{-4}$ with a scene-bootstrap 95\% CI of
+$[6.25\!\times\!10^{-4},1.13\!\times\!10^{-3}]$.  By contrast, its R@1 gain
+over last-state copy is $3.26$ points with CI $[-1.09,7.61]$ ($p=0.083$).
+Correct $>$ shuffled alone is therefore insufficient to rule out temporal
+smoothness.
+
+\paragraph{What part of history supports persistence?}
+We perform fixed-probe interventions on Wan B2 at the same layer and prefix.
+Removing all but the current frame increases angular error by
+$10.01^\circ$; removing complete frames in which the queried instance was
+visible increases it by $6.59^\circ$; and retaining the query without any visual
+history increases it by $13.55^\circ$ (Table~\ref{tab:b2-history-controls}).
+History content therefore matters, including frames that previously contained
+the target.  However, frame-order shuffling and reversal produce small changes
+whose confidence intervals include zero, so these interventions establish
+content dependence rather than a temporally ordered update rule.
+
+\begin{table}[t]
+  \centering
+  \caption{\textbf{Wan hidden-object history controls.}  Error increases are
+  paired against full history plus the correct query; confidence intervals use
+  scene/trajectory-clustered bootstrap.}
+  \label{tab:b2-history-controls}
+  \small
+  \begin{tabularx}{\columnwidth}{@{}Xrr@{}}
+    \toprule
+    Input intervention & $\Delta$ error & 95\% CI \\
+    \midrule
+    Current frame + query only & $+10.01^\circ$ & $[3.42,16.69]$ \\
+    Remove target-visible frames & $+6.59^\circ$ & $[0.58,12.91]$ \\
+    Query only; no visual history & $+13.55^\circ$ & $[7.31,19.61]$ \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+Query masking, same-scene query swapping, frame-order shuffling, and history
+reversal complete the control battery.  These are inference-time diagnostics:
+zeroing a query feature is not equivalent to retraining a probe without a query
+token, and a shuffled sequence is not a physically observed trajectory.
+
+\subsubsection{Spatial information across denoising time}
+\label{sec:timestep-analysis}
+
+Video generators expose representations at a chosen noise or flow coordinate.
+We therefore repeat the benchmark for Wan and CogVideoX at scheduler indices
+$\{499,999\}$, with the default 749 as reference, and for MiniMax-H3 at flow
+coordinates $\{0.5,1.0\}$, with the default $0.25$ as reference.  The canonical
+extraction grid contains layers $\{15,20,25\}$ and prefixes
+$\{8,12,16,24\}$ for both streaming and isolated-target features.  The primary
+comparison fixes layer 20 and p8; the larger grid is used only to check whether
+a timestep effect is stable across depth and history.
+
+\begin{figure*}[t]
+  \centering
+  \IfFileExists{figures/paper/fig06_timestep_analysis.pdf}{%
+    \includegraphics[width=0.95\textwidth]{figures/paper/fig06_timestep_analysis.pdf}%
+  }{\figplaceholder[4.6cm]{\textbf{Analysis figure placeholder: Denoising timestep}\\[2mm]
+      Three panels (Wan, CogVideoX, MiniMax-H3).\\
+      $x$: scheduler/noise coordinate; $y$: normalized capability score;
+      lines: geometry, persistence, dynamics.}}
+  \caption{\textbf{Spatial information across denoising time.}  This analysis
+  tests whether spatial information is concentrated at a particular generation
+  stage.  Feature extraction/probing is in progress; no timestep conclusion is
+  drawn from the current artifacts.}
+  \label{fig:timestep-analysis}
+\end{figure*}
+
+\subsubsection{Can a frozen representation support action output?}
+\label{sec:action-output}
+
+To close the perception--action loop, we construct a binary decision task from
+the p8 stream: given a current state, a goal, and two candidate 9D actions,
+select the action that makes progress toward the goal.  The current completed
+  pilot uses independently extracted DINOv2-L features at its single exported
+  layer, 512 training examples, and 128 validation examples.
+Table~\ref{tab:action-output} separates endpoint recognition from action
+selection and exposes action-vector shortcuts.
+
+\begin{table}[t]
+  \centering
+  \caption{\textbf{DINOv2 p8 action-output pilot.}  All probes are trained from
+  scratch on the same frozen split.}
+  \label{tab:action-output}
+  \small
+  \begin{tabularx}{\columnwidth}{@{}Xr@{}}
+    \toprule
+    Available information & Accuracy (\%) \\
+    \midrule
+    Endpoint-feature oracle: goal + two realized endpoints & 69.5 \\
+    Two candidate actions only & 64.1 \\
+    Current context + anchor only & 56.3 \\
+    Current + anchor + goal + two actions & 50.0 \\
+    Random choice & 50.0 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+The endpoint oracle shows that the representation can compare realized outcomes
+to a goal.  Yet action-only prediction is already strong, while the direct
+goal-conditioned actor remains at chance.  The pilot therefore reveals action
+statistics and endpoint utility, but provides no evidence that the frozen
+representation supports compositional transition reasoning.  A matched Wan
+p8/p12 replication should be reported separately when available.
+
+\subsubsection{Does V-JEPA2 propagate readable spatial structure?}
+\label{sec:predicted-feature-probing}
+
+The main benchmark probes encoder states and asks whether spatial information is
+present.  For a predictive world model, a stronger requirement is that the
+predictor carry the same information into the future.  We propose a
+read-then-predict test.  First, a spatial readout $g$ is trained only on real
+future encoder features and then frozen.  We apply this identical readout to the
+real target, V-JEPA2's predicted future feature, a no-condition prediction, and
+the copied last state.  The target-feature score is the readout ceiling; spatial
+retention is credited only when the prediction improves over both controls.
+
+\begin{figure*}[t]
+  \centering
+  \IfFileExists{figures/paper/fig07_vjepa_read_then_predict.pdf}{%
+    \includegraphics[width=0.92\textwidth]{figures/paper/fig07_vjepa_read_then_predict.pdf}%
+  }{\figplaceholder[4.6cm]{\textbf{Analysis figure placeholder: Read--Then--Predict}\\[2mm]
+      Context $\rightarrow$ V-JEPA2 predictor $\rightarrow$ predicted future latent.\\
+      Real target / predicted / no-condition / copy $\rightarrow$ one frozen
+      depth--pointmap readout $\rightarrow$ spatial score.}}
+  \caption{\textbf{Read--Then--Predict.}  The same frozen readout separates
+  future-feature retrieval from preservation of spatially readable structure.}
+  \label{fig:read-then-predict}
+\end{figure*}
+
+\begin{table}[t]
+  \centering
+  % Implementation audit: features/vjepa2/vjepa2_feature.py currently calls the
+  % model with skip_predictor=True, so no result should be inserted here until a
+  % predictor-feature export is completed under the same protocol.
+  \caption{\textbf{Predicted-feature spatial retention.}  Results are pending
+  predictor-feature extraction under the frozen protocol.}
+  \label{tab:predicted-feature-retention}
+  \small
+  \begin{tabular}{@{}lrrr@{}}
+    \toprule
+    Input to frozen readout & Depth $\downarrow$ & Pointmap $\downarrow$ & vs. copy \\
+    \midrule
+    Real future feature & \TBD & \TBD & -- \\
+    Predicted future feature & \TBD & \TBD & \TBD \\
+    No-condition prediction & \TBD & \TBD & \TBD \\
+    Last-state copy & \TBD & \TBD & -- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsubsection{Does latent update preserve transformation order?}
+\label{sec:se3-analysis}
+
+Finally, we test a limited compositional property of action-conditioned latent
+updates.  From a real observed triplet $A\!\rightarrow\!B\!\rightarrow\!C$,
+we form continuous relative poses $T_1=T_{AB}$ and $T_2=T_{BC}$.  A predictor is
+trained only on observed one-step pairs and then recursively applied as
+$T_1$ followed by $T_2$.  At test time we compare its distance to the real
+isolated $z_C$ with that obtained under the reversed order $T_2,T_1$.  This
+tests whether latent updates retain action order; it is neither novel-view
+rendering nor planning.
+
+\begin{table*}[t]
+  \centering
+  \caption{\textbf{Exploratory observed-order pilot at p8.}  Cosine distance is
+  averaged over seeds 42/43/44; lower is better.  The common held-out set has 44
+  tuples from 11 scenes.}
+  \label{tab:se3-pilot}
+  \small
+  \begin{tabular}{@{}lrrrrr@{}}
+    \toprule
+    Model (layer) & Correct order $\downarrow$ & Reversed $\downarrow$ &
+    Margin $\uparrow$ & Order acc. $\uparrow$ & 95\% CI for margin \\
+    \midrule
+    DINOv2 (0)    & 0.2002 & 0.2040 & 0.0037 & 0.5455 & $[0.0004,0.0074]$ \\
+    Fast3R (24)   & 0.0084 & 0.0087 & 0.0003 & 0.6288 & $[0.0000,0.0008]$ \\
+    V-JEPA2 (23)  & 0.1704 & 0.1732 & 0.0028 & 0.4697 & $[-0.0028,0.0101]$ \\
+    CogVideoX (20)& 0.0028 & 0.0029 & 0.0001 & 0.5152 & $[-0.0002,0.0005]$ \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+The margins are very small.  DINOv2 has the clearest positive interval; the
+Fast3R margin is near numerical zero, while the V-JEPA2 and CogVideoX intervals
+cross zero.  The pilot thus does not establish a general SE(3)-equivariant
+latent representation.  It tests only two-step order sensitivity under the
+motion families present in the data; rare motions, longer rollouts, and a
+SeeSE3-style middle-layer replication remain missing.

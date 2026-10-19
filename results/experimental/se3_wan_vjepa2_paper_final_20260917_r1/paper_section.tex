@@ -1,0 +1,43 @@
+\section{Compositional and observed-order generalization after one-step learning}
+\label{sec:se3_one_step_generalization}
+
+\paragraph{Question.}
+We use a deliberately restricted diagnostic to ask whether an update learned only from real one-step transitions generalizes to two structural tests.  Given a streaming state $s_A$, an external decoder $D$, and camera actions $T_1=T_{AB}$ and $T_2=T_{BC}$, a shared updater $U_\theta$ produces
+\begin{align}
+\hat z_{\rm seq} &= D(U_\theta(U_\theta(s_A,T_1),T_2)), &
+\hat z_{\rm dir} &= D(U_\theta(s_A,T_2T_1)),\\
+\hat z_{\rm swap} &= D(U_\theta(U_\theta(s_A,T_2),T_1)).
+\end{align}
+The two core diagnostics are sequential--direct composition consistency and observed-order sensitivity.  The A$\rightarrow$B error is reported only as the diagnostic head's one-step calibration, not as a new C1 experiment.
+
+\paragraph{Data and frozen interface.}
+The exact-v2 p12 set contains 436 tuples: 128 one-per-scene training tuples, 32 one-per-scene validation tuples, and 276 evaluation tuples from 69 scenes.  The evaluation scenes are exactly the 69 scenes used by the earlier development pilot, although none of the 276 exact A/B/C frame triples is identical to a pilot triple.  Thus exact feature matching does not make this an independent-scene confirmation set.  Each source is a causal streaming prefix of 12 real ordered frames ending at A; $z_A,z_B,z_C$ are isolated-target features used only as supervision or evaluation targets.  Wan uses blocks 0/5/10/15/20/25/29 at fixed scheduler argument 749, literal ``.'' null-prompt surrogate, deterministic sample-local noise, and repeat-tail padding from 12 to 81 input frames.  V-JEPA2 uses encoder blocks 0/5/11/17/23 with \texttt{skip\_predictor=True} and the fixed processor/repeat-tail path to 64 frames.
+
+The updater is a two-layer width-128 C2-shaped GRU trained for seeds 42--46 only on A$\rightarrow$B targets, with the backbone frozen and validation selection fixed.  It is an external probe, not either foundation model's native predictor.  Its hidden tuple is the only recurrent state: isolated target features are never fed back as streaming context.  No composition, order, cycle, or multi-step loss is used.  Matrix actions are composed in SE(3) before 9-D encoding.  Controls are copy, without-condition, action-only, matched shuffle, and an independently evaluated commutative additive updater.
+
+\paragraph{Statistics.}
+We average the five aligned training seeds and aggregate tuples within scene.  Uncertainty uses 2,000 shared paired scene-bootstrap resamples.  The predeclared Wan-L15/V-JEPA2-L11 family contains four comparisons and is Holm corrected.  For the significant comparison the implementation observed zero opposing-tail resamples, yielding a stored Holm value of zero; at finite bootstrap resolution we report $p_{\rm Holm}<0.004$, not an exact zero probability.  Layer trends are descriptive only.
+
+\input{table_main_layers.tex}
+
+\paragraph{Endpoint grounding.}
+All twelve layers improve two-step endpoint prediction relative to copy, with 95\% scene-bootstrap intervals above zero.  Relative to the without-action predictor, all five V-JEPA2 layers and six of seven Wan layers have positive intervals; Wan L0 is inconclusive.  These two comparisons answer different questions: copy gain measures endpoint grounding, whereas the without-action contrast isolates the incremental contribution of the correct action.  Raw cosine errors are defined in model-specific feature spaces and are not used to rank models.
+
+Across the seven Wan layers, diagnostic-head one-step error correlates with raw sequential--direct distance at $r=0.850$, with copy-normalized composition distance at $r=-0.258$, and with normalized order margin at $r=0.210$.  Across the five V-JEPA2 layers the corresponding values are $r=0.989$, $r=-0.265$, and $r=0.108$.  These 7/5-point layer correlations are descriptive and can be dominated by endpoint layers; they are not used to select a best layer or infer a causal relation.
+
+\paragraph{Composition consistency.}
+At the predeclared representative layers, the normalized sequential--direct distance is 0.0377 for Wan L15 and 0.0232 for V-JEPA2 L11.  The paired Wan-minus-V-JEPA2 difference is 0.0145 (95\% CI [0.0107, 0.0188], $p_{\rm Holm}<0.004$; Table~\ref{tab:se3_representative}).  Both paths remain grounded by their errors to the real $z_C$ (Table~\ref{tab:se3_multilayer}); closeness of endpoint errors alone is not called composition consistency.  The identity-padding comparison is a training-external stress test: exact identity is absent and also fails the coordinatewise training-range check.  It rules out update count alone for Wan L15 but does not rule it out for V-JEPA2 L11.  The representative difference is restricted to this layer pair and metric and is not an overall model ranking or evidence of stronger SE(3) understanding.
+
+\input{table_representative.tex}
+
+\paragraph{Observed-order sensitivity.}
+We separately measure the rotation-angle difference (radians) and camera-center displacement (metres) between $T_2T_1$ and $T_1T_2$.  Tertile thresholds are fixed using training geometry and shared across models and layers.  In the high rotation-difference stratum, Wan L15 has normalized margin 0.0006 (CI [-0.0014, 0.0028]) and V-JEPA2 L11 -0.0002 (CI [-0.0018, 0.0013]).  The corresponding high camera-center results also cross zero (Table~\ref{tab:se3_noncomm}).  No robust control-adjusted order advantage is detected.  Because the high strata contain physically non-commuting trajectories, approximate commutativity alone is insufficient to explain the weak overall effect; motion magnitude, frame interval, and A--C overlap checks remain descriptive potential confounds.
+
+\input{table_noncommutativity.tex}
+
+\paragraph{Analytic positive control and limitations.}
+The exact point-transform oracle has zero one-step, recursive, direct, identity, and sequential--direct error and a positive correct-versus-swapped margin of 0.1107\,m.  With the same recurrent structure and budget but only A$\rightarrow$B supervision, the learned point updater has one-step RMSE 0.1785\,m, sequential RMSE 0.7010\,m, and order margin -0.0004\,m (its interval includes zero).  This limitation appears in the main text because it prevents attributing weak visual order evidence uniquely to the frozen representation.  It does not invalidate the intended one-step-to-two-step generalization test and is not a reason to change its training objective after observing the result.
+
+\input{table_positive_control.tex}
+
+In summary, the frozen features support grounded endpoint prediction, and V-JEPA2 L11 has a smaller normalized composition distance than Wan L15 under the predeclared paired comparison.  We do not detect a robust control-adjusted observed-order advantage.  These results diagnose one-sided generalization of an external recurrent probe; they neither establish absence of SE(3) information nor prove a complete group action.

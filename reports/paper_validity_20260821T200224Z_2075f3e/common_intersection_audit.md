@@ -1,0 +1,3 @@
+# Common intersection audit
+
+C1/C2 model intersections and cross-prefix legacy-paired manifests were generated with SHA256 hashes. All 128 model×prefix×horizon comparisons have native n=common n=276, so no sample was dropped and native/common R@1 differences are floating-point roundoff only. The historical dumps lack canonical window IDs, so cross-prefix IDs are reconstructed from deterministic scene order and are `COMPLETE_WITH_CAVEAT`. B2 strict intersections are blocked because strict per-sample artifacts do not exist. Because the repository `manifests/` directory is not writable, files are under this report directory's `manifests/common/`. See `native_vs_common_counts.csv` and `native_vs_common_metrics.csv`.

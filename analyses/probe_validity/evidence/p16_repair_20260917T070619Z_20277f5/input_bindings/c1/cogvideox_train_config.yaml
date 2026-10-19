@@ -1,0 +1,147 @@
+task_name: inscene15k_streaming
+tags:
+- train
+- inscene15k_streaming
+- cogvideox
+- streaming_prefix
+- action_dynamics
+train: true
+test: false
+ckpt_path: null
+seed: 42
+allow_large_probe_ddp: false
+data:
+  data_root: vidfm3d/data/DL3DV/DL3DV-processed
+  data_module:
+    _target_: vidfm3d.data.video_probe_datamodule.VideoProbeDataModule
+    train_datasets:
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}',
+      streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'],
+      split='train', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}',
+      feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len},
+      min_view_interval=5, context_len=${prefix_len}, query_idx_divisor=None, target_h=288,
+      target_w=512, window_size=0, include_pmaps=False, streaming_prefix=True, prefix_min_len=${prefix_len},
+      prefix_max_len=${prefix_len}, prefix_stride=1, diag_action=True, target_feat_root='${target_feat_root}',
+      action_horizons=${action_horizons})
+    validation_datasets:
+    - InsScene15KDataset(root='${oc.env:INSCENE_DATA_ROOT}', root_vfm='${streaming_feat_root}',
+      streaming_feat_root='${streaming_feat_root}', sources=['processed_scannetpp_v2'],
+      split='val', vfm_name='${vfm_name}', feat_postfix='${feat_postfix}', feature_layer='${feature_layer}',
+      feature_timestep='${feature_timestep}', feat_pixalign=True, num_views=${prefix_len},
+      min_view_interval=5, context_len=${prefix_len}, query_idx_divisor=None, target_h=288,
+      target_w=512, window_size=0, include_pmaps=False, streaming_prefix=True, prefix_min_len=${prefix_len},
+      prefix_max_len=${prefix_len}, prefix_stride=1, diag_action=True, target_feat_root='${target_feat_root}',
+      action_horizons=${action_horizons})
+    batch_size_per_device: 4
+    batch_size_per_device_val: 4
+    num_workers: 4
+    num_workers_val: 2
+    pin_memory: true
+model:
+  _target_: vidfm3d.models.probe_ext_module.ProbeExtensionLitModule
+  probe_type: action_dynamics
+  output_path: ${paths.output_dir}
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 0.0003
+    betas:
+    - 0.9
+    - 0.95
+    weight_decay: 0.05
+  scheduler:
+    _target_: pl_bolts.optimizers.lr_scheduler.LinearWarmupCosineAnnealingLR
+    _partial_: true
+    warmup_epochs: 5
+    max_epochs: ${trainer.max_epochs}
+    eta_min: 1.0e-06
+  probe:
+    _target_: vidfm3d.models.components.probe_action_dynamics.ActionDynamicsProbe
+    in_channels: ${video_channels}
+    action_dim: 9
+    hidden_dim: 512
+    num_layers: 2
+    num_heads: 8
+    max_seq_len: 64
+  view_overlap_pos_threshold: 0.4
+  view_overlap_neg_threshold: 0.05
+  polar_loss_weights:
+  - 1.0
+  - 1.0
+  - 0.5
+  mse_loss_weight: 1.0
+  cosine_loss_weight: 1.0
+  compile: false
+callbacks:
+  model_checkpoint:
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: epoch_{epoch:03d}
+    monitor: val/loss
+    verbose: false
+    save_last: true
+    save_top_k: -1
+    mode: min
+    auto_insert_metric_name: false
+    save_weights_only: false
+    every_n_epochs: 5
+    save_on_train_epoch_end: null
+  early_stopping: null
+  model_summary:
+    max_depth: -1
+  rich_progress_bar:
+    refresh_rate: 1
+    leave: false
+logger:
+  wandb:
+    _target_: lightning.pytorch.loggers.wandb.WandbLogger
+    name: c_retrain_safe_20260722_1435_action_dynamics_cogvideox_p16_layer20
+    save_dir: ${paths.output_dir}
+    offline: true
+    id: null
+    anonymous: null
+    project: VideoProbe3D
+    log_model: false
+    prefix: ''
+    group: c_retrain_safe_20260722_1435
+    tags: []
+    job_type: ''
+trainer:
+  _target_: lightning.pytorch.trainer.Trainer
+  _convert_: partial
+  default_root_dir: ${paths.output_dir}
+  min_epochs: 1
+  max_epochs: 50
+  accelerator: gpu
+  devices:
+  - 0
+  check_val_every_n_epoch: 1
+  deterministic: false
+  plugins: []
+  strategy: auto
+  num_nodes: 1
+  sync_batchnorm: true
+  use_distributed_sampler: false
+  precision: bf16-mixed
+paths:
+  root_dir: ${oc.env:PROJECT_ROOT}
+  data_dir: ${paths.root_dir}/data/
+  log_dir: ${paths.root_dir}/logs/
+  output_dir: ${hydra:runtime.output_dir}
+  work_dir: ${hydra:runtime.cwd}
+  run_folder_name: c_retrain_safe_20260722_1435/c_retrain_safe_20260722_1435_action_dynamics_cogvideox_p16_layer20
+extras:
+  ignore_warnings: false
+  enforce_tags: true
+  print_config: true
+job_name: action_dynamics_cogvideox_p16_layer20
+autoresume: false
+feat_postfix: _t749_layer20
+feature_layer: 20
+feature_timestep: 749
+vfm_name: cogvideox
+video_channels: 3072
+prefix_len: 16
+streaming_feat_root: fj:s3://baiqiao/InsScene-15K/FEAT_STREAMING_BY_PREFIX/cogvideox_prefix_16_m0p35_r0p5
+target_feat_root: fj:s3://baiqiao/InsScene-15K/FEAT_TARGET_BY_PREFIX/cogvideox_prefix_16_m0p35_r0p5
+action_horizons:
+- 1

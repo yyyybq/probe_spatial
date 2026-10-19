@@ -1,0 +1,7 @@
+model,task,timestep,layer,prefixes,metric_value
+wan,A1 Mask,499,20,"8,12,16,24",6.917036831378937
+wan,A1 Mask,999,20,"8,12,16,24",5.695132195949554
+cogvideox,A1 Mask,499,20,"8,12,16,24",6.558573246002197
+cogvideox,A1 Mask,999,20,"8,12,16,24",7.180903315544128
+minimax_h3,A1 Mask,500,20,"8,12,16,24",
+minimax_h3,A1 Mask,1000,20,"8,12,16,24",

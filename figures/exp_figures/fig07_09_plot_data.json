@@ -1,0 +1,153 @@
+{
+  "sources": [
+    {
+      "path": "experiments/d_series_scannetpp_v1/diagnostics/dseries_vjepa2_d1_d3_three_seed_20260917_zoetrope_r1/across_seed_metrics.csv",
+      "sha256": "262c6732324d3a9595448b1e40b87bb8c7d96c80dfbc54ddccb351d8c8889617"
+    },
+    {
+      "path": "results/independent_goal_conditioned_continuous_action_p8_v1_20260921/continuous_action_paired_effects.csv",
+      "sha256": "242be4d1c32fe9fadef65aacae2efe2ebb758360216ee61afdcaabc0cdfb7147"
+    }
+  ],
+  "fig07": "Conceptual feature-token schematic; five illustrative slots, not a sampled trajectory.",
+  "fig08": {
+    "data": [
+      {
+        "horizon": 2,
+        "condition": "native_target_reference",
+        "mean": 0.18244095589371695,
+        "seed_sd": 0.0002878338872442153
+      },
+      {
+        "horizon": 2,
+        "condition": "frozen_readout_transfer",
+        "mean": 0.2458928549338294,
+        "seed_sd": 0.005787160544774567
+      },
+      {
+        "horizon": 2,
+        "condition": "retrained_same_capacity_readout",
+        "mean": 0.22328758268540608,
+        "seed_sd": 0.0008241897499896842
+      },
+      {
+        "horizon": 2,
+        "condition": "last_context",
+        "mean": 0.2889846683016434,
+        "seed_sd": 0.004370422304153636
+      },
+      {
+        "horizon": 2,
+        "condition": "train_layout_prior",
+        "mean": 0.24063112222306107
+      },
+      {
+        "horizon": 4,
+        "condition": "native_target_reference",
+        "mean": 0.182739342459374,
+        "seed_sd": 0.00032993083825709366
+      },
+      {
+        "horizon": 4,
+        "condition": "frozen_readout_transfer",
+        "mean": 0.24266850981177485,
+        "seed_sd": 0.005394378765017992
+      },
+      {
+        "horizon": 4,
+        "condition": "retrained_same_capacity_readout",
+        "mean": 0.22709435087309224,
+        "seed_sd": 0.0004893378583271095
+      },
+      {
+        "horizon": 4,
+        "condition": "last_context",
+        "mean": 0.29739969015877316,
+        "seed_sd": 0.004130437054599965
+      },
+      {
+        "horizon": 4,
+        "condition": "train_layout_prior",
+        "mean": 0.2376744028288817
+      }
+    ],
+    "interval": "Three-training-seed sample SD; not a confidence interval."
+  },
+  "fig09": {
+    "data": [
+      {
+        "model": "dino",
+        "comparison": "full_minus_goal_only",
+        "metric": "positive_progress",
+        "estimate": 15.104166666666668,
+        "ci_low": 8.955078692142399,
+        "ci_high": 20.783579502114968,
+        "display_scale": 100.0
+      },
+      {
+        "model": "f3r",
+        "comparison": "full_minus_goal_only",
+        "metric": "positive_progress",
+        "estimate": 14.0625,
+        "ci_low": 7.250807526195996,
+        "ci_high": 20.665703848049706,
+        "display_scale": 100.0
+      },
+      {
+        "model": "vjepa2",
+        "comparison": "full_minus_goal_only",
+        "metric": "positive_progress",
+        "estimate": 10.937500000000002,
+        "ci_low": 4.486788617886178,
+        "ci_high": 17.25128007820818,
+        "display_scale": 100.0
+      },
+      {
+        "model": "wan",
+        "comparison": "full_minus_goal_only",
+        "metric": "positive_progress",
+        "estimate": 10.677083333333334,
+        "ci_low": 5.096183632602033,
+        "ci_high": 15.972782258064514,
+        "display_scale": 100.0
+      },
+      {
+        "model": "dino",
+        "comparison": "full_minus_current_only",
+        "metric": "goal_distance_reduction",
+        "estimate": -0.015320109567189853,
+        "ci_low": -0.021361388250464488,
+        "ci_high": -0.009394600165127871,
+        "display_scale": 1.0
+      },
+      {
+        "model": "f3r",
+        "comparison": "full_minus_current_only",
+        "metric": "goal_distance_reduction",
+        "estimate": -0.020872633208713222,
+        "ci_low": -0.02992274105627807,
+        "ci_high": -0.012177990164178306,
+        "display_scale": 1.0
+      },
+      {
+        "model": "vjepa2",
+        "comparison": "full_minus_current_only",
+        "metric": "goal_distance_reduction",
+        "estimate": -0.008777908714585541,
+        "ci_low": -0.015011224913877514,
+        "ci_high": -0.0022765568779794408,
+        "display_scale": 1.0
+      },
+      {
+        "model": "wan",
+        "comparison": "full_minus_current_only",
+        "metric": "goal_distance_reduction",
+        "estimate": -0.009363098732884337,
+        "ci_low": -0.017119273180944326,
+        "ci_high": -0.0018033205108972112,
+        "display_scale": 1.0
+      }
+    ],
+    "interval": "Paired 95% scene-bootstrap CI, 2000 replicates."
+  }
+}

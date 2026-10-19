@@ -1,0 +1,14 @@
+\begin{table}[t]
+\centering
+\small
+\caption{Analytic positive control. Point errors are in metres. The learned updater uses only A$\rightarrow$B supervision and the same recurrent-head budget as the visual diagnostic.}
+\label{tab:se3_positive}
+\begin{tabular}{lrrrrr}
+\toprule
+System & One-step & Sequential & Direct & Seq.--direct & Order margin \\
+\midrule
+Analytic oracle & 0.0000 & 0.0000 & 0.0000 & 0.0000 & 0.1107 \
+Single-step learned GRU & 0.1785 & 0.7010 & 0.5036 & 0.3195 & -0.0004 \
+\bottomrule
+\end{tabular}
+\end{table}

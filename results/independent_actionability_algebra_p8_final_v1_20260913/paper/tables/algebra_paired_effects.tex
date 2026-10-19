@@ -1,0 +1,34 @@
+\begin{tabular}{lllrrrrl}
+\toprule
+model & effect & metric & n & estimate & ci\_low & ci\_high & direction \\
+\midrule
+dino & one\_composed\_gain\_over\_four\_primitives & prediction\_to\_endpoint\_cosine & 256 & -0.0184 & -0.0259 & -0.0111 & positive favors first named method \\
+dino & inverse\_gain\_over\_wrong\_inverse & decoded\_to\_anchor\_cosine & 256 & 0.0291 & 0.0226 & 0.0355 & positive favors first named method \\
+dino & inverse\_gain\_over\_repeated\_action & decoded\_to\_anchor\_cosine & 256 & 0.0488 & 0.0388 & 0.0593 & positive favors first named method \\
+dino & inverse\_gain\_over\_copy & decoded\_to\_anchor\_cosine & 256 & -0.0630 & -0.0670 & -0.0591 & positive favors first named method \\
+dino & matched\_non\_loop\_minus\_real\_loop & prediction\_to\_actual\_endpoint\_cosine & 412 & 0.2011 & 0.1864 & 0.2158 & positive means larger value for matched non-loop \\
+dino & matched\_non\_loop\_minus\_real\_loop & actual\_endpoint\_to\_anchor\_cosine & 412 & 0.2581 & 0.2385 & 0.2775 & positive means larger value for matched non-loop \\
+dino & matched\_non\_loop\_minus\_real\_loop & prediction\_to\_anchor\_cosine & 412 & 0.0069 & 0.0053 & 0.0086 & positive means larger value for matched non-loop \\
+f3r & one\_composed\_gain\_over\_four\_primitives & prediction\_to\_endpoint\_cosine & 256 & -0.0002 & -0.0003 & -0.0001 & positive favors first named method \\
+f3r & inverse\_gain\_over\_wrong\_inverse & decoded\_to\_anchor\_cosine & 256 & 0.0005 & 0.0004 & 0.0006 & positive favors first named method \\
+f3r & inverse\_gain\_over\_repeated\_action & decoded\_to\_anchor\_cosine & 256 & 0.0011 & 0.0009 & 0.0012 & positive favors first named method \\
+f3r & inverse\_gain\_over\_copy & decoded\_to\_anchor\_cosine & 256 & -0.0015 & -0.0017 & -0.0014 & positive favors first named method \\
+f3r & matched\_non\_loop\_minus\_real\_loop & prediction\_to\_actual\_endpoint\_cosine & 412 & 0.0027 & 0.0022 & 0.0032 & positive means larger value for matched non-loop \\
+f3r & matched\_non\_loop\_minus\_real\_loop & actual\_endpoint\_to\_anchor\_cosine & 412 & 0.0039 & 0.0033 & 0.0045 & positive means larger value for matched non-loop \\
+f3r & matched\_non\_loop\_minus\_real\_loop & prediction\_to\_anchor\_cosine & 412 & 0.0002 & 0.0002 & 0.0003 & positive means larger value for matched non-loop \\
+vjepa2 & one\_composed\_gain\_over\_four\_primitives & prediction\_to\_endpoint\_cosine & 256 & -0.0055 & -0.0082 & -0.0029 & positive favors first named method \\
+vjepa2 & inverse\_gain\_over\_wrong\_inverse & decoded\_to\_anchor\_cosine & 256 & 0.0052 & 0.0040 & 0.0064 & positive favors first named method \\
+vjepa2 & inverse\_gain\_over\_repeated\_action & decoded\_to\_anchor\_cosine & 256 & 0.0096 & 0.0076 & 0.0117 & positive favors first named method \\
+vjepa2 & inverse\_gain\_over\_copy & decoded\_to\_anchor\_cosine & 256 & -0.0448 & -0.0466 & -0.0430 & positive favors first named method \\
+vjepa2 & matched\_non\_loop\_minus\_real\_loop & prediction\_to\_actual\_endpoint\_cosine & 412 & 0.0666 & 0.0596 & 0.0742 & positive means larger value for matched non-loop \\
+vjepa2 & matched\_non\_loop\_minus\_real\_loop & actual\_endpoint\_to\_anchor\_cosine & 412 & 0.1039 & 0.0946 & 0.1132 & positive means larger value for matched non-loop \\
+vjepa2 & matched\_non\_loop\_minus\_real\_loop & prediction\_to\_anchor\_cosine & 412 & 0.0018 & 0.0014 & 0.0022 & positive means larger value for matched non-loop \\
+wan & one\_composed\_gain\_over\_four\_primitives & prediction\_to\_endpoint\_cosine & 256 & -0.0005 & -0.0010 & -0.0000 & positive favors first named method \\
+wan & inverse\_gain\_over\_wrong\_inverse & decoded\_to\_anchor\_cosine & 256 & 0.0011 & 0.0008 & 0.0014 & positive favors first named method \\
+wan & inverse\_gain\_over\_repeated\_action & decoded\_to\_anchor\_cosine & 256 & 0.0019 & 0.0014 & 0.0023 & positive favors first named method \\
+wan & inverse\_gain\_over\_copy & decoded\_to\_anchor\_cosine & 256 & -0.0032 & -0.0034 & -0.0030 & positive favors first named method \\
+wan & matched\_non\_loop\_minus\_real\_loop & prediction\_to\_actual\_endpoint\_cosine & 412 & 0.0052 & 0.0042 & 0.0061 & positive means larger value for matched non-loop \\
+wan & matched\_non\_loop\_minus\_real\_loop & actual\_endpoint\_to\_anchor\_cosine & 412 & 0.0079 & 0.0067 & 0.0090 & positive means larger value for matched non-loop \\
+wan & matched\_non\_loop\_minus\_real\_loop & prediction\_to\_anchor\_cosine & 412 & 0.0003 & 0.0002 & 0.0004 & positive means larger value for matched non-loop \\
+\bottomrule
+\end{tabular}

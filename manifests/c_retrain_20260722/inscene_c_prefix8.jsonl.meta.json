@@ -1,0 +1,31 @@
+{
+  "action_horizons": [
+    1
+  ],
+  "audit_dir": "/mnt/local_cache/inscene/inscene_dino_c1_prefix8_full_audit",
+  "created_at": "2026-07-22T08:46:46.070725+00:00",
+  "duplicate_sample_ids": [],
+  "excluded_scenes": "/mnt/local_cache/inscene/inscene_dino_c1_prefix8_full_audit/excluded_scenes.jsonl",
+  "feature_layer": 0,
+  "feature_timestep": 749,
+  "git_commit": null,
+  "included_scenes": "/mnt/local_cache/inscene/inscene_dino_c1_prefix8_full_audit/included_scenes.txt",
+  "manifest_version": 1,
+  "num_candidate_scenes": 683,
+  "num_duplicate_sample_ids": 0,
+  "num_included_scenes": 681,
+  "num_samples": 2724,
+  "output": "/mnt/local_cache/inscene/inscene_dino_c1_prefix8_full_audit.jsonl",
+  "prefix_lengths": [
+    8
+  ],
+  "scene_root": "fj:s3://baiqiao/InsScene-15K/data/processed_scannetpp_v2/processed_scannetpp_v2",
+  "sha256": "a8ae9afe37bb8a18c190e614cbbbb0f3116d1caae474c2b32c6e3aa0ceb1c04c",
+  "split_counts": {
+    "train": 2448,
+    "val": 276
+  },
+  "streaming_feature_root": "fj:s3://baiqiao/InsScene-15K/FEAT_STREAMING_BY_PREFIX/dino_prefix_8_m0p35_r0p5",
+  "target_feature_root": "fj:s3://baiqiao/InsScene-15K/FEAT_TARGET_BY_PREFIX/dino_prefix_8_m0p35_r0p5",
+  "vfm_name": "dino"
+}

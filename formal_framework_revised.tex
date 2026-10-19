@@ -1,0 +1,165 @@
+\section{Probing Spatial Capabilities}
+\label{sec:formal-framework}
+
+We ask a simple question: \emph{what spatial information can be decoded from a
+frozen visual representation, and where in the network does it emerge?}
+Spatial understanding is not a single ability. A representation may expose
+the geometry of the currently observed scene without maintaining the location
+of an occluded object; likewise, a future representation may be predictable
+because consecutive frames look similar, rather than because the model uses
+the camera action. We therefore separate three complementary capabilities and
+evaluate each with a task-specific readout while keeping the backbone frozen.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \begin{tabular}{p{0.18\textwidth}p{0.27\textwidth}p{0.47\textwidth}}
+    \toprule
+    \textbf{Capability} & \textbf{Why it is needed} & \textbf{What the probe does} \\
+    \midrule
+    \textbf{Geometric perception}
+      & Establishes whether the representation describes the observed 3D
+        scene, before asking it to remember or predict anything.
+      & Reads out metric depth, relative camera pose, and dense instance identity,
+        and tests whether representations from two views reveal their visual
+        overlap. \\
+    \textbf{Egocentric persistence}
+      & Distinguishes a persistent, camera-relative object state from a
+        snapshot of what is currently visible.
+      & Forms an appearance query when an object is visible, then localizes
+        that object after it becomes hidden. The output is its azimuth,
+        elevation, and distance in the camera frame at the end of the prefix;
+        the probe receives neither camera pose nor the target-time mask or
+        location. \\
+    \textbf{Action-conditioned prediction}
+      & Tests whether the representation supports spatial updates under
+        motion, rather than only static geometry or temporal smoothness.
+      & Predicts an independently encoded future representation from the
+        observed prefix and camera motion. We test a one-step transition,
+        sequential rollout at horizons $1,2,4$, and a counterfactual
+        intervention in which different actions from the same state must lead
+        to their corresponding future representations. \\
+    \bottomrule
+  \end{tabular}
+  \caption{The three spatial capabilities evaluated in our benchmark. The
+  names in this table are used consistently throughout the paper; repository
+  implementation codes are not used as scientific task names.}
+  \label{tab:spatial-capabilities}
+\end{table*}
+
+The three capabilities answer different questions and are not assumed to form
+a score hierarchy. In particular, geometric perception does not imply object
+persistence, and high future-feature retrieval does not by itself establish
+the use of action. We therefore accompany the prediction tasks with matched
+no-action, shuffled-action, and last-observation-copy controls, and the
+persistence task with object-conditioned random-feature and unconditional
+controls.
+
+\subsection{Causal streaming evaluation}
+\label{sec:streaming-evaluation}
+
+All temporal claims use posed ScanNet++ trajectories
+\citep{yeshwanth2023scannetpp}. For model $m$, extraction layer $\ell$, prefix
+length $p$, and current time $t$, we compute
+\begin{equation}
+  \mathbf{Z}^{m,\ell}_{t,p}
+  = E^{m}_{\ell}\!\left(\mathbf{I}_{t-p+1:t}\right),
+  \qquad p\in\{8,12,16,24\}.
+  \label{eq:causal-streaming-feature}
+\end{equation}
+Each prefix is forwarded independently and contains no frame after $t$; the
+four prefix lengths are trained and evaluated as separate fixed-shape
+settings. This design measures how a representation changes as more past
+observations become available without giving the encoder future context.
+
+The leakage-sensitive inputs are constructed separately. For egocentric
+persistence, the same object is selected from the common visible history and
+reused across the prefix sweep, while its target is expressed in the camera
+coordinate system at the current prefix tail. For action-conditioned
+prediction, every future target at $t+h$ is produced by an independent
+target-only encoder forward,
+\begin{equation}
+  \mathbf{Z}^{m,\ell,\mathrm{tar}}_{t+h}
+  = E^{m}_{\ell}\!\left(\mathbf{I}_{t+h}\right),
+  \qquad h\in\{1,2,4\},
+  \label{eq:isolated-target-feature}
+\end{equation}
+so it cannot contain prefix tokens or later frames. Stochastic backbones use
+fixed, matched noise seeds within a comparison. Splits are scene-disjoint.
+
+\subsection{Models and extraction layers}
+\label{sec:model-layer-grid}
+
+We probe representations from image encoders, video encoders, 3D encoders,
+video generation/world models, and a multimodal language model. Table
+\ref{tab:model-layer-grid} lists the extraction points in the experimental
+matrix. Dense layer sweeps are used for the principal video backbones, while
+single canonical representations serve as reference points for the remaining
+models. Layer numbers are model-specific extraction indices and should not be
+compared as absolute depths across architectures.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \begin{tabular}{p{0.20\textwidth}p{0.25\textwidth}p{0.25\textwidth}p{0.22\textwidth}}
+    \toprule
+    \textbf{Model family} & \textbf{Model} & \textbf{Extraction layers} &
+    \textbf{Extraction condition} \\
+    \midrule
+    Image encoder
+      & DINOv2-Large
+      & final hidden state
+      & deterministic \\
+    Video encoder
+      & V-JEPA2 ViT-L
+      & $\{0,5,11,17,23\}$
+      & deterministic \\
+    Video encoder
+      & VideoMAE-Large
+      & $\{0,5,11,17,23\}$
+      & deterministic \\
+    3D encoder
+      & Fast3R ViT-L
+      & $\{24\}$
+      & deterministic \\
+    Video generator
+      & Wan2.1-T2V-1.3B
+      & $\{0,5,10,15,20,25,29\}$
+      & scheduler step $749$ \\
+    Video generator
+      & CogVideoX-5B-I2V
+      & $\{0,5,10,15,20,25,30,35,40\}$
+      & scheduler step $749$ \\
+    World model
+      & AetherV1
+      & $\{1\}$
+      & scheduler step $749$ \\
+    Video generator
+      & MiniMax-H3
+      & $\{10,20,30,40,50\}$
+      & flow coordinate $0.25$ \\
+    Video generator
+      & LingBot-Video MoE-30B-A3B
+      & $\{10,20,30,40,48\}$
+      & flow coordinate $0.25$ \\
+    Multimodal language model
+      & Qwen2.5-VL-7B-Instruct
+      & visual-merger output
+      & deterministic visual forward \\
+    \bottomrule
+  \end{tabular}
+  \caption{Models and model-specific extraction layers in the current
+  experimental matrix. For DINOv2, the cache label $0$ denotes the final
+  hidden state; for Qwen2.5-VL, cache label $-1$ denotes the visual-merger
+  output. The terminal sweep labels $50$ for MiniMax-H3 and $48$ for
+  LingBot-Video map to their final blocks (indices $49$ and $47$,
+  respectively).}
+  \label{tab:model-layer-grid}
+\end{table*}
+
+Within each model and capability, the readout architecture and training
+protocol are held fixed across layers and prefix lengths. This produces a
+layer--context map of each capability without assuming that the last layer or
+the longest prefix is necessarily best.

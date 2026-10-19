@@ -108,7 +108,8 @@ Optional AOSS storage requires its client and `AOSS_CONF` (default
 
 ## Results and reproducibility
 
-- [PROJECT_STATUS.md](PROJECT_STATUS.md): entrypoint for experiment status.
+- [2026-10-19 handoff](docs/HANDOFF_20261019.md): what the project is and the latest accepted evaluations. Read this before the dated status pages.
+- [PROJECT_STATUS.md](PROJECT_STATUS.md): 2026-10-16 evidence snapshot; counts there are superseded by the handoff.
 - [2026-10-15 experiment inventory](docs/EXPERIMENT_INVENTORY_20261015.md): per-group completion, checkpoint tensor validity, accepted result scope, and remaining release work by kind.
 - [Experiment inventory and release plan](docs/RELEASE_READINESS_20261011.md): the 2026-10-11 scope definitions for canonical V2, timestep, and other analyses.
 - [Per-experiment CSVs](metadata/release_inventory/README.md): exact identities, evidence paths, completion, checkpoint tensor status and result status; rebuild with `python scripts/update_release_inventory_20261015.py` then `python scripts/summarize_release_inventory.py`.

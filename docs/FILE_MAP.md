@@ -8,7 +8,8 @@ ledger/dashboard/export are historical snapshots, not a live status feed.
 
 # Start Here
 
-- `PROJECT_STATUS.md`: dated evidence summary and links to the current audit.
+- [2026-10-19 handoff](HANDOFF_20261019.md): current project purpose and latest progress. Read this first.
+- `PROJECT_STATUS.md`: 2026-10-16 evidence snapshot; its counts are superseded by the handoff.
 - [2026-10-15 inventory](EXPERIMENT_INVENTORY_20261015.md): per-group completion, checkpoint tensor validity, feature-cache overflow, remaining work by kind.
 - [Release plan](RELEASE_READINESS_20261011.md): canonical V2, timestep, other analyses, and publication requirements (2026-10-11 counts superseded where the 10-15 inventory differs).
 - [Per-experiment inventory](../metadata/release_inventory/README.md): three source CSVs (with `checkpoint_tensor_status`), combined CSV and hash-linked summary; the 10-11 tables are kept in `metadata/release_inventory/archive_20261011/`.

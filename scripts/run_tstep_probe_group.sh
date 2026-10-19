@@ -48,12 +48,35 @@ if [[ "${strict_audit_ok}" != "true" ]]; then
   echo "[err] groups.tsv does not record a passing strict canonical audit" >&2
   exit 3
 fi
+# Accepted namespace pairs (keep in sync with NAMESPACE_PAIRS in
+# scripts/audit_tstep_canonical_alignment.py).  The MiniMax bf16 pair is the
+# 2026-10-16 re-extraction of MiniMax layers 20/25 (stage 5 of
+# docs/MINIMAX_REEXTRACT_RETRAIN_PLAN_20261016.md).
+case "${streaming_namespace}:${target_namespace}" in
+  FEAT_STREAMING_CANONICAL_V2_SEEDED_V1:FEAT_TARGET_CANONICAL_V2_SEEDED_V1)
+    namespace_family=seeded_v1 ;;
+  FEAT_STREAMING_CANONICAL_V2_SEEDED_V1_MINIMAX_BF16_V1:FEAT_TARGET_CANONICAL_V2_SEEDED_V1_MINIMAX_BF16_V1)
+    namespace_family=seeded_v1_minimax_bf16_v1 ;;
+  *) namespace_family="" ;;
+esac
 if [[ "${canonical_protocol}" != "inscene_streaming_canonical_v2_obs28_h124" ||
       "${canonical_obs_len}" != "28" ||
-      "${streaming_namespace}" != "FEAT_STREAMING_CANONICAL_V2_SEEDED_V1" ||
-      "${target_namespace}" != "FEAT_TARGET_CANONICAL_V2_SEEDED_V1" ]]; then
+      -z "${namespace_family}" ]]; then
   echo "[err] group is not bound to canonical-v2 seeded-v1" >&2
   exit 3
+fi
+if [[ "${namespace_family}" == "seeded_v1_minimax_bf16_v1" ]]; then
+  if [[ "${vfm}" != "minimax_h3" || ( "${layer}" != "20" && "${layer}" != "25" ) ]]; then
+    echo "[err] the MiniMax bf16 namespaces hold minimax_h3 layers 20/25 only; got vfm=${vfm} layer=${layer}" >&2
+    exit 3
+  fi
+  # Stage 5 trains with features widened to fp32 in the loader; bf16
+  # pass-through to the GPU was never validated.
+  PROBE_FP16_PASSTHROUGH=${PROBE_FP16_PASSTHROUGH:-0}
+  if [[ "${PROBE_FP16_PASSTHROUGH}" != "0" ]]; then
+    echo "[err] the MiniMax bf16 namespaces require PROBE_FP16_PASSTHROUGH=0" >&2
+    exit 3
+  fi
 fi
 if [[ -z "${INSCENE_STRICT_AUDIT:-}" ]]; then
   echo "[err] set INSCENE_STRICT_AUDIT to the full passing audit artifact: ${strict_audit_from_row}" >&2
@@ -67,15 +90,17 @@ fi
   --protocol-id "${canonical_protocol}" \
   --canonical-obs-len "${canonical_obs_len}" \
   --prefix "${prefix}" \
-  --expected-artifact-sha256 "${strict_audit_sha256}"
+  --expected-artifact-sha256 "${strict_audit_sha256}" \
+  --streaming-namespace "${streaming_namespace}" \
+  --target-namespace "${target_namespace}"
 
 DATA_ROOT=${DATA_ROOT:-/mnt/umm/users/yinbaiqiao/InsScene-15K/data}
 LOCAL_SCENE_ROOT=${LOCAL_SCENE_ROOT:-${DATA_ROOT}/processed_scannetpp_v2/processed_scannetpp_v2}
-TARGET_INDEX_ROOT=${TARGET_INDEX_ROOT:-/mnt/umm/users/yinbaiqiao/InsScene-15K/FEAT_TARGET_CANONICAL_V2_SEEDED_V1}
+TARGET_INDEX_ROOT=${TARGET_INDEX_ROOT:-/mnt/umm/users/yinbaiqiao/InsScene-15K/${target_namespace}}
 STREAMING_EXCLUSIONS=${STREAMING_EXCLUSIONS:-${PROJECT_ROOT}/configs/experiment/inscene15k_streaming/tstep_canonical_v2_exclusions.txt}
 AOSS_BUCKET_ROOT=${AOSS_BUCKET_ROOT:-aoss://baiqiao/InsScene-15K}
-STREAM_ROOT=${STREAM_ROOT:-${AOSS_BUCKET_ROOT}/FEAT_STREAMING_CANONICAL_V2_SEEDED_V1}
-TARGET_ROOT=${TARGET_ROOT:-${AOSS_BUCKET_ROOT}/FEAT_TARGET_CANONICAL_V2_SEEDED_V1}
+STREAM_ROOT=${STREAM_ROOT:-${AOSS_BUCKET_ROOT}/${streaming_namespace}}
+TARGET_ROOT=${TARGET_ROOT:-${AOSS_BUCKET_ROOT}/${target_namespace}}
 LOG_ROOT=${LOG_ROOT:-${PROJECT_ROOT}/logs/tstep_probe_seeded_v1/${RUN_ID}}
 GPU_IDS_CSV=${GPU_IDS_CSV:-0,1,2,3,4,5,6,7}
 BATCH_SIZE=${BATCH_SIZE:-2}
@@ -94,11 +119,11 @@ AEC2_NAME=${AEC2_NAME:-zoetrope}
   exit 3
 }
 [[ "${STREAM_ROOT%/}" == "${AOSS_BUCKET_ROOT%/}/${streaming_namespace}" ]] || {
-  echo "[err] STREAM_ROOT must be the seeded-v1 AOSS namespace" >&2
+  echo "[err] STREAM_ROOT must be the group's AOSS namespace ${streaming_namespace}" >&2
   exit 3
 }
 [[ "${TARGET_ROOT%/}" == "${AOSS_BUCKET_ROOT%/}/${target_namespace}" ]] || {
-  echo "[err] TARGET_ROOT must be the seeded-v1 AOSS namespace" >&2
+  echo "[err] TARGET_ROOT must be the group's AOSS namespace ${target_namespace}" >&2
   exit 3
 }
 [[ "$(basename -- "${TARGET_INDEX_ROOT%/}")" == "${target_namespace}" ]] || {
@@ -211,6 +236,7 @@ echo "vfm=${vfm} timestep=${timestep} layer=${layer} prefix=${prefix}"
 echo "tasks=${tasks_csv} manifest=${manifest}"
 echo "strict_audit=${INSCENE_STRICT_AUDIT} protocol=${canonical_protocol} obs_len=${canonical_obs_len}"
 echo "stream_root=${STREAM_ROOT} target_root=${TARGET_ROOT}"
+echo "namespace_family=${namespace_family} probe_fp16_passthrough=${PROBE_FP16_PASSTHROUGH}"
 echo "local_scene_root=${LOCAL_SCENE_ROOT} target_index_root=${TARGET_INDEX_ROOT}"
 echo "cache_dir=${CACHE_DIR} cache_max_gib=${CACHE_MAX_GIB}"
 

@@ -1,5 +1,13 @@
 # Probe Spatial — Project Status
 
+**Current handoff (2026-10-19):** [docs/HANDOFF_20261019.md](docs/HANDOFF_20261019.md).
+The page below is the 2026-10-16 snapshot. Canonical V2 (804), timestep (316)
+and C3-from-C1 (180) evaluations have since been accepted; MiniMax L20/L25
+bf16 consolidation and full verification passed on 2026-10-19 (job pt-f4g9bk61;
+0 problems), all 48 B2 retrain final checkpoints are finite, and the 16-group
+stage-5 dry run is clean (errors=0, HEAD 1e35916); the stage-5 pilot is not yet
+submitted ([execution record](docs/MINIMAX_REEXTRACT_RETRAIN_EXECUTION_20261016.md)).
+
 Evidence reviewed **2026-10-15**, corrected **2026-10-16** (local artifacts, one
 scheduler snapshot at 22:5x UTC, two read-only GPU feature audits). This is not a live scheduler
 report. Start with the [2026-10-15 experiment inventory](docs/EXPERIMENT_INVENTORY_20261015.md),

@@ -1,0 +1,104 @@
+{
+ "items": {
+  "aether__scannetpp__t749__l1__p12__action_dynamics__seed42": {
+   "c1_records": 828,
+   "c3_sets": 276,
+   "matched": 828,
+   "max_abs_pred_diff": 0.0,
+   "pred_identical": 828,
+   "status": "IDENTICAL",
+   "target_identical": 828,
+   "variant": "c3_from_c1"
+  },
+  "cogvideox__scannetpp__t499__l15__p12__action_dynamics__seed42": {
+   "c1_records": 276,
+   "c3_sets": 276,
+   "matched": 276,
+   "max_abs_pred_diff": 0.0,
+   "no_c1_counterpart": 552,
+   "pred_identical": 276,
+   "status": "IDENTICAL",
+   "target_identical": 276,
+   "variant": "h1_trained_diagnostic"
+  },
+  "cogvideox__scannetpp__t749__l0__p12__action_dynamics__seed42": {
+   "c1_records": 828,
+   "c3_sets": 276,
+   "matched": 828,
+   "max_abs_pred_diff": 0.0,
+   "pred_identical": 828,
+   "status": "IDENTICAL",
+   "target_identical": 828,
+   "variant": "c3_from_c1"
+  },
+  "lingbot__scannetpp__t250__l10__p12__action_dynamics__seed42": {
+   "c1_records": 828,
+   "c3_sets": 276,
+   "matched": 828,
+   "max_abs_pred_diff": 0.0,
+   "pred_identical": 828,
+   "status": "IDENTICAL",
+   "target_identical": 828,
+   "variant": "c3_from_c1"
+  },
+  "minimax_h3__scannetpp__t1000__l15__p12__action_dynamics__seed42": {
+   "c1_records": 276,
+   "c3_sets": 276,
+   "matched": 276,
+   "max_abs_pred_diff": 0.0,
+   "no_c1_counterpart": 552,
+   "pred_identical": 276,
+   "status": "IDENTICAL",
+   "target_identical": 276,
+   "variant": "h1_trained_diagnostic"
+  },
+  "minimax_h3__scannetpp__t250__l20__p12__action_dynamics__seed42": {
+   "c1_records": 171,
+   "c3_sets": 171,
+   "matched": 171,
+   "max_abs_pred_diff": 0.0009765625,
+   "no_c1_counterpart": 342,
+   "pred_identical": 170,
+   "status": "WITHIN_1e-3",
+   "target_identical": 171,
+   "variant": "h1_trained_diagnostic"
+  },
+  "vjepa2__scannetpp__t749__l11__p12__action_dynamics__seed42": {
+   "c1_records": 828,
+   "c3_sets": 276,
+   "matched": 828,
+   "max_abs_pred_diff": 0.0,
+   "pred_identical": 828,
+   "status": "IDENTICAL",
+   "target_identical": 828,
+   "variant": "c3_from_c1"
+  },
+  "wan__scannetpp__t749__l0__p12__action_dynamics__seed42": {
+   "c1_records": 828,
+   "c3_sets": 276,
+   "matched": 828,
+   "max_abs_pred_diff": 0.0,
+   "pred_identical": 828,
+   "status": "IDENTICAL",
+   "target_identical": 828,
+   "variant": "c3_from_c1"
+  },
+  "wan__scannetpp__t999__l15__p12__action_dynamics__seed42": {
+   "c1_records": 276,
+   "c3_sets": 276,
+   "matched": 276,
+   "max_abs_pred_diff": 0.0,
+   "no_c1_counterpart": 552,
+   "pred_identical": 276,
+   "status": "IDENTICAL",
+   "target_identical": 276,
+   "variant": "h1_trained_diagnostic"
+  }
+ },
+ "mode": "canary",
+ "totals": {
+  "c3_from_c1|IDENTICAL": 5,
+  "h1_trained_diagnostic|IDENTICAL": 3,
+  "h1_trained_diagnostic|WITHIN_1e-3": 1
+ }
+}

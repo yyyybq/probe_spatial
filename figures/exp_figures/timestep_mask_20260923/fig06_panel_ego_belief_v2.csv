@@ -1,0 +1,7 @@
+model,task,timestep,layer,prefixes,metric_value
+wan,B2 Persistence,499,20,"8,12,16,24",59.03865146636963
+wan,B2 Persistence,999,20,"8,12,16,24",78.0382022857666
+cogvideox,B2 Persistence,499,20,"8,12,16,24",78.56532096862793
+cogvideox,B2 Persistence,999,20,"8,12,16,24",78.56532096862793
+minimax_h3,B2 Persistence,500,20,"8,12,16,24",78.56532096862793
+minimax_h3,B2 Persistence,1000,20,"8,12,16,24",78.56532096862793
