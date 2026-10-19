@@ -436,11 +436,13 @@ def _record_c1_action_sensitivity(probe_module, batch) -> List[Dict[str, Any]]:
     action_set_ids = batch.get("action_set_id", manifest_ids)
     candidate_ids = batch.get("candidate_ids", batch.get("action_horizons"))
     equivalence = batch.get("action_equivalence_group")
+    pred_finite = torch.isfinite(pred).all(dim=-1)
     out = []
     for b in range(batch_size):
         action_set_id = action_set_ids[b]
         if isinstance(action_set_id, torch.Tensor):
             action_set_id = action_set_id.item()
+        set_finite = bool(pred_finite[b][valid[b]].all())
         out.append({
             "scene_path": scene_paths[b] if isinstance(scene_paths, list) else str(scene_paths[b]),
             "manifest_sample_id": manifest_ids[b],
@@ -451,7 +453,10 @@ def _record_c1_action_sensitivity(probe_module, batch) -> List[Dict[str, Any]]:
             "actions": _detach_cpu(actions[b]),
             "pred": _detach_cpu(pred[b]),
             "target": _detach_cpu(target_pooled[b]),
-            "valid": _detach_cpu(valid[b]),
+            # A set with a non-finite prediction is not scored at all, rather
+            # than scored over its remaining candidates with a different chance.
+            "valid": _detach_cpu(valid[b] & set_finite),
+            "prediction_finite": set_finite,
             "action_equivalence_group": (
                 _detach_cpu(equivalence[b]) if isinstance(equivalence, torch.Tensor)
                 else list(equivalence[b]) if equivalence is not None else None
@@ -499,15 +504,26 @@ def _group_c1_records_for_action_sensitivity(records: List[Dict[str, Any]]) -> L
         if len({str(value) for value in candidate_ids}) != len(candidate_ids):
             raise ValueError(f"duplicate candidate_id in action set {group_id}")
         equivalence = [row.get("action_equivalence_group") for row in rows]
+        pred = torch.stack([row["pred"] for row in rows])
+        # The C1 recorder flags rows whose predictions (or controls) are non-finite.
+        # Grouping must keep that flag: otherwise argmax over a NaN similarity
+        # column scores the set and n_nonfinite_pred_records stays 0.
+        finite = [
+            row.get("prediction_finite", True) is not False and bool(torch.isfinite(p).all())
+            for row, p in zip(rows, pred)
+        ]
+        set_finite = all(finite)
         output.append({
             "scene_path": rows[0].get("scene_path", "?"),
             "manifest_sample_id": rows[0].get("manifest_sample_id"),
             "action_set_id": group_id,
             "candidate_ids": candidate_ids,
             "actions": torch.stack([row["action"] for row in rows]),
-            "pred": torch.stack([row["pred"] for row in rows]),
+            "pred": pred,
             "target": torch.stack([row["target"] for row in rows]),
-            "valid": torch.ones(len(rows), dtype=torch.bool),
+            "valid": torch.full((len(rows),), set_finite, dtype=torch.bool),
+            "prediction_finite": set_finite,
+            "n_nonfinite_candidates": len(rows) - sum(finite),
             "action_equivalence_group": None if all(value is None for value in equivalence) else equivalence,
         })
     return output
@@ -721,6 +737,8 @@ def _summarize_c1_action_sensitivity(
     valid_sets = 0
 
     for record in records:
+        if record.get("prediction_finite", True) is False:
+            continue
         valid = record["valid"].bool()
         if int(valid.sum().item()) < 2:
             continue
