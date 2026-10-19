@@ -557,6 +557,8 @@ def _record_path_integration(probe_module, batch) -> List[Dict[str, Any]]:
             "paired_sample_id": paired_ids[b],
             "streaming_window_id": int(batch.get("streaming_window_id", torch.full((pred.shape[0],), -1, device=pred.device, dtype=torch.long))[b].item()),
             "streaming_tail_raw": int(batch.get("streaming_tail_raw", torch.full((pred.shape[0],), -1, device=pred.device, dtype=torch.long))[b].item()),
+            # Only valid horizons are scored, so only they decide finiteness.
+            "prediction_finite": bool(torch.isfinite(pred[b][valid[b].bool()]).all()),
         })
     return out
 
@@ -919,8 +921,9 @@ def _summarize(
     n = len(records)
     finite_records = _finite_records(records)
     n_nonfinite_pred = n - len(finite_records)
-    if probe_type in {"view_consistency", "ego_belief", "ego_belief_v2", "action_dynamics"}:
+    if probe_type in {"view_consistency", "ego_belief", "ego_belief_v2", "action_dynamics", "path_integration"}:
         # Non-finite predictions are counted, never scored as negatives or bin 0.
+        # For C2 a NaN similarity row otherwise still yields a finite global_R@1.
         records = finite_records
         if not records:
             return {"n": n, "n_scored": 0, "n_nonfinite_pred": n_nonfinite_pred}
@@ -1107,11 +1110,11 @@ def _summarize(
         if flat_pred:
             pred_all = torch.cat(flat_pred, dim=0)
             tgt_all = torch.cat(flat_tgt, dim=0)
-            out = {"n": n, "n_valid_records": n_valid_records,
+            out = {"n": n, "n_valid_records": n_valid_records, "n_nonfinite_pred": n_nonfinite_pred,
                    "n_valid_steps": int(pred_all.shape[0]),
                    **_feature_retrieval_summary(pred_all, tgt_all, compute_calibrated)}
         else:
-            out = {"n": n, "n_valid_records": 0, "n_valid_steps": 0}
+            out = {"n": n, "n_valid_records": 0, "n_nonfinite_pred": n_nonfinite_pred, "n_valid_steps": 0}
 
         out.update({
             "final_pose_error": float(sum(final_errors) / len(final_errors)) if final_errors else float("nan"),
