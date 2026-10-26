@@ -197,10 +197,15 @@ def group_command(row: dict, groups_tsv: Path, gpu_ids: str) -> str:
 
 def dry_run(row: dict, groups_tsv: Path, log_root: Path, gpu_ids: str) -> dict:
     env = os.environ.copy()
+    # SKIP_COMPLETE=0: the runner otherwise skips (and writes no log for) every probe
+    # whose TRAIN_COMPLETE marker exists. After the pilot's fast probes finish, every
+    # later plan or --submit would then fail reading those logs. A DRY_RUN=1 pass never
+    # touches the markers, and the submitted job commands (group_command) keep the
+    # runner default, so finished probes are still skipped on the GPU nodes.
     env.update({"GROUPS_TSV": str(groups_tsv), "GROUP_ID": row["group_id"], "RUN_ID": RUN_ID, "DRY_RUN": "1",
                 "AEC2_NAME": "zoetrope", "ALLOW_STREAMING_ONLY": "0", "INSCENE_STRICT_AUDIT": row["strict_audit"],
                 **GROUP_ENV, "GPU_IDS_CSV": gpu_ids, "PROBE_FP16_PASSTHROUGH": "0", "AOSS_CONF": AOSS_CONF,
-                "LOG_ROOT": str(log_root), "AOSS_CACHE_BASE": str(log_root / "cache")})
+                "LOG_ROOT": str(log_root), "AOSS_CACHE_BASE": str(log_root / "cache"), "SKIP_COMPLETE": "0"})
     done = subprocess.run(["bash", str(GROUP_SCRIPT)], cwd=ROOT, env=env, text=True, capture_output=True)
     result = {"group_id": row["group_id"], "returncode": done.returncode, "problems": []}
     if done.returncode:

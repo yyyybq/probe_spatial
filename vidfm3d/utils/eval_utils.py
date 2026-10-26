@@ -1,13 +1,23 @@
+"""Evaluation helpers.
+
+`pytorch3d` and `trimesh` are only needed by the point-cloud metrics
+(`chamfer_dist`, `eval_pc`, `evaluate_sample`, `dump_pointclouds_compare`).
+They are imported inside those functions so that the streaming probe
+evaluators, which only use `build_mask` and `align_pmaps`, stay importable
+with the pinned CPU test environment (`requirements-dev.txt`).
+"""
+
+from __future__ import annotations
+
 import os
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import numpy as np
-import pytorch3d
 import roma
 import torch
-import trimesh
-from pytorch3d.ops.knn import knn_gather, knn_points
-from pytorch3d.structures.pointclouds import Pointclouds
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from pytorch3d.structures.pointclouds import Pointclouds
 
 
 # normalize the pointcloud with per-axis std
@@ -40,6 +50,8 @@ def dump_pointclouds_compare(pc1, pc2, path="./pc.ply"):
     color1[:, 0] = 255
     color2 = np.zeros(pc2.shape).astype(np.uint8)
     color2[:, 1] = 255
+    import trimesh
+
     pc_vertices = np.vstack([pc1, pc2])
     colors = np.vstack([color1, color2])
     pc_color = trimesh.points.PointCloud(vertices=pc_vertices, colors=colors)
@@ -58,6 +70,8 @@ def _handle_pointcloud_input(
     Otherwise, return the input points (and normals) with the number of points per cloud
     set to the size of the second dimension of `points`.
     """
+    from pytorch3d.structures.pointclouds import Pointclouds
+
     if isinstance(points, Pointclouds):
         X = points.points_padded()
         lengths = points.num_points_per_cloud()
@@ -99,6 +113,8 @@ def chamfer_dist(x, y, x_lengths=None, y_lengths=None, norm=2):
         idx_x: [B, N1], nearest indices for each point of x in y
         idx_y: [B, N2], nearest indices for each point of y in x
     """
+    from pytorch3d.ops.knn import knn_points
+
     x, x_lengths, _ = _handle_pointcloud_input(x, x_lengths, None)
     y, y_lengths, _ = _handle_pointcloud_input(y, y_lengths, None)
 
@@ -235,6 +251,8 @@ def eval_pc(
     dist_acc, dist_comp, idx_pred, _ = chamfer_dist(pred, gt)
     f_score = compute_fscore(dist_acc, dist_comp, f_thresholds)  # [B, n_threshold]
     if rgb_pred is not None and rgb_gt is not None:
+        from pytorch3d.ops.knn import knn_gather
+
         nearest_rgb = knn_gather(rgb_gt, idx_pred.unsqueeze(-1)).squeeze(
             -2
         )  # [B, N1, 3]
@@ -296,6 +314,8 @@ def evaluate_sample(
                 best_rotation = rotation_batch[j].clone()
 
     if icp_align:
+        import trimesh
+
         # further register the pointcloud with ICP
         _, best_xyz_pred, _ = trimesh.registration.icp(
             best_xyz_pred.cpu().numpy(), xyz_gt[0].cpu().numpy(), scale=False

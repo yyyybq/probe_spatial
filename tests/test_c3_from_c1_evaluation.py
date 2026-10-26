@@ -114,6 +114,84 @@ def test_flat_c1_rows_group_by_anchor_and_report_equivalence() -> None:
     assert summary["equivalence_separation_gap"] > 0
 
 
+def _flat_set(set_id: str, predictions, finite=None) -> list[dict]:
+    rows = []
+    for candidate, prediction in enumerate(predictions):
+        row = {
+            "scene_path": f"/scene/{set_id}",
+            "manifest_sample_id": set_id,
+            "action_set_id": set_id,
+            "candidate_id": candidate,
+            "action_equivalence_group": None,
+            "action": torch.tensor([float(candidate)] + [0.0] * 8),
+            "pred": torch.tensor(prediction),
+            "target": torch.eye(3)[candidate],
+        }
+        if finite is not None:
+            row["prediction_finite"] = finite[candidate]
+        rows.append(row)
+    return rows
+
+
+def test_nonfinite_candidate_excludes_its_action_set_and_is_counted() -> None:
+    """Regression (2026-10-19): grouping used to drop prediction_finite.
+
+    argmax over a NaN similarity column picks that column, so a set with a NaN
+    candidate was scored as one hit and the non-finite count stayed 0.
+    """
+    from vidfm3d.eval_diag import _valid_evaluation_record
+
+    good = _flat_set("good", ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]))
+    bad = _flat_set(
+        "bad", ([1.0, 0.0, 0.0], [float("nan")] * 3, [0.0, 0.0, 1.0]), finite=[True, False, True]
+    )
+    grouped = _group_c1_records_for_action_sensitivity(good + bad)
+    by_id = {record["action_set_id"]: record for record in grouped}
+    assert by_id["good"]["prediction_finite"] is True
+    assert by_id["bad"]["prediction_finite"] is False
+    assert by_id["bad"]["n_nonfinite_candidates"] == 1
+    assert not by_id["bad"]["valid"].any()
+    assert not _valid_evaluation_record(by_id["bad"], "c3_action_sensitivity")
+    assert sum(1 for r in grouped if r.get("prediction_finite", True) is False) == 1
+
+    summary = _summarize_c1_action_sensitivity(grouped)
+    assert summary["n_valid_action_sets"] == 1
+    assert summary["intervention_validity"] == 1.0
+    interval = _bootstrap_c1_action_sensitivity(grouped, reps=20, seed=0)["intervention_validity"]
+    assert interval == [1.0, 1.0]
+
+
+def test_nan_prediction_without_flag_is_still_not_scored() -> None:
+    rows = _flat_set("legacy", ([1.0, 0.0, 0.0], [float("nan")] * 3, [0.0, 0.0, 1.0]))
+    grouped = _group_c1_records_for_action_sensitivity(rows)
+    assert grouped[0]["prediction_finite"] is False
+    assert _summarize_c1_action_sensitivity(grouped)["n_valid_action_sets"] == 0
+
+
+def test_batched_recorder_flags_nonfinite_valid_candidates() -> None:
+    class _NanForSecondAction(torch.nn.Module):
+        def forward(self, context: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+            out = action[:, :2].clone()
+            out[action[:, 1] > 0] = float("nan")
+            return out
+
+    module = SimpleNamespace(probe=_NanForSecondAction())
+    actions = torch.tensor([[[1.0, 0.0] + [0.0] * 7, [0.0, 1.0] + [0.0] * 7]]).repeat(2, 1, 1)
+    batch = {
+        "input_feat": torch.zeros(2, 3, 1, 1, 2),
+        "candidate_actions": actions,
+        "candidate_target_feat": torch.eye(2).reshape(1, 2, 2).repeat(2, 1, 1),
+        # In the second set the NaN candidate is already invalid, so the set stays usable.
+        "candidate_valid": torch.tensor([[True, True], [True, False]]),
+        "action_set_id": ["nan-valid", "nan-invalid"],
+        "scene_path": ["/scene/a", "/scene/b"],
+    }
+    first, second = _record_c1_action_sensitivity(module, batch)
+    assert first["prediction_finite"] is False and not first["valid"].any()
+    assert second["prediction_finite"] is True
+    assert second["valid"].tolist() == [True, False]
+
+
 def test_singleton_anchor_is_not_misreported_as_action_sensitivity() -> None:
     rows = [{
         "manifest_sample_id": "only-one",

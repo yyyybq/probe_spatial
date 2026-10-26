@@ -35,15 +35,28 @@ the cache-name registry must produce `feature_t250_layer{L}.sft` for
 MiniMax-H3/LingBot. Run it alone with
 `python -m pytest -q tests/test_nonfinite_handling.py`.
 
-## Release tests and internal tests (2026-10-18)
+## Release tests and internal tests (2026-10-18, updated 2026-10-19)
 
-The repository tracks only release tests: tests of the training, data, model and
-evaluation code (`vidfm3d/`), the feature-extraction contracts (`features/`), the
-timestep manifest protocol and the D-series code. They run on a clean checkout with
-`python -m pytest -q`, without campaign artifacts or extra `PYTHONPATH` entries.
+Release tests cover the training, data, model and evaluation code (`vidfm3d/`),
+the feature-extraction contracts (`features/`), the timestep manifest protocol,
+the D-series code and the MiniMax bf16 stage-5 tooling. They run on a clean
+checkout with `python -m pytest -q`, without campaign artifacts or extra
+`PYTHONPATH` entries.
 
-Tests of cluster submission, upload and recovery, extraction campaigns (windowfix,
-timestep, Wan target), the 816 overlay audit and the unreleased analyses (SE3,
-active representation, probe validity) are internal. They are not tracked; they stay
-next to the internal tools they test in the working checkout, and are listed in
-`.gitignore`. Earlier commits of the 2026-10 history still contain them.
+Internal tests cover cluster submission, upload and recovery, extraction
+campaigns (windowfix, timestep, Wan target), the 816 overlay audit and the
+unreleased analyses (SE3, active representation, probe validity). They were
+untracked on 2026-10-18 and tracked again by commit `8a8948d` (2026-10-19) as
+provenance. Several import frozen `runtime/` copies, read untracked artifacts
+or call the cluster Python, so `tests/conftest.py` (`INTERNAL_MODULES`, the same
+list as the "Internal campaign tests" block of `.gitignore`) excludes them
+unless `--run-artifact-tests` is given. Run them on the cluster checkout where
+those files exist.
+
+Clean-checkout results, Python 3.13 with `requirements-dev.txt` (2026-10-19,
+CPU; 2026-10-18 reported 198 passed for the 25 release files alone):
+
+| Selection | Result |
+| --- | --- |
+| `python -m pytest -q` (29 tracked release modules) | 221 passed, 1 skipped (`pytorch3d` not installed) |
+| `python -m pytest -q --run-artifact-tests` without cluster artifacts | 2 collection errors (missing `runtime/` copies); further failures come from untracked `runtime/`, `artifacts/`, `results/analysis/` files, two untracked `scripts/windowfix_v2/*.schema.json` files, and the cluster Python path |

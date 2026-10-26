@@ -1,5 +1,14 @@
 # Release experiment inventory — 2026-10-11, updated 2026-10-15
 
+**2026-10-19:** these CSVs are frozen at the 2026-10-16 state; their
+`evaluation_acceptance_status` and `result_status` predate the accepted v2
+evaluations (804 canonical, 316 timestep, 180 C3-from-C1 rows). The current
+per-run status is `release_status_20261019.csv`, built from these files and the
+accepted tables by `python3 scripts/build_release_status_20261019.py`
+(`--check` verifies it is current). `retrain_queue_20261016.csv` and
+`retrain_submissions_20261016.csv` list the 176 re-train runs; the 128 stage-5
+rows have no job id because stage 5 is not submitted.
+
 The three input CSVs separate **canonical V2**, **timestep**, and **other
 analyses**. They are dated local evidence inventories, not scheduler queries.
 

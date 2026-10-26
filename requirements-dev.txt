@@ -29,3 +29,8 @@ scikit-learn==1.8.0
 opencv-python==4.13.0.92
 pytest==8.3.5
 jsonschema==4.26.0
+# Rigid/similarity registration used by the A1 point-map alignment (vidfm3d/utils/eval_utils.py).
+roma==1.6.1
+# Not required by the release tests: pytorch3d and trimesh are imported lazily by the
+# point-cloud metrics only (chamfer/F-score/ICP); install them from requirements.txt
+# when running those.

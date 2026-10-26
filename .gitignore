@@ -92,8 +92,9 @@ archive/artifacts/
 syncRecord.txt
 /features/independent_*/
 
-# Internal campaign tests: kept in the working checkout, not released (2026-10-18).
-# See tests/README.md.
+# Internal campaign tests (2026-10-18). Commit 8a8948d (2026-10-19) tracks them again,
+# so these rules no longer apply to them; tests/conftest.py excludes them from the
+# default run. See tests/README.md.
 /tests/test_a1_movement_task_registry.py
 /tests/test_active_repr_probe.py
 /tests/test_audit_wan_target_h124_canary.py

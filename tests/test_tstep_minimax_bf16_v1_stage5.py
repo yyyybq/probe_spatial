@@ -304,8 +304,12 @@ BF16_RUNNER = next((p for p in (RUNNER, STAGED_RUNNER)
                     if p.is_file() and "seeded_v1_minimax_bf16_v1" in p.read_text(encoding="utf-8")), None)
 
 
-@pytest.mark.skipif(BF16_RUNNER is None, reason="no bf16-aware runner (installed or staged)")
-def test_stage5_submitter_ready_path_plans_dry_runs_and_requires_approval(tmp_path: Path, monkeypatch) -> None:
+def _stage5_ready(tmp_path: Path, monkeypatch, group_script: Path):
+    """Point the stage-5 submitter at a synthetic ready matrix and this machine.
+
+    The runner defaults PYTHON and AOSS_CONF to cluster paths; the dry run copies
+    os.environ, so set both here to keep the test portable.
+    """
     import shutil
 
     import scripts.submit_tstep_minimax_bf16_v1_retrain as stage5
@@ -320,14 +324,25 @@ def test_stage5_submitter_ready_path_plans_dry_runs_and_requires_approval(tmp_pa
         shutil.copy(output_dir / "groups.tsv", out_dir / "groups.tsv")
         return [dict(row) for row in rows]
 
+    conf = tmp_path / "petreloss.conf"
+    conf.write_text("[default]\n")
+    monkeypatch.setenv("PYTHON", sys.executable)
+    monkeypatch.delenv("SKIP_COMPLETE", raising=False)
+    monkeypatch.setattr(stage5, "AOSS_CONF", str(conf))
     monkeypatch.setattr(stage5, "consolidation_ready", lambda: (True, "test: consolidation PASS"))
     monkeypatch.setattr(stage5, "config_parity", lambda: [])  # composes 128 real configs; run on its own
     monkeypatch.setattr(stage5, "build_matrix", fake_build)
     monkeypatch.setattr(stage5, "OUT_DIR", tmp_path / "campaign")
-    monkeypatch.setattr(stage5, "GROUP_SCRIPT", BF16_RUNNER)
+    monkeypatch.setattr(stage5, "GROUP_SCRIPT", group_script)
     monkeypatch.setattr(stage5, "SOURCE_MATRIX", output_dir / "groups.tsv")  # stands in for the 2026-09 matrix
     monkeypatch.setattr(stage5, "LAYERS", (20,))
     monkeypatch.setattr(stage5, "PREFIXES", (8,))
+    return stage5, rows
+
+
+@pytest.mark.skipif(BF16_RUNNER is None, reason="no bf16-aware runner (installed or staged)")
+def test_stage5_submitter_ready_path_plans_dry_runs_and_requires_approval(tmp_path: Path, monkeypatch) -> None:
+    stage5, _ = _stage5_ready(tmp_path, monkeypatch, BF16_RUNNER)
     for layout, jobs, spec in (("node8", 2, "N4lS.Iq.I80.8"), ("single", 16, "N4lS.Iq.I80.1")):
         monkeypatch.setattr(sys, "argv", ["submit", "--layout", layout])
         assert stage5.main() == 0
@@ -339,6 +354,44 @@ def test_stage5_submitter_ready_path_plans_dry_runs_and_requires_approval(tmp_pa
     monkeypatch.setattr(sys, "argv", ["submit", "--submit"])
     with pytest.raises(SystemExit, match="approval"):
         stage5.main()
+
+
+@pytest.mark.skipif(BF16_RUNNER is None, reason="no bf16-aware runner (installed or staged)")
+def test_stage5_dry_run_still_checks_probes_that_already_finished(tmp_path: Path, monkeypatch) -> None:
+    """Regression (2026-10-19): the approved flow re-runs the submitter after the pilot.
+
+    By then the pilot's fast probes have TRAIN_COMPLETE. The runner skips such probes
+    unless SKIP_COMPLETE=0 and writes no per-probe log, so the dry run used to fail
+    with FileNotFoundError and block the submission of the remaining groups.
+    """
+    # The runner writes markers under <project root>/logs, so run it from a scratch
+    # project root whose sources are links to this checkout.
+    project = tmp_path / "project"
+    project.mkdir()
+    for entry in PROJECT_ROOT.iterdir():
+        if entry.name not in {"logs", ".git"}:
+            (project / entry.name).symlink_to(entry)
+    stage5, rows = _stage5_ready(tmp_path, monkeypatch, project / "scripts" / BF16_RUNNER.name)
+
+    finished = ("view_consistency", "action_dynamics", "path_integration", "counterfactual")
+    markers = []
+    for row in rows:
+        for task in finished:
+            tag = f"tp_{row['vfm']}_t{row['timestep']}_l{row['layer']}_p{row['prefix']}_{task}"
+            marker = project / "logs/inscene15k_streaming/runs/tstep_probe_seeded_v1" / stage5.RUN_ID / tag
+            marker.mkdir(parents=True)
+            (marker / "TRAIN_COMPLETE").touch()
+            markers.append(marker / "TRAIN_COMPLETE")
+
+    monkeypatch.setattr(sys, "argv", ["submit", "--layout", "node8"])
+    assert stage5.main() == 0
+    plan = json.loads((tmp_path / "campaign/launcher/plan_node8.json").read_text())
+    assert plan["errors"] == []
+    assert plan["dry_run"] and all(not r["problems"] for r in plan["dry_run"])
+    assert all(marker.is_file() for marker in markers)  # a dry run leaves training state alone
+    # The submitted job command keeps the runner default, so finished probes are
+    # still skipped on the GPU node.
+    assert all("SKIP_COMPLETE" not in job["command"] for job in plan["jobs"])
 
 
 def test_pilot_gate_requires_a_finite_checkpoint_for_every_probe(tmp_path: Path, monkeypatch) -> None:

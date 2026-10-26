@@ -212,3 +212,75 @@ def test_a2_records_flag_nonfinite_logits():
     records = diag_eval._record_view_consistency(_A2Stub(), batch)
     assert [r["prediction_finite"] for r in records] == [False, True]
     assert not diag_eval._valid_evaluation_record(records[0], "view_consistency")
+
+
+def _c2_batch(pred_nan_sample: int | None):
+    """Two C2 samples with three horizons; optionally make one sample's predictions NaN."""
+
+    class _PathProbe(torch.nn.Module):
+        def forward(self, input_feat_seq, path_actions):
+            out = torch.eye(3).expand(path_actions.shape[0], 3, 3).clone()
+            if pred_nan_sample is not None:
+                out[pred_nan_sample] = float("nan")
+            return out
+
+    eye = torch.eye(4)
+    target_extrinsics = eye.repeat(2, 3, 1, 1)
+    target_extrinsics[:, :, 0, 3] = torch.tensor([1.0, 2.0, 3.0])
+    batch = {
+        "input_feat_seq": torch.zeros(2, 4, 1, 1, 3),
+        "path_actions": torch.zeros(2, 3, 9),
+        "target_feat_seq": torch.eye(3).reshape(1, 3, 1, 1, 3).repeat(2, 1, 1, 1, 1),
+        "path_horizon_valid": torch.ones(2, 3, dtype=torch.bool),
+        "action_horizons": torch.tensor([[1, 2, 4], [1, 2, 4]]),
+        "start_extrinsic": eye.repeat(2, 1, 1),
+        "target_extrinsics": target_extrinsics,
+        "scene_path": ["/scene/a", "/scene/b"],
+    }
+    return SimpleNamespace(probe=_PathProbe()), batch
+
+
+def test_c2_records_flag_nan_predictions_and_summary_excludes_them():
+    """Regression (2026-10-19): C2 records had no prediction_finite flag.
+
+    A NaN prediction still produced a finite global_R@1, and the export gate on
+    non-finite predictions could not fire for path_integration.
+    """
+    module, batch = _c2_batch(pred_nan_sample=1)
+    records = diag_eval._record_path_integration(module, batch)
+    assert [r["prediction_finite"] for r in records] == [True, False]
+    assert not diag_eval._valid_evaluation_record(records[1], "path_integration")
+
+    summary = diag_eval._summarize(records, "path_integration")
+    assert summary["n_nonfinite_pred"] == 1
+    assert summary["n_valid_records"] == 1
+    assert summary["global_R@1"] == 1.0
+
+    clean = diag_eval._summarize(diag_eval._record_path_integration(*_c2_batch(None)), "path_integration")
+    assert clean["n_nonfinite_pred"] == 0 and clean["n_valid_records"] == 2
+
+
+def test_c2_invalid_horizons_do_not_decide_finiteness():
+    module, batch = _c2_batch(pred_nan_sample=None)
+    batch["path_horizon_valid"] = torch.tensor([[True, True, True], [True, True, False]])
+
+    class _NanOnInvalidHorizon(torch.nn.Module):
+        def forward(self, input_feat_seq, path_actions):
+            out = torch.eye(3).expand(2, 3, 3).clone()
+            out[1, 2] = float("nan")
+            return out
+
+    records = diag_eval._record_path_integration(SimpleNamespace(probe=_NanOnInvalidHorizon()), batch)
+    assert [r["prediction_finite"] for r in records] == [True, True]
+
+
+@pytest.mark.parametrize("split, ok", [(None, True), ("val", True), ("test", False), ("train", False)])
+def test_a1_evaluator_refuses_splits_it_cannot_evaluate(split, ok):
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.create({} if split is None else {"eval_split": split})
+    if ok:
+        assert a1_eval._require_val_split(cfg) == "val"
+    else:
+        with pytest.raises(ValueError, match="validation split only"):
+            a1_eval._require_val_split(cfg)
