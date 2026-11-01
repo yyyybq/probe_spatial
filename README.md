@@ -1,5 +1,13 @@
 # probe_spatial: Probing Spatial Understanding in Video Foundation Models
 
+> **Looking for the code of the paper?** The public release of *Probing Spatial State
+> Representations in Visual Foundation Models*
+> ([arXiv:2610.40636](https://arxiv.org/abs/2610.40636),
+> [project page](https://yyyybq.github.io/probing-spatial-state/)) is
+> [yyyybq/Probing_Spatial_State_Release](https://github.com/yyyybq/Probing_Spatial_State_Release).
+> This repository holds the development history; the README below describes an earlier
+> state of the project and is not maintained.
+
 This repository extends [VidFM3D](https://github.com/zxhuang1698/VidFM3D) with a **Spatial Diagnostic Suite** — diagnostic probes that characterize what kind of 3D / temporal / ego-centric understanding a Video Foundation Model (VFM) has internalized, all trained on frozen VFM features without touching VFM weights.
 
 | Family | Probe | Question |
